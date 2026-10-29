@@ -1,0 +1,19 @@
+{
+  "source": "https://huggingface.co/Xenova/clip-vit-base-patch32",
+  "revision": "6b7c523703ae26e39be4b03774966f8571c7f523",
+  "license": "MIT",
+  "weights": {
+    "LICENSE": "987e63b32f6c89ff5160e429458a872ff048e6860b590a3912e938f9da8f14db",
+    "preprocessor_config.json": "6f638fb9401a6d6296feff533ee7efe657b787c49f954f82f5906b36ef2a1b1f",
+    "README.md": "ae287015b60eb7ca1d40e726c550af1988977c24f0005f123274d52490c20d8d",
+    "revision.txt": "c0b27a89bc12b5a50c184d08fd054d828c674b3fcbe8425d47cef331c398f8ab",
+    "tokenizer.json": "f7f3b7af117d467b58374797691a6438d3e6b9e9cef800dfd5dced7f697a90cd",
+    "onnx\\text_model_quantized.onnx": "73baab855d406190da9faa498cfedf65f15cf309f4cc7385b7b032e6d08e5c3a",
+    "onnx\\vision_model_quantized.onnx": "583fd1110a514667812fee7d684952aaf82a99b959760c8d7dca7e0ab9839299"
+  },
+  "validation_fixture": "https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/tiger.jpg",
+  "runtime": {
+    "onnxruntime": "1.23.2",
+    "tokenizers": "0.22.1"
+  }
+}

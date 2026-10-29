@@ -1,0 +1,8 @@
+Pillow>=12.1,<13
+numpy>=2.2,<3
+tifffile==2026.10.15
+pypng==0.20220715.0
+imagecodecs==2026.10.10
+# RawTherapee is an external executable; see README (not a pip package).
+# Optional HEIC codec:
+# pillow-heif>=1,<2

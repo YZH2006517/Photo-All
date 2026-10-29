@@ -1,0 +1,141 @@
+// Real shared catalog -> contact sheet -> immersive review -> persisted decisions.
+const {spawn}=require('node:child_process'),fs=require('node:fs'),path=require('node:path'),readline=require('node:readline');
+const {chromium}=require('C:/Users/Administrator/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
+const root=path.resolve(__dirname,'..'),output=path.join(__dirname,'artifacts','lighttable-'+Date.now());fs.mkdirSync(output,{recursive:true});
+const python='C:/Users/Administrator/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe';
+const child=spawn(python,['-u',path.join(root,'product/service.py'),'--data-dir',path.join(output,'data')],{windowsHide:true});child.stderr.on('data',d=>process.stderr.write(d));let browser;
+async function until(fn,ms=30000){const end=Date.now()+ms;while(Date.now()<end){if(await fn())return;await new Promise(r=>setTimeout(r,100));}throw Error('Lighttable validation timeout');}
+(async()=>{
+ const connection=JSON.parse(await new Promise(r=>readline.createInterface({input:child.stdout}).once('line',r)));
+ const call=async(route,body)=>{const r=await fetch(`http://127.0.0.1:${connection.port}/api${route}`,{method:body?'POST':'GET',headers:{Authorization:'Bearer '+connection.token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const v=await r.json();if(!r.ok)throw Error(v.error);return v;};
+ const input=path.join(output,'inputs');fs.mkdirSync(input);for(let i=0;i<6;i++)fs.copyFileSync(path.join(__dirname,'inputs/recognition-fixture.jpg'),path.join(input,`frame-${i+1}.jpg`));
+ const album=await call('/albums',{name:'胶片电子观片台'}),job=await call('/import',{album_id:album.id,folder:input});await until(async()=>(await call('/jobs/'+job.id)).status==='done');
+ browser=await chromium.launch({channel:'chrome',headless:true});const page=await browser.newPage({viewport:{width:1440,height:940}}),errors=[],sourceRequests=[];let sourceLoads=0,activeImages=0;page.on('pageerror',e=>errors.push(e.message));
+ page.on('request',request=>{if(request.url().includes('/api/image/')){activeImages++;if(new URL(request.url()).searchParams.get('quality')==='source')sourceLoads++;}});
+ for(const event of ['requestfinished','requestfailed'])page.on(event,request=>{if(request.url().includes('/api/image/'))activeImages--;});
+ page.on('response',response=>{if(response.url().includes('/api/image/')){if(response.status()>=400)errors.push('Image HTTP '+response.status());if(new URL(response.url()).searchParams.get('quality')==='source'){sourceRequests.push(response.url());if(!response.headers()['content-type']?.includes('image/png'))errors.push('Source request was not lossless PNG');}}});
+ await page.goto(`http://127.0.0.1:1420/#port=${connection.port}&token=${connection.token}`);
+ await page.getByRole('button',{name:'首页电子观片台'}).click({timeout:4000});const picker=page.getByRole('dialog',{name:'选择观片图集'});await picker.waitFor();
+ if(!await picker.getByRole('button',{name:'开始观片',exact:true}).isDisabled())throw Error('Home entry did not require a collection choice');
+ await picker.getByRole('checkbox',{name:'胶片电子观片台',exact:true}).check();await picker.getByRole('button',{name:'开始观片',exact:true}).click();
+ await page.getByRole('dialog',{name:'电子观片台'}).waitFor();await until(()=>page.getByRole('dialog',{name:'电子观片台'}).getAttribute('data-ready').then(value=>value==='true'));await page.keyboard.press('Escape');await page.getByRole('heading',{name:'图集',exact:true}).waitFor();
+ await page.getByRole('button',{name:'打开图集 胶片电子观片台'}).click();
+ await page.getByRole('button',{name:'电子观片台',exact:true}).click({timeout:5000});const dialog=page.getByRole('dialog',{name:'电子观片台'});await dialog.waitFor();await until(()=>dialog.getAttribute('data-ready').then(value=>value==='true'));
+ if(!await page.locator('.app-shell').evaluate(el=>el.inert))throw Error('Underlying workspace is interactive');
+ const tabletop=page.locator('.film-table');await tabletop.waitFor({timeout:3000});
+ if(await page.getByRole('slider',{name:'照片尺寸',exact:true}).count())throw Error('Global photo size slider remains');
+ await page.locator('.ft-resize-handle').first().waitFor({timeout:2500});
+ if(await page.locator('.lt-decisions').count())throw Error('Legacy P/X/U button group remains visible');
+ await page.getByRole('button',{name:'观片收藏',exact:true}).waitFor({timeout:2500});
+ const wakeControls=async()=>{await page.mouse.move(700,5);};
+ const unlit=await tabletop.evaluate(el=>getComputedStyle(el).backgroundColor);
+ await until(()=>page.locator('.lt-contact-frame img').count().then(n=>n===6));await page.screenshot({path:path.join(output,'00-lamp-off.png')});
+ const firstTablePhoto=(await call('/library')).photos[0];const heart=page.getByRole('button',{name:'观片收藏',exact:true});
+ await heart.click();await until(async()=>(await call('/library')).photos.find(p=>p.id===firstTablePhoto.id).decision==='keep');
+ await heart.click();await until(async()=>(await call('/library')).photos.find(p=>p.id===firstTablePhoto.id).decision==='pending');
+ const recipesBefore=JSON.stringify((await call('/library')).photos.map(p=>p.recipe));
+ await wakeControls();
+ await page.getByRole('button',{name:'观片台背光开关'}).click();await until(()=>tabletop.getAttribute('data-light').then(v=>v==='on'));
+ await until(()=>tabletop.evaluate(el=>getComputedStyle(el).backgroundColor).then(color=>color!==unlit));
+ await page.getByRole('slider',{name:'灯光亮度'}).fill('135');
+ const frame=page.locator('.lt-contact-frame').first();const start=await frame.boundingBox(),oldLeft=await frame.evaluate(el=>el.style.left);
+ await frame.click();await page.keyboard.press('Control+a');const selectedText=await page.evaluate(()=>getSelection()?.toString()||'');
+ if(selectedText.length){await page.screenshot({path:path.join(output,'selection-gray.png')});throw Error('Browser selection grayed the film table: '+selectedText.length+' selected characters');}
+ await page.mouse.move(start.x+start.width/2,start.y+start.height/2);await page.mouse.down();await page.mouse.move(start.x+start.width/2+65,start.y+start.height/2+35,{steps:8});await page.mouse.up();
+ if(await frame.evaluate(el=>el.style.left)===oldLeft)throw Error('Film cannot be moved on table');
+ const beforeResize=await frame.boundingBox(),desktopBefore=await page.locator('.ft-world').getAttribute('style'),neighborBefore=await page.locator('.lt-contact-frame').nth(1).boundingBox();
+ const handle=frame.locator('.ft-resize-handle.se'),handleBounds=await handle.boundingBox();
+ await page.mouse.move(handleBounds.x+handleBounds.width/2,handleBounds.y+handleBounds.height/2);await page.mouse.down();await page.mouse.move(handleBounds.x+handleBounds.width/2+65,handleBounds.y+handleBounds.height/2+35,{steps:8});await page.mouse.up();
+ const afterResize=await frame.boundingBox();if(afterResize.width<beforeResize.width*1.25)throw Error('Individual resize handle did not enlarge the selected frame');
+ const neighborAfter=await page.locator('.lt-contact-frame').nth(1).boundingBox();if(Math.abs(neighborAfter.width-neighborBefore.width)>1||Math.abs(neighborAfter.height-neighborBefore.height)>1)throw Error('Resizing one frame changed its neighbor');
+ if(await page.locator('.ft-world').getAttribute('style')!==desktopBefore)throw Error('Photo size changed desktop zoom');
+ if(Math.abs(afterResize.x+afterResize.width/2-beforeResize.x-beforeResize.width/2)>2)throw Error('Resizing lost the dragged photo center');
+ await handle.focus();await handle.press('Home');if(Math.abs((await frame.boundingBox()).width-beforeResize.width)>1)throw Error('Individual frame reset failed');
+ await wakeControls();await page.getByRole('button',{name:'桌面放大'}).click();await page.keyboard.press('v');await page.locator('.ft-magnifier').waitFor();
+ const magnification=page.getByRole('slider',{name:'放大镜倍率',exact:true});await magnification.hover();await magnification.fill('20');
+ if(await magnification.getAttribute('min')!=='1'||await magnification.getAttribute('max')!=='20')throw Error('Loupe must support 1–20×');
+ await until(()=>page.locator('.ft-lens-film .picture[data-source-size="0"]:not(.loading) img').count().then(n=>n>0));
+ const fullPixels=await page.locator('.ft-lens-film .picture[data-source-size="0"]:not(.loading) img').first().evaluate(img=>({width:img.naturalWidth,height:img.naturalHeight}));
+ if(fullPixels.width!==firstTablePhoto.width||fullPixels.height!==firstTablePhoto.height)throw Error('High-magnification loupe is not using all native source pixels: '+JSON.stringify(fullPixels));
+ await magnification.fill('3');
+ const lensSize=page.getByRole('slider',{name:'放大镜大小',exact:true});if(await page.locator('.ft-magnification + .ft-lens-size').count()!==1)throw Error('Loupe size control is not beside magnification');
+ const beforeLensSize=await page.locator('.ft-magnifier').boundingBox();await lensSize.fill('180');if((await page.locator('.ft-magnifier').boundingBox()).width<=beforeLensSize.width+40)throw Error('Explicit loupe size slider did not resize the lens');await lensSize.fill('150');
+ if(await page.locator('.ft-filter-definitions feDisplacementMap').count()!==1)throw Error('Lens must displace coherent RGB pixels once');
+ if(await page.locator('.ft-filter-definitions feColorMatrix').count())throw Error('Lens still splits RGB channels');
+ const lensBounds=await page.locator('.ft-magnifier').boundingBox();if(lensBounds.width>360)throw Error('Default loupe is too large: '+lensBounds.width);
+ if(await frame.getAttribute('title'))throw Error('Filename tooltip remains over the lens');
+ if(await frame.evaluate(el=>getComputedStyle(el).cursor)==='crosshair')throw Error('Crosshair remains over lens');
+ if((await page.locator('.ft-magnifier').evaluate(el=>getComputedStyle(el).boxShadow)).includes('9999px'))throw Error('Loupe blacked out the surrounding table');
+ if(!await page.locator('.ft-optics').evaluate(el=>getComputedStyle(el).filter.includes('url(')))throw Error('Optical refraction filter missing');
+ const moved=await frame.boundingBox();await page.mouse.move(moved.x+moved.width*.5,moved.y+moved.height*.5);await page.screenshot({path:path.join(output,'00-round-loupe.png')});
+ await until(()=>page.locator('.ft-optics .picture.loading').count().then(n=>n===0));const warped=await page.locator('.ft-optics').screenshot();
+ await page.locator('.ft-optics').evaluate(el=>{el.dataset.optics=el.style.filter;el.style.filter='none';});const flat=await page.locator('.ft-optics').screenshot();
+ if(warped.equals(flat))throw Error('Refraction did not change rendered pixels');await page.locator('.ft-optics').evaluate(el=>{el.style.filter=el.dataset.optics;});
+ await wakeControls();await page.getByRole('slider',{name:'灯光亮度'}).fill('100');await page.keyboard.press('Escape');await page.locator('.ft-magnifier').waitFor({state:'detached',timeout:3000});await dialog.waitFor();await until(()=>dialog.getAttribute('data-ready').then(value=>value==='true'));
+ if(JSON.stringify((await call('/library')).photos.map(p=>p.recipe))!==recipesBefore)throw Error('Table lighting modified photo recipes');
+ await wakeControls();await page.getByRole('button',{name:'一键平铺胶片'}).click();
+ await page.getByRole('button',{name:'胶片边框开关'}).click({timeout:3000});
+ if(await page.locator('.ft-rail').count()||await page.locator('.ft-gloss').count())throw Error('Table decorations remain after switch off');
+ if(await page.locator('.ft-emulsion').first().evaluate(el=>getComputedStyle(el).borderLeftWidth)!=='0px')throw Error('Black side border remains in image-only mode');
+ await page.keyboard.press('c');await page.locator('.film-table.is-roll.is-plain').waitFor();
+ if(await page.locator('.ft-rail,.ft-roll-leader,.ft-roll-shadow').count())throw Error('Roll decorations remain after switch off');
+ if(JSON.stringify((await call('/library')).photos.map(p=>p.recipe))!==recipesBefore)throw Error('Border switch modified photo recipes');
+ await wakeControls();await page.getByRole('button',{name:'胶片边框开关'}).click();await page.locator('.ft-rail').first().waitFor();await page.keyboard.press('g');
+ if(await page.locator('.lt-contact-frame').count()!==6)throw Error('Contact sheet lost entry scope');
+ await page.locator('.lt-contact-frame img').first().waitFor();await page.screenshot({path:path.join(output,'01-contact-sheet.png')});
+ await page.locator('.lt-contact-frame').first().dblclick();await page.locator('.lt-display .picture img').waitFor();
+ // Warm each layout, then repeatedly switch at stable settings. The selected
+ // frame must already have a decoded URL on the first rendered frame.
+ for(const key of ['c','g','e']){await page.keyboard.press(key);await until(()=>activeImages===0);}
+ const warmedLoads=sourceLoads;
+ for(const key of ['c','g','e','c','g','e']){
+   await page.keyboard.press(key);
+   const target=key==='e'?'.lt-display .picture img':'.film-table:not([hidden]) .ft-world .ft-film.active .picture img';
+   if(!await page.locator(target).count())throw Error('Warmed layout displayed a blank selected image: '+key);
+   if(!await page.locator(target).first().evaluate(img=>img.complete&&img.naturalWidth>0))throw Error('Warmed layout decoded the selected bitmap again: '+key);
+   await until(()=>activeImages===0);
+ }
+ const warmedDelta=sourceLoads-warmedLoads;if(warmedDelta)throw Error('Warmed layouts requested source pixels again: '+warmedDelta);
+ const caption=()=>page.locator('.lt-pane:not(.reference) .lt-pane-caption span').first().textContent();const first=await caption();await page.keyboard.press('p');await until(async()=>(await call('/library')).photos.some(p=>p.name===first&&p.decision==='keep'));
+ if(await caption()===first)throw Error('Selection did not advance');const second=await caption();await page.keyboard.press('x');await until(async()=>(await call('/library')).photos.some(p=>p.name===second&&p.decision==='reject'));
+ await page.keyboard.press('Control+z');await until(async()=>(await call('/library')).photos.find(p=>p.name===second).decision==='pending');await page.keyboard.press('Control+Shift+z');await until(async()=>(await call('/library')).photos.find(p=>p.name===second).decision==='reject');
+ await page.keyboard.press('c');await page.locator('.film-table.is-roll').waitFor({timeout:3000});
+ const rollFrames=await page.locator('.ft-world .ft-film').evaluateAll(els=>els.map(el=>({x:parseFloat(el.style.left),y:parseFloat(el.style.top),w:parseFloat(el.style.width),h:parseFloat(el.style.height)})));
+ if(rollFrames.length!==6||rollFrames.some((f,i)=>i&&Math.abs(f.x-rollFrames[i-1].x-rollFrames[i-1].w)>.1))throw Error('Film edges are not connected');
+ const rollWorld=page.locator('.ft-world'),rollBefore=await rollWorld.getAttribute('style');await page.mouse.move(1000,400);await page.mouse.wheel(0,240);await until(async()=>await rollWorld.getAttribute('style')!==rollBefore);
+ const firstRoll=page.locator('.ft-world .ft-film').first();
+ await page.mouse.wheel(0,-100000);await until(()=>firstRoll.locator('.picture img').count().then(n=>n===1));
+ const oldRollUrl=await firstRoll.locator('img').getAttribute('src');await page.mouse.wheel(0,100000);
+ await until(()=>firstRoll.locator('.picture img').count().then(n=>n===0));
+ if(!await page.evaluate(async url=>{try{return (await fetch(url)).ok;}catch{return false;}},oldRollUrl))throw Error('Warm source bitmap was discarded instead of retained within the bounded cache');
+ await page.mouse.wheel(0,-100000);await until(()=>firstRoll.locator('.picture img').count().then(n=>n===1));
+ await page.keyboard.down('Control');await page.mouse.move(1000,700);await page.mouse.wheel(0,800);await page.waitForTimeout(80);await page.mouse.move(1000,170);await page.mouse.wheel(0,-800);await page.waitForTimeout(80);await page.keyboard.up('Control');
+ const rollAfterZoom=await page.locator('.ft-world .ft-film').first().boundingBox();if(rollAfterZoom.y+rollAfterZoom.height/2<150||rollAfterZoom.y+rollAfterZoom.height/2>750)throw Error('Roll zoom moved the film outside the viewing area: '+JSON.stringify(rollAfterZoom));
+ if(await page.locator('.ft-roll-strip').evaluate(el=>getComputedStyle(el).overflow)!=='hidden'||await page.locator('.ft-roll-shadow').evaluate(el=>getComputedStyle(el).borderRadius)!=='15px')throw Error('Roll ends or shadow are not consistently rounded');
+ await page.keyboard.press('Space');await page.screenshot({path:path.join(output,'02-compare.png')});await page.keyboard.press('e');await page.locator('.lt-loupe').dblclick();if(!await page.locator('.lt-image-transform').evaluate(el=>el.style.transform.includes('scale(2)')))throw Error('Loupe zoom failed');
+ await page.mouse.move(710,400);await until(()=>page.locator('.lighttable.hud-hidden').count().then(n=>n===1));
+ for(let i=0;i<20;i++){await page.mouse.move(710+i,400);await page.waitForTimeout(30);}
+ if(!await page.locator('.lighttable.hud-hidden').count())throw Error('Canvas motion reopened immersive bars');
+ for(const selector of ['.lt-header','.lt-footer'])if(await page.locator(selector).evaluate(el=>getComputedStyle(el).visibility)!=='hidden')throw Error('Immersive bar remained visible');
+ await page.screenshot({path:path.join(output,'03-immersive.png')});await page.keyboard.down('Space');if(!await page.locator('.lighttable.hud-visible').count())throw Error('Space did not reveal controls');await page.keyboard.up('Space');
+ await page.keyboard.press('f');await until(()=>page.evaluate(()=>!!document.fullscreenElement));await page.keyboard.press('Escape');await until(()=>page.evaluate(()=>!document.fullscreenElement));await dialog.waitFor();await until(()=>dialog.getAttribute('data-ready').then(value=>value==='true'));await page.keyboard.press('Escape');await dialog.waitFor({state:'detached'});
+ if(await page.locator('.app-shell').evaluate(el=>el.inert))throw Error('Workspace remained inert after exit');
+ // Selected pair enters compare directly; decisions do not shrink the saved review scope.
+ await page.locator('.photo-card').nth(0).click();await page.locator('.photo-card').nth(1).click({modifiers:['Control']});await page.getByRole('button',{name:'电子观片台',exact:true}).click();await dialog.waitFor();await until(()=>dialog.getAttribute('data-ready').then(value=>value==='true'));await page.locator('.film-table.is-roll').waitFor();if(await page.locator('.lt-contact-frame').count()!==2)throw Error('Selected pair not on roll');await page.keyboard.press('Escape');await dialog.waitFor({state:'detached'});
+ // A rejected edit is rolled back; dismissing it must not trap exit forever.
+ await page.getByRole('button',{name:'电子观片台',exact:true}).click();await dialog.waitFor();await until(()=>dialog.getAttribute('data-ready').then(value=>value==='true'));await page.route('**/api/edit',route=>route.fulfill({status:500,contentType:'application/json',body:JSON.stringify({error:'模拟保存失败'})}),{times:1});
+ await page.keyboard.press('u');await page.getByRole('alert').filter({hasText:'模拟保存失败'}).waitFor();await page.keyboard.press('Escape');await dialog.waitFor({state:'detached',timeout:3000});
+ // Exit waits for a fullscreen request already in flight, then restores the entry state.
+ await page.getByRole('button',{name:'电子观片台',exact:true}).click();await dialog.waitFor();await until(()=>dialog.getAttribute('data-ready').then(value=>value==='true'));await page.evaluate(()=>{const original=document.documentElement.requestFullscreen.bind(document.documentElement);document.documentElement.requestFullscreen=async()=>{await new Promise(r=>setTimeout(r,250));return original();};});
+ await page.keyboard.press('f');await page.keyboard.press('Escape');await dialog.waitFor({state:'detached'});await page.waitForTimeout(400);if(await page.evaluate(()=>!!document.fullscreenElement))throw Error('In-flight fullscreen leaked into workspace');
+ await page.getByRole('button',{name:'电子观片台',exact:true}).click();await dialog.waitFor();await until(()=>dialog.getAttribute('data-ready').then(value=>value==='true'));await wakeControls();await page.getByRole('button',{name:'胶片边框开关'}).click();await page.keyboard.press('Escape');await dialog.waitFor({state:'detached'});
+ await page.getByRole('button',{name:'电子观片台',exact:true}).click();await dialog.waitFor();await until(()=>dialog.getAttribute('data-ready').then(value=>value==='true'));await page.locator('.film-table.is-plain').waitFor();if(await page.locator('.ft-rail').count())throw Error('Decoration preference was not remembered');
+ const thumbs=page.locator('.lt-strip>button'),countBeforeDelete=await thumbs.count(),deleteLabel=await thumbs.first().getAttribute('aria-label');
+ const removedPhoto=(await call('/library')).photos.find(p=>'跳转观片 '+p.name===deleteLabel);await wakeControls();await thumbs.first().click({button:'right'});
+ const deletion=page.getByRole('menuitem',{name:'删除照片',exact:true});await deletion.waitFor();await deletion.click();
+ await until(()=>thumbs.count().then(n=>n===countBeforeDelete-1));if(!fs.existsSync(removedPhoto.path))throw Error('Viewer deletion removed a source file');
+ await page.keyboard.press('Control+z');await until(()=>thumbs.count().then(n=>n===countBeforeDelete));
+ await page.screenshot({path:path.join(output,'04-images-only.png')});await page.keyboard.press('Escape');await dialog.waitFor({state:'detached'});
+ if(!sourceRequests.length)throw Error('Viewer did not request lossless source-quality pixels');
+ if(errors.length)throw Error(errors.join('\n'));const report={status:'passed',source_png_requests:sourceRequests.length,source_full:true,per_photo_resize:true,loupe_size:true,warmed_mode_requests:warmedDelta,context_remove_undo:true,loupe_1_to_20:true,coherent_rgb:true,corner_heart:true,contact_sheet:6,home_entry:true,no_selection_gray:true,small_loupe:true,connected_roll:true,roll_zoom_bounds:true,decorations_toggle:true,decorations_remembered:true,physical_backlight:true,film_drag:true,round_loupe:true,display_only_brightness:true,auto_advance:true,undo_redo:true,compare:true,zoom:true,immersive:true,fullscreen_restore:true,selected_pair:true,failed_save_exit:true,fullscreen_race:true,browser_errors:errors};fs.writeFileSync(path.join(output,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({output,...report},null,2));
+})().catch(e=>{console.error(e);process.exitCode=1;}).finally(async()=>{if(browser)await browser.close();child.kill();});

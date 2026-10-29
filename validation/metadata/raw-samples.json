@@ -1,0 +1,16 @@
+[
+  {
+    "sha256": "639945753240005d80488c0462c01e73a7ab82c96d3d1cdb6661f02e1b3c1319",
+    "license": "CC0-1.0",
+    "model": "D7000",
+    "url": "https://raw.pixls.us/getfile.php/958/nice/Nikon - D7000 - 14bit 14bit compressed (Lossless) (3:2).NEF",
+    "path": "F:\\PHOTO ALL\\validation\\inputs\\D7000.NEF"
+  },
+  {
+    "sha256": "81c5ee6da45c4e22584c5344807ac32e2c9ba82ad274486ba64745ef8dd4f69c",
+    "license": "CC0-1.0",
+    "model": "EOS 5D Mark II",
+    "url": "https://raw.pixls.us/getfile.php/1182/nice/Canon - EOS 5D Mark II - RAW (3:2).CR2",
+    "path": "F:\\PHOTO ALL\\validation\\inputs\\EOS_5D_Mark_II.CR2"
+  }
+]
