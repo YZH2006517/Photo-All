@@ -743,6 +743,98 @@ export function selectPhotos(
 }
 const raw = /\.(nef|dng|arw|cr2|cr3|raf|rw2|orf|pef)$/i;
 export const isRaw = (photo: Photo) => raw.test(photo.path);
+export type VariantMode = "all" | "raw" | "jpeg";
+
+function variantKind(photo: Photo): "raw" | "jpeg" | undefined {
+  return isRaw(photo)
+    ? "raw"
+    : /\.jpe?g$/i.test(photo.path)
+      ? "jpeg"
+      : undefined;
+}
+
+function variantPairKey(photo: Photo): string | undefined {
+  if (!variantKind(photo)) return undefined;
+  const normalized = photo.path.replace(/\\/g, "/");
+  const slash = normalized.lastIndexOf("/"),
+    dot = normalized.lastIndexOf(".");
+  const directory = normalized.slice(0, slash + 1).replace(/\/{2,}/g, "/");
+  const stem = normalized.slice(slash + 1, dot);
+  return `${directory}\0${stem}`
+    .normalize("NFC")
+    .toLowerCase()
+    .replace(/ß/g, "ss")
+    .replace(/ς/g, "σ");
+}
+
+function variantGroups(photos: Photo[]): Map<string, number> {
+  const groups = new Map<string, number>();
+  for (const photo of photos) {
+    const key = variantPairKey(photo);
+    if (key !== undefined)
+      groups.set(key, (groups.get(key) || 0) | (isRaw(photo) ? 1 : 2));
+  }
+  return groups;
+}
+
+/** Hide only the non-preferred member type of a local RAW + JPEG pair. */
+export function applyVariantPreference(
+  photos: Photo[],
+  mode: VariantMode,
+): Photo[] {
+  if (mode === "all") return photos;
+  const groups = variantGroups(photos);
+  return photos.filter((photo) => {
+    const key = variantPairKey(photo);
+    return (
+      key === undefined || groups.get(key) !== 3 || variantKind(photo) === mode
+    );
+  });
+}
+
+/** Carry paired variants into a review scope so its display mode can be changed. */
+export function expandVariantScope(source: Photo[], ids: number[]): Photo[] {
+  const selected = new Set(ids),
+    groups = variantGroups(source);
+  const pairs = new Set<string>();
+  for (const photo of source) {
+    const key = variantPairKey(photo);
+    if (selected.has(photo.id) && key !== undefined && groups.get(key) === 3)
+      pairs.add(key);
+  }
+  return source.filter(
+    (photo) => selected.has(photo.id) || pairs.has(variantPairKey(photo)!),
+  );
+}
+
+/** Preserve review position when a preference hides the current capture variant. */
+export function resolveVariantSelection(
+  source: Photo[],
+  visible: Photo[],
+  currentId: number | undefined,
+  previousIds: number[] = source.map((photo) => photo.id),
+): number | undefined {
+  const ids = new Set(visible.map((photo) => photo.id));
+  if (currentId !== undefined && ids.has(currentId)) return currentId;
+  const current = source.find((photo) => photo.id === currentId);
+  const key = current && variantPairKey(current);
+  if (key !== undefined) {
+    const paired = visible.find(
+      (photo) =>
+        variantPairKey(photo) === key &&
+        variantKind(photo) !== variantKind(current!),
+    );
+    if (paired) return paired.id;
+  }
+  const index = previousIds.indexOf(currentId!);
+  for (let next = index + 1; next < previousIds.length; next++) {
+    if (ids.has(previousIds[next])) return previousIds[next];
+  }
+  for (let previous = index - 1; previous >= 0; previous--) {
+    if (ids.has(previousIds[previous])) return previousIds[previous];
+  }
+  return visible[0]?.id;
+}
 export function exportIds(photos: Photo[], format: string) {
   return [
     ...new Set(

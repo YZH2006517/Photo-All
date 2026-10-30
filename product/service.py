@@ -24,6 +24,20 @@ import film
 ORIGINS = {'http://127.0.0.1:1420', 'http://localhost:1420', 'http://tauri.localhost', 'tauri://localhost', 'https://tauri.localhost'}
 
 
+def import_paths(folder, cancellation):
+    """Stream directory entries; cancellation never waits for a full tree listing."""
+    pending = [Path(folder)]
+    while pending:
+        cancellation.check()
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                cancellation.check()
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                elif Path(entry.name).suffix.lower() in engine.SUPPORTED and entry.is_file():
+                    yield entry.path
+
+
 class StudioServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -388,17 +402,15 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('照片路径必须是列表')
                 if folder is not None and not isinstance(folder, str):
                     raise ValueError('文件夹路径无效')
-                def action(progress):
-                    files = paths
-                    if folder:
-                        files = [str(p) for p in Path(folder).rglob('*') if p.is_file() and p.suffix.lower() in engine.SUPPORTED]
+                def action(progress, cancellation):
+                    files = import_paths(folder, cancellation) if folder else paths
                     catalog = engine.Catalog(self.server.data_dir / 'library.sqlite')
                     try:
-                        rows, errors = catalog.import_files(files, progress, album_id=body.get('album_id'))
+                        rows, errors = catalog.import_files(files, progress, album_id=body.get('album_id'), cancel=cancellation)
                         return {'imported': len(rows), 'errors': errors}
                     finally:
                         catalog.close()
-                return self.reply(self.server.submit(action))
+                return self.reply(self.server.submit(action, cancellable=True))
             if route.path in {'/api/edit', '/api/undo', '/api/redo'} and self.command == 'POST':
                 catalog = engine.Catalog(self.server.data_dir / 'library.sqlite')
                 recipes = None

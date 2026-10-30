@@ -67,6 +67,9 @@ import {
   mergeLibraryRecipes,
   reviewPhotos,
   albumSelectionPhotos,
+  VariantMode,
+  applyVariantPreference,
+  expandVariantScope,
 } from "./model";
 import { Albums, Classification } from "./Albums";
 import { Composite } from "./Composite";
@@ -122,7 +125,53 @@ function Studio() {
   const [albumId, setAlbumId] = useState<number | null>(null),
     [facets, setFacets] = useState<Facets>({});
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const sidebar = useRef<HTMLElement>(null);
+  const drawerOpenTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const drawerCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const drawerPointerInside = useRef(false);
+  const drawerHoverSuppressed = useRef(false);
+  const clearDrawerTimers = useCallback(() => {
+    if (drawerOpenTimer.current) clearTimeout(drawerOpenTimer.current);
+    if (drawerCloseTimer.current) clearTimeout(drawerCloseTimer.current);
+    drawerOpenTimer.current = null;
+    drawerCloseTimer.current = null;
+  }, []);
+  const closeDrawer = useCallback(() => {
+    clearDrawerTimers();
+    drawerHoverSuppressed.current = true;
+    setDrawerOpen(false);
+  }, [clearDrawerTimers]);
+  const scheduleDrawerClose = useCallback(() => {
+    clearDrawerTimers();
+    drawerCloseTimer.current = setTimeout(() => {
+      drawerCloseTimer.current = null;
+      if (
+        !drawerPointerInside.current &&
+        !sidebar.current?.contains(document.activeElement)
+      )
+        setDrawerOpen(false);
+    }, 350);
+  }, [clearDrawerTimers]);
+  useEffect(() => clearDrawerTimers, [clearDrawerTimers]);
   const [folderMode, setFolderMode] = useState("single");
+  const [variantMode, setVariantMode] = useState<VariantMode>(() => {
+    try {
+      const saved = localStorage.getItem("photoall-variant-mode");
+      return saved === "raw" || saved === "jpeg" ? saved : "all";
+    } catch {
+      return "all";
+    }
+  });
+  const changeVariantMode = (next: VariantMode) => {
+    setVariantMode(next);
+    setSelected([]);
+    setLimit(48);
+    try {
+      localStorage.setItem("photoall-variant-mode", next);
+    } catch {
+      /* A storage limit must not block viewing. */
+    }
+  };
   const [composite, setComposite] = useState<CompositeDocument | null>(null),
     [batchStyle, setBatchStyle] = useState("film");
   const compositeSave = useRef<null | (() => Promise<void>)>(null);
@@ -135,6 +184,7 @@ function Studio() {
   const [revisions, setRevisions] = useState<Record<number, number>>({}),
     [toast, setToast] = useState(""),
     [job, setJob] = useState<Job | null>(null);
+  const [jobAction, setJobAction] = useState("");
   const [saving, setSaving] = useState(false);
   const [exportOpen, setExportOpen] = useState(false),
     [template, setTemplate] = useState("plain"),
@@ -272,10 +322,13 @@ function Studio() {
 
   const albumPhotos = useMemo(
     () =>
-      library.photos.filter(
-        (p) => albumId === null || p.album_ids.includes(albumId),
+      applyVariantPreference(
+        library.photos.filter(
+          (p) => albumId === null || p.album_ids.includes(albumId),
+        ),
+        variantMode,
       ),
-    [library.photos, albumId],
+    [library.photos, albumId, variantMode],
   );
   const scopePhotos = useMemo(
     () => selectPhotos(albumPhotos, group, filter, search, sort),
@@ -292,7 +345,26 @@ function Studio() {
       ? [current]
       : photos.filter((p) => selected.includes(p.id));
   const exportSelection = exportIds(exportScope, format);
-  const kept = library.photos.filter((p) => p.decision === "keep").length;
+  const visibleLibraryPhotos = useMemo(
+    () => applyVariantPreference(library.photos, variantMode),
+    [library.photos, variantMode],
+  );
+  const visibleAlbumCounts = useMemo(
+    () =>
+      new Map(
+        library.albums.map((album) => [
+          album.id,
+          applyVariantPreference(
+            library.photos.filter((photo) =>
+              photo.album_ids.includes(album.id),
+            ),
+            variantMode,
+          ).length,
+        ]),
+      ),
+    [library.albums, library.photos, variantMode],
+  );
+  const kept = visibleLibraryPhotos.filter((p) => p.decision === "keep").length;
   const busy = job?.status === "running";
   const updateRecipe = (patch: Recipe) => {
     if (!current || busy) return;
@@ -316,12 +388,13 @@ function Studio() {
   const startJob = async (route: string, body: unknown) => {
     await flush();
     const result = await api<{ id: string }>(route, body);
+    setJobAction(route);
     setJob({
       id: result.id,
       status: "running",
       done: 0,
       total: 0,
-      cancellable: route === "/export",
+      cancellable: route === "/export" || route === "/import",
       cancel_requested: false,
     });
   };
@@ -351,10 +424,14 @@ function Studio() {
                 );
             } else if (result.status === "error")
               notify(result.error || "处理失败");
-            else if (result.status === "cancelled")
+            else if (result.status === "cancelled") {
+              await reload();
               notify(
-                `导出已终止，已完成 ${result.result?.outputs?.length || 0} 张；已完成文件保留。`,
+                jobAction === "/import"
+                  ? `导入已终止，已新增 ${result.result?.imported || 0} 张；已完成导入的记录已保留。`
+                  : `导出已终止，已完成 ${result.result?.outputs?.length || 0} 张；已完成文件保留。`,
               );
+            }
           })
           .catch((error) => {
             if (!disposed) {
@@ -368,7 +445,7 @@ function Studio() {
       disposed = true;
       clearInterval(timer);
     };
-  }, [job?.id, job?.status, reload, notify]);
+  }, [job?.id, job?.status, jobAction, reload, notify]);
   const importPhotos = () =>
     act(async () => {
       setImportMenu(false);
@@ -436,7 +513,10 @@ function Studio() {
           : photos;
       if (!scope.length) return;
       setReviewScope({
-        ids: scope.map((p) => p.id),
+        ids: expandVariantScope(
+          libraryRef.current.photos,
+          scope.map((p) => p.id),
+        ).map((p) => p.id),
         initialId: mode === "editor" ? current?.id : undefined,
         compare: chosen.length > 1,
         back: home ? "albums" : mode === "editor" ? "editor" : "library",
@@ -586,7 +666,7 @@ function Studio() {
       await flush();
       await compositeSave.current?.();
       setMode("trash");
-      setDrawerOpen(false);
+      closeDrawer();
       setSelected([]);
     });
   const beginComposite = (existing?: CompositeDocument) =>
@@ -703,7 +783,7 @@ function Studio() {
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
       if (event.key === "Escape" && drawerOpen) {
-        setDrawerOpen(false);
+        closeDrawer();
         return;
       }
       if (reviewPicker || contextMenu) {
@@ -860,6 +940,8 @@ function Studio() {
           onUndo={() => historyAction("undo")}
           onRedo={() => historyAction("redo")}
           onEdit={openPhoto}
+          variantMode={variantMode}
+          onVariantMode={changeVariantMode}
           onRemove={async (id) => {
             await flush();
             await api("/remove", {
@@ -886,25 +968,65 @@ function Studio() {
         inert={mode === "lighttable" || reviewPicker}
         aria-hidden={mode === "lighttable" || reviewPicker ? true : undefined}
       >
-        {drawerOpen && (
-          <button
-            className="sidebar-scrim"
-            aria-label="关闭导航抽屉"
-            onClick={() => setDrawerOpen(false)}
-          />
-        )}
+        <button
+          className="sidebar-scrim"
+          aria-label="关闭导航抽屉"
+          aria-hidden={!drawerOpen}
+          tabIndex={drawerOpen ? 0 : -1}
+          onClick={closeDrawer}
+        />
         <aside
+          ref={sidebar}
           className={`sidebar ${drawerOpen ? "is-open" : "is-closed"}`}
+          onPointerEnter={(e) => {
+            if (e.pointerType !== "mouse") return;
+            drawerPointerInside.current = true;
+            clearDrawerTimers();
+            if (drawerHoverSuppressed.current) return;
+            drawerOpenTimer.current = setTimeout(() => {
+              drawerOpenTimer.current = null;
+              if (drawerPointerInside.current) setDrawerOpen(true);
+            }, 120);
+          }}
+          onPointerLeave={(e) => {
+            if (e.pointerType !== "mouse") return;
+            drawerPointerInside.current = false;
+            drawerHoverSuppressed.current = false;
+            scheduleDrawerClose();
+          }}
+          onFocusCapture={(e) => {
+            clearDrawerTimers();
+            if ((e.target as HTMLElement).matches(":focus-visible")) {
+              drawerHoverSuppressed.current = false;
+              setDrawerOpen(true);
+            }
+          }}
+          onBlurCapture={(e) => {
+            if (e.currentTarget.contains(e.relatedTarget as Node | null))
+              return;
+            if (!drawerPointerInside.current) {
+              drawerHoverSuppressed.current = false;
+              scheduleDrawerClose();
+            }
+          }}
           onClick={(e) => {
-            if ((e.target as HTMLElement).closest(".nav-item,.album-nav-item"))
-              setDrawerOpen(false);
+            if (
+              (e.target as HTMLElement).closest(
+                ".nav-item,.album-nav-item,.album-list .album,.brand,.workspace-switch",
+              )
+            )
+              closeDrawer();
           }}
         >
           <button
             className="drawer-toggle"
             aria-label={drawerOpen ? "收起导航" : "展开导航"}
             aria-expanded={drawerOpen}
-            onClick={() => setDrawerOpen((v) => !v)}
+            onClick={() => {
+              clearDrawerTimers();
+              drawerHoverSuppressed.current = true;
+              setDrawerOpen((v) => !v);
+            }}
           >
             {drawerOpen ? (
               <PanelLeftClose size={20} />
@@ -945,13 +1067,13 @@ function Studio() {
             <b>{library.albums.length}</b>
           </button>
           {[
-            ["all", "全部照片", Images, library.photos.length],
+            ["all", "全部照片", Images, visibleLibraryPhotos.length],
             ["keep", "精选作品", Heart, kept],
             [
               "duplicates",
               "重复照片",
               Copy,
-              library.photos.filter((p) => p.duplicate_of).length,
+              visibleLibraryPhotos.filter((p) => p.duplicate_of).length,
             ],
           ].map(([id, label, Icon, count]) => {
             const I = Icon as typeof Images;
@@ -994,7 +1116,9 @@ function Studio() {
                   </span>
                   <span>
                     {album.name}
-                    <small>{album.count} 张照片</small>
+                    <small>
+                      {visibleAlbumCounts.get(album.id) ?? album.count} 张照片
+                    </small>
                   </span>
                   <ChevronRight size={13} />
                 </button>
@@ -1016,7 +1140,7 @@ function Studio() {
           <div className="sidebar-bottom">
             <span className="online-dot" /> 本地引擎
             {library.capabilities.raw ? "已就绪" : "待连接"}
-            <span className="version">0.9</span>
+            <span className="version">0.9.1</span>
           </div>
         </aside>
 
@@ -1150,6 +1274,8 @@ function Studio() {
               <Albums
                 key={mode}
                 trash={mode === "trash"}
+                variantMode={variantMode}
+                onVariantMode={changeVariantMode}
                 removeAlbum={trashAlbum}
                 restoreAlbum={restoreAlbum}
                 library={library}
@@ -1250,6 +1376,19 @@ function Studio() {
                   }
                 />
                 <div className="library-toolbar">
+                  <select
+                    className="variant-preference"
+                    aria-label="图集格式偏好"
+                    title="同目录同名 RAW+JPEG 只显示优先格式；未配对照片保留"
+                    value={variantMode}
+                    onChange={(e) =>
+                      changeVariantMode(e.target.value as VariantMode)
+                    }
+                  >
+                    <option value="all">全部格式</option>
+                    <option value="raw">RAW 优先</option>
+                    <option value="jpeg">JPEG 优先</option>
+                  </select>
                   <div className="segmented">
                     <button
                       className={filter === "all" ? "selected" : ""}
@@ -1640,17 +1779,25 @@ function Studio() {
             >
               <LoaderCircle className="spin" size={17} />
               <div>
-                <strong>让美好，慢慢呈现</strong>
+                <strong>
+                  {jobAction === "/import"
+                    ? "正在导入照片"
+                    : jobAction === "/export"
+                      ? "正在导出作品"
+                      : "让美好，慢慢呈现"}
+                </strong>
                 <span>
                   {job!.total
                     ? `正在处理 ${job!.done} / ${job!.total}`
-                    : "正在准备本地处理…"}
+                    : jobAction === "/import" && job!.done
+                      ? `已处理 ${job!.done} 张 · 持续扫描文件夹`
+                      : "正在准备本地处理…"}
                 </span>
               </div>
               {job?.cancellable && (
                 <button
                   className="job-cancel"
-                  aria-label="终止导出"
+                  aria-label={jobAction === "/import" ? "终止导入" : "终止导出"}
                   disabled={job.cancel_requested}
                   onClick={() =>
                     act(async () => {
@@ -1662,7 +1809,11 @@ function Studio() {
                     })
                   }
                 >
-                  {job.cancel_requested ? "正在终止…" : "终止"}
+                  {job.cancel_requested
+                    ? "正在终止…"
+                    : jobAction === "/import"
+                      ? "终止导入"
+                      : "终止导出"}
                 </button>
               )}
               <div className="job-progress">

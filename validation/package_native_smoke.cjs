@@ -9,7 +9,7 @@ if (!portableSource || !installer) throw Error('Pass portable directory and NSIS
 const output = path.join(__dirname, 'artifacts', 'package-native-' + Date.now());
 fs.mkdirSync(output, {recursive: true});
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'Photo All 独立发布 '));
-const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(PHOTOALL|PYTHON)/.test(key)));
+const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(PHOTOALL|PYTHON)/.test(key) && !/^path$/i.test(key)));
 env.PATH = path.join(process.env.SystemRoot, 'System32');
 env.APPDATA = path.join(temporary, 'profile', 'Roaming');
 env.LOCALAPPDATA = path.join(temporary, 'profile', 'Local');
@@ -23,7 +23,8 @@ const run = (file, args, options = {}) => new Promise((resolve, reject) => {
   process.once('error', reject);
   process.once('exit', code => code === 0 ? resolve({code, stdout, stderr}) : reject(Error(`${file} returned ${code}: ${stderr}`)));
 });
-const existsKey = key => spawnSync('reg.exe', ['query', key], {windowsHide: true, env, encoding: 'utf8'}).status === 0;
+const reg = path.join(process.env.SystemRoot, 'System32/reg.exe');
+const existsKey = key => spawnSync(reg, ['query', key], {windowsHide: true, env, encoding: 'utf8'}).status === 0;
 const waitFor = async (check, timeout = 45000) => {
   const end = Date.now() + timeout;
   while (Date.now() < end) {
@@ -35,6 +36,14 @@ const waitFor = async (check, timeout = 45000) => {
 let active, browser, installed = false;
 const installedFolder = path.join(temporary, 'installed app');
 const report = {temporary, portable: {}, installer: {}};
+function copyDirectory(source, destination) {
+  fs.mkdirSync(destination, {recursive: true});
+  for (const entry of fs.readdirSync(source, {withFileTypes: true})) {
+    const input = path.join(source, entry.name), target = path.join(destination, entry.name);
+    if (entry.isDirectory()) copyDirectory(input, target);
+    else fs.copyFileSync(input, target);
+  }
+}
 async function exercise(executable, phase, port) {
   const data = path.join(temporary, 'profile', phase, 'Local', 'org.photoall.studio');
   const appEnv = {...env, PHOTOALL_DATA_DIR: data,
@@ -73,11 +82,13 @@ async function exercise(executable, phase, port) {
   await page.reload();
   await page.getByRole('heading', {name: '图集', exact: true}).waitFor();
   await page.screenshot({path: path.join(output, phase + '.png')});
-  const backend = spawnSync('powershell.exe', ['-NoProfile', '-Command',
+  const backend = spawnSync(path.join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe'), ['-NoProfile', '-Command',
     `Get-CimInstance Win32_Process -Filter "ParentProcessId = ${active.pid}" | Select-Object ProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress`],
-    {env, windowsHide: true, encoding: 'utf8'}).stdout.trim();
-  if (!backend.includes('runtime') || /codex-runtimes|PHOTO ALL\\product/.test(backend)) throw Error('Native process used the builder runtime: ' + backend);
-  fs.writeFileSync(path.join(output, phase + '-processes.json'), backend);
+    {env, windowsHide: true, encoding: 'utf8'});
+  if (backend.status !== 0) throw Error('Process inventory failed: ' + backend.stderr);
+  const inventory = backend.stdout.trim();
+  if (!inventory.includes('runtime') || /codex-runtimes|PHOTO ALL\\product/.test(inventory)) throw Error('Native process used the builder runtime: ' + inventory);
+  fs.writeFileSync(path.join(output, phase + '-processes.json'), inventory);
   await page.evaluate(() => window.__TAURI_INTERNALS__.invoke('plugin:window|close', {label: 'main'})).catch(() => {});
   await waitFor(() => closed);
   let reachable = true;
@@ -93,21 +104,25 @@ async function exercise(executable, phase, port) {
 (async () => {
   if (existsKey(uninstallKey) || existsKey(settingsKey)) throw Error('An existing user installation/profile registry entry must be preserved; test installation aborted');
   const portable = path.join(temporary, '便携 application');
-  fs.cpSync(portableSource, portable, {recursive: true});
+  copyDirectory(portableSource, portable);
   report.portable = await exercise(path.join(portable, 'Photo All Studio.exe'), 'portable', 9438);
-  const install = await run(installer, ['/S', '/NS', '/D=' + installedFolder], {env});
+  const install = await run(installer, ['/S', '/NS', '/D=' + installedFolder], {env, windowsVerbatimArguments: true, argv0: '"' + installer + '"'});
   fs.writeFileSync(path.join(output, 'install-process.json'), JSON.stringify(install, null, 2));
   installed = true;
   if (!existsKey(uninstallKey) || !fs.existsSync(path.join(installedFolder, 'photo-all.exe'))) throw Error('Per-user installer did not register/install the application');
   report.installer = {per_user_registry: true, no_shortcuts: true,
     ...await exercise(path.join(installedFolder, 'photo-all.exe'), 'installed', 9439)};
-  const uninstall = await run(path.join(installedFolder, 'uninstall.exe'), ['/S', '_?=' + installedFolder], {env});
+  const uninstaller = path.join(installedFolder, 'uninstall.exe');
+  const uninstall = await run(uninstaller, ['/S', '_?=' + installedFolder], {env, windowsVerbatimArguments: true, argv0: '"' + uninstaller + '"'});
   fs.writeFileSync(path.join(output, 'uninstall-process.json'), JSON.stringify(uninstall, null, 2));
   await waitFor(() => !fs.existsSync(path.join(installedFolder, 'photo-all.exe')) && !existsKey(uninstallKey));
   installed = false;
   if (!fs.existsSync(path.join(temporary, 'profile/installed/Local/org.photoall.studio/library.sqlite'))) throw Error('Uninstaller deleted the user library');
   report.installer.uninstalled = true;
   report.installer.library_preserved = true;
+  // NSIS retains its last-install-location preference after an ordinary uninstall.
+  // This key did not exist before this test, so restore the original absence.
+  await run(reg, ['delete', settingsKey, '/f'], {env}).catch(() => {});
   report.status = 'passed';
   fs.writeFileSync(path.join(output, 'report.json'), JSON.stringify(report, null, 2));
   console.log(JSON.stringify({output, ...report}, null, 2));
@@ -116,13 +131,18 @@ async function exercise(executable, phase, port) {
   console.error(error);
   process.exitCode = 1;
 }).finally(async () => {
+  if (active?.pid) await run(path.join(process.env.SystemRoot, 'System32/taskkill.exe'), ['/PID', String(active.pid), '/T', '/F'], {env}).catch(() => {});
   if (browser) await browser.close().catch(() => {});
-  active?.kill();
   if (installed && fs.existsSync(path.join(installedFolder, 'uninstall.exe'))) {
-    await run(path.join(installedFolder, 'uninstall.exe'), ['/S', '_?=' + installedFolder], {env}).catch(() => {});
+    const uninstaller = path.join(installedFolder, 'uninstall.exe');
+    await run(uninstaller, ['/S', '_?=' + installedFolder], {env, windowsVerbatimArguments: true, argv0: '"' + uninstaller + '"'}).catch(() => {});
+    await run(reg, ['delete', settingsKey, '/f'], {env}).catch(() => {});
   }
   const resolved = path.resolve(temporary);
   if (resolved.startsWith(path.resolve(os.tmpdir()) + path.sep) && path.basename(resolved).startsWith('Photo All ')) {
-    fs.rmSync(resolved, {recursive: true, force: true, maxRetries: 10, retryDelay: 300});
+    const cleanup = "import pathlib,shutil,sys,tempfile,time; target=pathlib.Path(sys.argv[1]).resolve(); assert target.parent==pathlib.Path(tempfile.gettempdir()).resolve() and target.name.startswith('Photo All ');\nfor attempt in range(10):\n try: shutil.rmtree(target); break\n except FileNotFoundError: break\n except PermissionError:\n  if attempt==9: raise\n  time.sleep(.3)";
+    await run(path.join(portableSource, 'runtime/python/python.exe'), ['-c', cleanup, resolved], {env}).catch(error => {
+      fs.writeFileSync(path.join(output, 'cleanup-error.txt'), String(error));
+    });
   }
 });

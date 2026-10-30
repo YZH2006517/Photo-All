@@ -7,6 +7,58 @@ const photos = [
   {id:3,name:'重复.jpg',group_id:'b',decision:'pending',duplicate_of:1,score:99,captured:30,path:'c.jpg'},
   {id:4,name:'夜色.jpg',group_id:'b',decision:'reject',duplicate_of:null,score:80,captured:40,path:'d.jpg'},
 ] as any;
+
+describe('RAW and JPEG display preference',()=>{
+  const variants = [
+    {id:11,path:'C:\\Travel\\DSC_001.NEF',name:'DSC_001.NEF'},
+    {id:12,path:'c:/TRAVEL/dsc_001.JpEg',name:'dsc_001.JpEg'},
+    {id:13,path:'C:/Travel/only-raw.DNG',name:'only-raw.DNG'},
+    {id:14,path:'C:/Travel/only-jpeg.jpg',name:'only-jpeg.jpg'},
+    {id:15,path:'C:/Other/DSC_001.jpg',name:'DSC_001.jpg'},
+    {id:16,path:'C:/Travel/DSC_001.png',name:'DSC_001.png'},
+    {id:17,path:'C:/Travel/DSC_001.ARW',name:'DSC_001.ARW'},
+  ] as any;
+  it('pairs only RAW/JPEG in the same case-folded directory and stem',()=>{
+    expect(typeof model.applyVariantPreference).toBe('function');
+    expect(model.applyVariantPreference(variants,'raw').map(p=>p.id)).toEqual([11,13,14,15,16,17]);
+    expect(model.applyVariantPreference(variants,'jpeg').map(p=>p.id)).toEqual([12,13,14,15,16]);
+    expect(model.applyVariantPreference(variants,'all')).toEqual(variants);
+    expect(variants.map((p:any)=>p.id)).toEqual([11,12,13,14,15,16,17]);
+  });
+  it('preserves input order and all unpaired/other-format records',()=>{
+    const reordered=[variants[4],variants[1],variants[3],variants[6],variants[0],variants[2],variants[5]];
+    expect(model.applyVariantPreference(reordered,'raw').map(p=>p.id)).toEqual([15,14,17,11,13,16]);
+    expect(model.applyVariantPreference([variants[1]],'raw')).toEqual([variants[1]]);
+    expect(model.applyVariantPreference([], 'jpeg')).toEqual([]);
+  });
+  it('supports Unicode casefold and dotted stems without matching another directory',()=>{
+    const input=[{id:1,path:'D:/相片/Straße.001.NEF'},{id:2,path:'d:/相片/STRASSE.001.JPG'},
+      {id:3,path:'D:/相片/sub/straße.001.jpg'}] as any;
+    expect(model.applyVariantPreference(input,'raw').map(p=>p.id)).toEqual([1,3]);
+  });
+  it('moves a hidden current photo to its paired version and keeps a visible selection',()=>{
+    expect(typeof model.resolveVariantSelection).toBe('function');
+    const raw=model.applyVariantPreference(variants,'raw'),jpeg=model.applyVariantPreference(variants,'jpeg');
+    expect(model.resolveVariantSelection(variants,raw,12,[11,12,13,14,15,16,17])).toBe(11);
+    expect(model.resolveVariantSelection(variants,jpeg,17,[11,12,13,14,15,16,17])).toBe(12);
+    expect(model.resolveVariantSelection(variants,raw,15,[11,12,13,14,15,16,17])).toBe(15);
+    expect(model.reviewStep(raw.map(p=>p.id),11,1)).toBe(13);
+  });
+  it('falls forward to the next surviving review frame, then backward, and handles an empty view',()=>{
+    const visible=[variants[0],variants[3]];
+    expect(model.resolveVariantSelection(variants,visible,13,[11,13,14])).toBe(14);
+    expect(model.resolveVariantSelection(variants,[variants[0]],13,[11,13])).toBe(11);
+    expect(model.resolveVariantSelection(variants,[],12,[11,12])).toBeUndefined();
+  });
+  it('expands only selected paired RAW/JPEG captures without leaking another folder or PNG',()=>{
+    expect(typeof model.expandVariantScope).toBe('function');
+    expect(model.expandVariantScope(variants,[12]).map(p=>p.id)).toEqual([11,12,17]);
+    expect(model.expandVariantScope(variants,[16]).map(p=>p.id)).toEqual([16]);
+    expect(model.expandVariantScope(variants,[15,13,15,999]).map(p=>p.id)).toEqual([13,15]);
+    expect(model.expandVariantScope([variants[0],variants[6]],[11]).map(p=>p.id)).toEqual([11]);
+    expect(model.expandVariantScope(variants,[])).toEqual([]);
+  });
+});
 describe('real library selection', () => {
   it('combines search, group and decision without modifying the library', () => {
     expect(selectPhotos(photos, 'a', 'all', '山', 'time').map(p=>p.id)).toEqual([2]);

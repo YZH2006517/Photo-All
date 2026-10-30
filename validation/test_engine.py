@@ -149,6 +149,83 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(self.catalog.photos()), 1)
         self.assertEqual(path.read_bytes(), before)
 
+    def test_cancel_import_keeps_completed_memberships_and_can_resume_without_duplicates(self):
+        album = self.catalog.create_album('Resume')['id']
+        paths = [self.photo(f'resume-{index}.png') for index in range(3)]
+        originals = [path.read_bytes() for path in paths]
+        cancel = self.engine.CancellationToken(); updates = []
+        def progress(done, total):
+            updates.append((done, total))
+            if done == 1: cancel.cancel()
+        rows, errors = self.catalog.import_files(paths, progress, album, cancel=cancel)
+        self.assertEqual(len(rows), 1); self.assertEqual(errors, [])
+        self.assertEqual(self.catalog.albums()[0]['count'], 1)
+        self.assertEqual(updates[-1], (1, 3))
+        rows, errors = self.catalog.import_files([*paths, paths[0]], album_id=album, cancel=self.engine.CancellationToken())
+        self.assertEqual(len(rows), 2); self.assertEqual(errors, [])
+        self.assertEqual(self.catalog.albums()[0]['count'], 3)
+        self.assertEqual([path.read_bytes() for path in paths], originals)
+
+    def test_cancel_import_stops_lazy_enumeration_before_consuming_whole_folder(self):
+        cancel = self.engine.CancellationToken(); visited = []
+        def paths():
+            visited.append('first')
+            yield self.photo('lazy-first.png')
+            cancel.cancel()
+            visited.append('second')
+            yield self.photo('lazy-second.png')
+            self.fail('Cancelled import continued enumerating')
+        rows, errors = self.catalog.import_files(paths(), cancel=cancel)
+        self.assertEqual(len(rows), 1); self.assertEqual(errors, [])
+        self.assertEqual(visited, ['first', 'second'])
+        self.assertEqual(len(self.catalog.photos()), 1)
+
+    def test_cancel_import_hashing_stops_before_image_decode(self):
+        from unittest.mock import patch
+        cancel = self.engine.CancellationToken()
+        source = self.root / 'large.png'; source.write_bytes(b'x' * (3 * 1024 * 1024))
+        original_open = Path.open; reads = []
+        class CancellableReader:
+            def __init__(self, stream): self.stream = stream
+            def __enter__(self): return self
+            def __exit__(self, *args): self.stream.close()
+            def read(self, size=-1):
+                reads.append(size)
+                chunk = self.stream.read(size)
+                cancel.cancel()
+                return chunk
+        def open_path(path, *args, **kwargs):
+            stream = original_open(path, *args, **kwargs)
+            return CancellableReader(stream) if path == source and args == ('rb',) else stream
+        with patch.object(Path, 'open', open_path), patch('engine.open_image') as decode:
+            rows, errors = self.catalog.import_files([source], cancel=cancel)
+        self.assertEqual(rows, []); self.assertEqual(errors, [])
+        self.assertEqual(len(reads), 1); self.assertLess(reads[0], source.stat().st_size)
+        decode.assert_not_called()
+
+    def test_cancel_import_terminates_current_raw_decoder_without_recording_failure(self):
+        from unittest.mock import patch
+        import threading
+        import time
+        source = self.root / 'pending.nef'; source.write_bytes(b'raw fixture placeholder')
+        cancel = self.engine.CancellationToken(); real_run = cancel.run
+        entered = threading.Event()
+        def decoder(*args, **kwargs):
+            entered.set()
+            return real_run([sys.executable, '-c', 'import time; time.sleep(30)'], timeout=60)
+        def stop():
+            if entered.wait(5): cancel.cancel()
+        thread = threading.Thread(target=stop, daemon=True); thread.start()
+        started = time.monotonic()
+        with patch('engine.raw_executable', return_value=Path(sys.executable)), patch('engine.RAW_CACHE', self.root / 'raw-cache'), patch.object(cancel, 'run', side_effect=decoder):
+            rows, errors = self.catalog.import_files([source], cancel=cancel)
+        self.assertTrue(entered.is_set())
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(rows, []); self.assertEqual(errors, [])
+        self.assertEqual(self.catalog.photos(), [])
+        self.assertEqual(list((self.root / 'raw-cache').glob('job-*')), [])
+        self.assertEqual(source.read_bytes(), b'raw fixture placeholder')
+
     def test_remove_from_album_is_undoable_and_keeps_shared_original(self):
         path=self.photo('shared.png');before=path.read_bytes();a=self.catalog.create_album('A');b=self.catalog.create_album('B')
         self.catalog.import_files([path],album_id=a['id']);self.catalog.import_files([path],album_id=b['id']);identity=self.catalog.photos()[0]['id']

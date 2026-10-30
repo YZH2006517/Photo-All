@@ -50,6 +50,64 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(self.call(f"/api/albums/{album['id']}/restore", {})['changed'])
         self.assertEqual(self.call('/api/library')['trash_albums'], [])
 
+    def test_import_cancel_keeps_completed_photos_and_resumes_without_duplicates(self):
+        import engine
+        from unittest.mock import patch
+        album = self.call('/api/albums', {'name': 'Cancelled import'})
+        paths = [self.root / f'import-{index}.png' for index in range(3)]
+        for path in paths: Image.new('RGB', (20, 20), 'coral').save(path)
+        entered = threading.Event(); release = threading.Event(); analyze = engine.analyze; calls = []
+        def controlled(path, *args, **kwargs):
+            calls.append(path)
+            if len(calls) == 2:
+                entered.set(); release.wait(5)
+            return analyze(path, *args, **kwargs)
+        with patch('engine.analyze', side_effect=controlled):
+            identity = self.call('/api/import', {'paths': [str(path) for path in paths], 'album_id': album['id']})['id']
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertTrue(self.call('/api/jobs/' + identity + '/cancel', {})['cancel_requested'])
+            finally: release.set()
+            job = self.wait_job(identity)
+        self.assertEqual(job['status'], 'cancelled', job)
+        self.assertEqual(job['done'], 1); self.assertEqual(job['total'], 3)
+        self.assertEqual(job['result'], {'imported': 1, 'errors': []})
+        self.assertEqual(len(self.call('/api/library')['photos']), 1)
+        resumed = self.wait_job(self.call('/api/import', {'paths': [str(path) for path in paths], 'album_id': album['id']})['id'])
+        self.assertEqual(resumed['status'], 'done', resumed)
+        self.assertEqual(resumed['result']['imported'], 2)
+        self.assertEqual(len(self.call('/api/library')['photos']), 3)
+
+    def test_import_cancel_during_directory_scan_does_not_consume_rest_of_directory(self):
+        import service
+        from unittest.mock import patch
+        folder = self.root / 'scanning'; folder.mkdir()
+        (folder / 'not-a-photo.txt').write_text('unrelated', encoding='utf-8')
+        entered = threading.Event(); release = threading.Event(); next_calls = []
+        real_scandir = service.os.scandir
+        class ControlledScan:
+            def __init__(self, path): self.entries = real_scandir(path)
+            def __enter__(self): return self
+            def __exit__(self, *args): self.entries.close()
+            def __iter__(self): return self
+            def __next__(self):
+                next_calls.append(True)
+                if len(next_calls) == 1:
+                    entered.set(); release.wait(5)
+                    return next(self.entries)
+                raise AssertionError('Scan advanced again after cancellation')
+        with patch('service.os.scandir', side_effect=ControlledScan):
+            identity = self.call('/api/import', {'folder': str(folder)})['id']
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertTrue(self.call('/api/jobs/' + identity + '/cancel', {})['cancel_requested'])
+            finally: release.set()
+            job = self.wait_job(identity)
+        self.assertEqual(job['status'], 'cancelled', job)
+        self.assertEqual(job['result'], {'imported': 0, 'errors': []})
+        self.assertEqual(job['done'], 0); self.assertEqual(job['total'], 0)
+        self.assertEqual(len(next_calls), 1)
+
     def test_export_rejects_empty_invalid_and_missing_photo_ids(self):
         import engine
         path = self.root / 'valid.png'; Image.new('RGB', (20, 20), 'coral').save(path)

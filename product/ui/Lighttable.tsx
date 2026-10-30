@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Film-contact-sheet workspace implemented for Photo All's shared catalog and render pipeline.
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import {
   ArrowLeft,
@@ -32,13 +38,18 @@ import {
   decodedPreviews,
   photoPreviewFamily,
   photoDimensions,
+  VariantMode,
+  applyVariantPreference,
+  resolveVariantSelection,
 } from "./model";
 import { Picture } from "./Preview";
 import { FilmTable } from "./FilmTable";
 
 type Layout = "sheet" | "single" | "compare";
 export function Lighttable({
-  photos,
+  photos: sourcePhotos,
+  variantMode = "all",
+  onVariantMode,
   initialId,
   startCompare,
   revisions,
@@ -53,6 +64,8 @@ export function Lighttable({
   saveRef,
 }: {
   photos: Photo[];
+  variantMode?: VariantMode;
+  onVariantMode?: (mode: VariantMode) => void;
   initialId?: number;
   startCompare: boolean;
   revisions: Record<number, number>;
@@ -66,6 +79,10 @@ export function Lighttable({
   onRemove?: (id: number) => Promise<void>;
   saveRef: React.MutableRefObject<null | (() => Promise<void>)>;
 }) {
+  const photos = useMemo(
+    () => applyVariantPreference(sourcePhotos, variantMode),
+    [sourcePhotos, variantMode],
+  );
   const ids = photos.map((p) => p.id);
   const [layout, setLayout] = useState<Layout>(
     startCompare && photos.length > 1
@@ -75,7 +92,7 @@ export function Lighttable({
         : "sheet",
   );
   const [currentId, setCurrentId] = useState(
-    initialId && ids.includes(initialId) ? initialId : ids[0],
+    resolveVariantSelection(sourcePhotos, photos, initialId) ?? -1,
   );
   const [immersive, setImmersive] = useState(true),
     [controls, setControls] = useState(true),
@@ -129,14 +146,13 @@ export function Lighttable({
     onRemove,
   });
   callbacks.current = { onDecision, onUndo, onRedo, onEdit, onExit, onRemove };
-  const shownId = ids.includes(currentId)
-    ? currentId
-    : ids[
-        Math.min(
-          Math.max(0, previousIds.current.indexOf(currentId)),
-          ids.length - 1,
-        )
-      ];
+  const shownId =
+    resolveVariantSelection(
+      sourcePhotos,
+      photos,
+      currentId,
+      previousIds.current,
+    ) ?? -1;
   useEffect(() => {
     if (currentId !== shownId) {
       setCurrentId(shownId);
@@ -248,36 +264,34 @@ export function Lighttable({
   useEffect(() => {
     if (layout === "sheet") return;
     const controller = new AbortController();
-    [photos[index - 1], photos[index + 1]]
-      .filter(Boolean)
-      .forEach(
-        (photo) =>
-          void decodedPreviews
-            .read(
-              photoPreviewFamily(
+    [photos[index - 1], photos[index + 1]].filter(Boolean).forEach(
+      (photo) =>
+        void decodedPreviews
+          .read(
+            photoPreviewFamily(
+              photo,
+              false,
+              revisions[photo.id] || 0,
+              "source",
+            ),
+            1024,
+            (signal) =>
+              photoBlob(
                 photo,
+                1024,
                 false,
+                signal,
                 revisions[photo.id] || 0,
                 "source",
               ),
-              1024,
-              (signal) =>
-                photoBlob(
-                  photo,
-                  1024,
-                  false,
-                  signal,
-                  revisions[photo.id] || 0,
-                  "source",
-                ),
-              controller.signal,
-              photoDimensions({
-                ...photo,
-                recipe: photo.committed_recipe ?? photo.recipe,
-              }),
-            )
-            .catch(() => {}),
-      );
+            controller.signal,
+            photoDimensions({
+              ...photo,
+              recipe: photo.committed_recipe ?? photo.recipe,
+            }),
+          )
+          .catch(() => {}),
+    );
     return () => controller.abort();
   }, [shownId, layout]);
   const enqueue = (work: () => Promise<void>) => {
@@ -611,6 +625,19 @@ export function Lighttable({
           </button>
         </div>
         <div className="lt-header-actions">
+          <select
+            aria-label="观片格式偏好"
+            title="同目录同名的 RAW 与 JPEG 只显示优先格式；保留独立照片"
+            value={variantMode}
+            disabled={!onVariantMode}
+            onChange={(event) =>
+              onVariantMode?.(event.target.value as VariantMode)
+            }
+          >
+            <option value="all">全部</option>
+            <option value="raw">RAW优先</option>
+            <option value="jpeg">JPEG优先</option>
+          </select>
           <span className="lt-save-state">
             {pendingCount ? (
               <>

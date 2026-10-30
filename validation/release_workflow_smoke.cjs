@@ -87,6 +87,260 @@ async function capture(options) {
   await page.waitForTimeout(750);
   return page.screenshot(options);
 }
+async function verifyAlbumCovers(page) {
+  script(`
+import sys
+from pathlib import Path
+from PIL import Image
+sys.path.insert(0,r'${path.join(root, "product")}')
+import engine
+p=Path(r'${output}');(p/'cover-input').mkdir();c=engine.Catalog(p/'data'/'library.sqlite')
+cases=[('封面单竖',['portrait']),('封面单横',['landscape']),('封面双混',['portrait','landscape']),('封面双竖',['portrait','portrait']),('封面三混',['portrait','landscape','portrait']),('封面三横',['landscape','landscape','landscape'])]
+for n,(name,kinds) in enumerate(cases):
+ a=c.create_album(name)
+ for i,kind in enumerate(kinds):
+  size=(360,1200) if kind=='portrait' else (1600,400)
+  f=p/'cover-input'/f'cover-{n}-{i}.png';Image.new('RGB',size,(65+n*23,100+i*45,160+n*8)).save(f);c.import_files([f],album_id=a['id'])
+c.close()
+`);
+  await page.reload();
+  await page
+    .getByRole("button", { name: "打开图集 封面三横", exact: true })
+    .waitFor();
+  const measurements = [];
+  for (const width of [1080, 1440]) {
+    await page.setViewportSize({ width, height: 1000 });
+    const covers = page.locator(".album-cover");
+    for (let index = 0; index < (await covers.count()); index++) {
+      const cover = covers.nth(index);
+      await cover.scrollIntoViewIfNeeded();
+      await until(
+        () =>
+          cover.evaluate((el) =>
+            Array.from(el.querySelectorAll(".picture")).every(
+              (p) => p.querySelector("img")?.naturalWidth > 0,
+            ),
+          ),
+        "cover images decoded",
+      );
+    }
+    await capture({
+      path: path.join(output, `09-covers-${width}.png`),
+      fullPage: true,
+    });
+    const sizes = await page.evaluate(() => {
+      const art = document
+        .querySelector(".new-album-art")
+        .getBoundingClientRect();
+      return Array.from(document.querySelectorAll(".album-cover")).map((el) => {
+        const cover = el.getBoundingClientRect();
+        return {
+          name: el.closest(".album-card").querySelector(".album-title strong")
+            .textContent,
+          width: cover.width,
+          height: cover.height,
+          art_width: art.width,
+          art_height: art.height,
+          pictures: Array.from(el.querySelectorAll(".picture")).map((p) => {
+            const b = p.getBoundingClientRect();
+            return {
+              x: b.x - cover.x,
+              y: b.y - cover.y,
+              width: b.width,
+              height: b.height,
+            };
+          }),
+        };
+      });
+    });
+    for (const cover of sizes) {
+      assert(
+        Math.abs(cover.width - cover.art_width) < 1 &&
+          Math.abs(cover.height - cover.art_height) < 1,
+        `Album cover disagrees with new-album art at ${width}px: ${JSON.stringify(cover)}`,
+      );
+      assert(
+        Math.abs(cover.height - cover.width / 1.55) < 1,
+        `Portrait pixels stretched the album cover at ${width}px: ${JSON.stringify(cover)}`,
+      );
+      assert(
+        cover.pictures.every(
+          (p) =>
+            p.x >= 0 &&
+            p.y >= 0 &&
+            p.x + p.width <= cover.width + 1 &&
+            p.y + p.height <= cover.height + 1,
+        ),
+        "Cover image escaped its frame: " + cover.name,
+      );
+      const [first, second, third] = cover.pictures;
+      if (first)
+        assert(
+          Math.abs(first.y + first.height - (cover.height - 5)) < 2,
+          "First cover image must fill its column: " + cover.name,
+        );
+      if (second)
+        assert(
+          second.x >= first.x + first.width && Math.abs(second.y - first.y) < 1,
+          "Second cover image must start in the right column: " + cover.name,
+        );
+      if (third)
+        assert(
+          third.y >= second.y + second.height &&
+            Math.abs(third.x - second.x) < 1,
+          "Third cover image must occupy the lower right cell: " + cover.name,
+        );
+    }
+    measurements.push({ viewport_width: width, covers: sizes });
+  }
+  return measurements;
+}
+async function verifyVariantFlow(page) {
+  script(`
+import sys,shutil
+from pathlib import Path
+from PIL import Image
+sys.path.insert(0,r'${path.join(root, "product")}')
+import engine
+p=Path(r'${output}');(p/'variant-input').mkdir();engine.RAW_CACHE=p/'data'/'raw-cache'
+raw=p/'variant-input'/'paired.NEF';jpeg=p/'variant-input'/'paired.jpg'
+shutil.copyfile(r'${path.join(root, "validation/inputs/D7000.NEF")}',raw)
+Image.new('RGB',(640,400),'#4587a1').save(jpeg)
+c=engine.Catalog(p/'data'/'library.sqlite');a=c.create_album('格式配对');b=c.create_album('仅JPEG');d=c.create_album('仅RAW')
+c.import_files([raw,jpeg],album_id=a['id']);c.import_files([jpeg],album_id=b['id']);c.import_files([raw],album_id=d['id'])
+assert len([x for x in c.photos() if a['id'] in x['album_ids']])==2
+c.close()
+`);
+  await page.reload();
+  const pair = page.getByRole("button", {
+    name: "打开图集 格式配对",
+    exact: true,
+  });
+  const jpegOnly = page.getByRole("button", {
+    name: "打开图集 仅JPEG",
+    exact: true,
+  });
+  const rawOnly = page.getByRole("button", {
+    name: "打开图集 仅RAW",
+    exact: true,
+  });
+  await pair.waitFor();
+  const home = page.getByLabel("图集封面格式偏好", { exact: true });
+  await home.selectOption("raw");
+  await until(
+    async () =>
+      (await pair.locator(".album-count").textContent()).includes("1 张"),
+    "RAW cover count",
+  );
+  await jpegOnly.scrollIntoViewIfNeeded();
+  await until(
+    async () => (await jpegOnly.locator('img[alt="paired.jpg"]').count()) === 1,
+    "album-local JPEG cover survives RAW preference",
+  );
+  await rawOnly.scrollIntoViewIfNeeded();
+  await until(
+    async () => (await rawOnly.locator('img[alt="paired.NEF"]').count()) === 1,
+    "unpaired RAW cover",
+  );
+  await pair.scrollIntoViewIfNeeded();
+  await until(
+    async () =>
+      (await pair.locator('img[alt="paired.NEF"]').count()) === 1 &&
+      (await pair.locator('img[alt="paired.jpg"]').count()) === 0,
+    "paired RAW cover",
+  );
+  await home.selectOption("jpeg");
+  await until(
+    async () =>
+      (await pair.locator('img[alt="paired.jpg"]').count()) === 1 &&
+      (await pair.locator('img[alt="paired.NEF"]').count()) === 0,
+    "paired JPEG cover",
+  );
+  assert(
+    (await rawOnly.locator(".album-count").textContent()).includes("1 张"),
+    "JPEG preference hid an album-local unpaired RAW",
+  );
+  await home.selectOption("all");
+  await until(
+    async () =>
+      (await pair.locator(".album-count").textContent()).includes("2 张"),
+    "all format cover count",
+  );
+  await home.selectOption("raw");
+  await pair.click();
+  await page.getByLabel("图集格式偏好", { exact: true }).waitFor();
+  await until(
+    async () => (await page.locator(".photo-card").count()) === 1,
+    "library RAW preference",
+  );
+  await page.getByRole("button", { name: "电子观片台", exact: true }).click();
+  const viewer = page.getByRole("dialog", { name: "电子观片台", exact: true });
+  await viewer.waitFor();
+  const selector = viewer.getByLabel("观片格式偏好", { exact: true });
+  assert(
+    (await selector.inputValue()) === "raw",
+    "Viewer did not inherit RAW preference",
+  );
+  await until(
+    async () =>
+      (await viewer
+        .getByLabel("跳转观片 paired.NEF", { exact: true })
+        .count()) === 1 &&
+      (await viewer
+        .getByLabel("跳转观片 paired.jpg", { exact: true })
+        .count()) === 0,
+    "viewer RAW variant",
+  );
+  await selector.selectOption("jpeg");
+  await until(
+    async () =>
+      (await viewer
+        .getByLabel("跳转观片 paired.jpg", { exact: true })
+        .count()) === 1 &&
+      (await viewer
+        .getByLabel("跳转观片 paired.NEF", { exact: true })
+        .count()) === 0,
+    "viewer JPEG variant from expanded review scope",
+  );
+  await selector.selectOption("all");
+  await until(
+    async () => (await viewer.locator(".lt-strip button").count()) === 2,
+    "viewer all variants",
+  );
+  await until(
+    () => viewer.locator(".film-table .lt-contact-frame .picture img").evaluateAll(images => images.length === 2 && images.every(image => image.complete && image.naturalWidth > 0)),
+    "viewer source pixels decoded",
+    60000,
+  );
+  await capture({ path: path.join(output, "10-viewer-variants.png") });
+  await selector.selectOption("jpeg");
+  await viewer.getByLabel("退出观片台", { exact: true }).click();
+  await page.getByLabel("图集格式偏好", { exact: true }).waitFor();
+  assert(
+    (await page.getByLabel("图集格式偏好", { exact: true }).inputValue()) ===
+      "jpeg",
+    "Viewer preference was not shared back to the library",
+  );
+  await page.getByLabel("返回全部图集", { exact: true }).click();
+  assert(
+    (await page
+      .getByLabel("图集封面格式偏好", { exact: true })
+      .inputValue()) === "jpeg",
+    "Home cover preference did not remain shared",
+  );
+  await pair.scrollIntoViewIfNeeded();
+  await capture({
+    path: path.join(output, "11-home-variant-covers.png"),
+    fullPage: true,
+  });
+  return {
+    actual_nef: true,
+    album_local_pairing: true,
+    cover_counts: true,
+    shared_home_library_viewer_preference: true,
+    review_scope_keeps_both_variants: true,
+  };
+}
 (async () => {
   const connection = JSON.parse(
     await new Promise((resolve, reject) => {
@@ -134,6 +388,28 @@ async function capture(options) {
   await page
     .getByRole("button", { name: "打开图集 交付甲", exact: true })
     .waitFor();
+  if (process.argv.includes("--covers-only")) {
+    const covers = await verifyAlbumCovers(page);
+    const report = { status: "passed", covers, browser_errors: errors };
+    assert(!errors.length, errors.join("\n"));
+    fs.writeFileSync(
+      path.join(output, "report.json"),
+      JSON.stringify(report, null, 2),
+    );
+    console.log(JSON.stringify({ output, ...report }, null, 2));
+    return;
+  }
+  if (process.argv.includes("--variants-only")) {
+    const variants = await verifyVariantFlow(page);
+    const report = { status: "passed", variants, browser_errors: errors };
+    assert(!errors.length, errors.join("\n"));
+    fs.writeFileSync(
+      path.join(output, "report.json"),
+      JSON.stringify(report, null, 2),
+    );
+    console.log(JSON.stringify({ output, ...report }, null, 2));
+    return;
+  }
   const initial = await call("/library"),
     pending = initial.photos.find((p) => p.name === "pending.jpg");
   assert(
@@ -144,6 +420,116 @@ async function capture(options) {
     Math.abs((await page.locator(".sidebar").boundingBox()).width - 72) < 1,
     "Default rail is not 72px",
   );
+  const sidebar = page.locator(".sidebar");
+  const drawerExpanded = () =>
+    sidebar.locator(".drawer-toggle").getAttribute("aria-expanded");
+  await page.mouse.move(500, 150);
+  await page.mouse.move(25, 150);
+  await page.waitForTimeout(45);
+  await page.mouse.move(500, 150);
+  await page.waitForTimeout(200);
+  assert(
+    (await drawerExpanded()) === "false",
+    "Quick rail transit flashed the drawer",
+  );
+  await page.mouse.move(25, 150);
+  await until(
+    async () => (await drawerExpanded()) === "true",
+    "hover intent opens drawer",
+    2000,
+  );
+  await page.mouse.move(160, 550);
+  await page.waitForTimeout(450);
+  assert(
+    (await drawerExpanded()) === "true",
+    "Moving within the open drawer closed it",
+  );
+  await page.mouse.move(600, 550);
+  await page.waitForTimeout(140);
+  assert(
+    (await drawerExpanded()) === "true",
+    "Drawer closed without its leave delay",
+  );
+  await until(
+    async () => (await drawerExpanded()) === "false",
+    "pointer leave closes drawer",
+    2000,
+  );
+  assert(
+    await sidebar.evaluate((el) =>
+      getComputedStyle(el).transitionProperty.includes("width"),
+    ),
+    "Drawer has no smooth closing transition",
+  );
+  await page.waitForTimeout(280);
+  await sidebar.dispatchEvent("pointerenter", { pointerType: "touch" });
+  await page.waitForTimeout(180);
+  assert(
+    (await drawerExpanded()) === "false",
+    "Touch generated an unintended hover open",
+  );
+  await page.keyboard.press("Tab");
+  await sidebar.locator(".drawer-toggle").focus();
+  await until(
+    async () => (await drawerExpanded()) === "true",
+    "keyboard focus opens drawer",
+    2000,
+  );
+  await page.mouse.move(600, 800);
+  await page.waitForTimeout(500);
+  assert(
+    (await drawerExpanded()) === "true",
+    "Sidebar keyboard focus was not retained",
+  );
+  await page.getByLabel("返回全部图集", { exact: true }).focus();
+  await until(
+    async () => (await drawerExpanded()) === "false",
+    "focus leaving closes drawer",
+    2000,
+  );
+  await page.mouse.move(25, 150);
+  await until(
+    async () => (await drawerExpanded()) === "true",
+    "hover reopens drawer",
+    2000,
+  );
+  await sidebar.getByTitle("图集", { exact: true }).click();
+  await page.waitForTimeout(550);
+  assert(
+    (await drawerExpanded()) === "false",
+    "Navigation close immediately reopened under the pointer",
+  );
+  await page.mouse.move(600, 100);
+  await page.mouse.move(25, 150);
+  await until(
+    async () => (await drawerExpanded()) === "true",
+    "drawer opens before Escape",
+    2000,
+  );
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(400);
+  assert(
+    (await drawerExpanded()) === "false",
+    "Escape close immediately reopened under the pointer",
+  );
+  await page.mouse.move(600, 100);
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await until(
+    async () =>
+      await sidebar.evaluate((el) =>
+        getComputedStyle(el)
+          .transitionDuration.split(",")
+          .every((v) => parseFloat(v) === 0),
+      ),
+    "reduced-motion disables drawer movement",
+    2000,
+  );
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await page.getByLabel("展开导航", { exact: true }).click();
+  await sidebar.locator(".drawer-toggle").click();
+  await page.waitForTimeout(250);
+  assert((await drawerExpanded()) === "false", "Manual collapse button failed");
+  await page.mouse.move(600, 100);
   await page.getByLabel("展开导航", { exact: true }).click();
   assert(
     (await page
@@ -479,12 +865,24 @@ print(json.dumps({'bits':16,'float_pipeline_match':True,'sources_unchanged':True
 `),
   );
   assert(!errors.length, errors.join("\n"));
+  const covers = await verifyAlbumCovers(page);
+  const variants = await verifyVariantFlow(page);
+  assert(!errors.length, errors.join("\n"));
   const report = {
     status: "passed",
     layout,
     facet_count: 13,
     all_facets_exercised: true,
     linked_facets: true,
+    hover_drawer: {
+      intent_ms: 120,
+      leave_ms: 350,
+      quick_transit_no_flash: true,
+      internal_pointer_retained: true,
+      keyboard_focus_retained: true,
+      touch_no_hover: true,
+      reduced_motion: true,
+    },
     incompatible_format_dialog_reopens: true,
     trash_retention_days: 30,
     trash_restore: true,
@@ -501,6 +899,8 @@ print(json.dumps({'bits':16,'float_pipeline_match':True,'sources_unchanged':True
       ui_targeted_current_job: true,
     },
     precision,
+    covers,
+    variants,
     browser_errors: errors,
   };
   fs.writeFileSync(

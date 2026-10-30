@@ -23,6 +23,8 @@ import {
   localDate,
   facetCounts,
   facetKeys,
+  VariantMode,
+  applyVariantPreference,
 } from "./model";
 
 export const colorLabels: Record<string, string> = {
@@ -69,6 +71,8 @@ export function Albums({
   removeAlbum,
   restoreAlbum,
   trash = false,
+  variantMode = "all",
+  onVariantMode,
 }: {
   library: Library;
   open: (album: Album) => void;
@@ -79,8 +83,14 @@ export function Albums({
   removeAlbum: (album: Album) => void;
   restoreAlbum: (album: Album) => void;
   trash?: boolean;
+  variantMode?: VariantMode;
+  onVariantMode?: (mode: VariantMode) => void;
 }) {
   const albums = trash ? library.trash_albums || [] : library.albums;
+  const visiblePhotoCount = applyVariantPreference(
+    library.photos,
+    variantMode,
+  ).length;
   const [creating, setCreating] = useState(false),
     [name, setName] = useState(""),
     [error, setError] = useState(""),
@@ -126,7 +136,7 @@ export function Albums({
             <Film size={24} />
             <span>
               电子观片台
-              <small>{library.photos.length} 张照片 · 胶卷与光影</small>
+              <small>{visiblePhotoCount} 张显示照片 · 胶卷与光影</small>
             </span>
             <ArrowUpRight size={16} />
           </button>
@@ -140,6 +150,20 @@ export function Albums({
         <span>
           {trash ? "已删除图集" : "我的图集"} <b>{albums.length}</b>
         </span>
+        {!trash && (
+          <select
+            className="variant-preference"
+            aria-label="图集封面格式偏好"
+            title="同一图集内的同目录同名 RAW 与 JPEG 仅显示优先格式"
+            value={variantMode}
+            disabled={busy || !onVariantMode}
+            onChange={(e) => onVariantMode?.(e.target.value as VariantMode)}
+          >
+            <option value="all">全部格式</option>
+            <option value="raw">RAW 优先</option>
+            <option value="jpeg">JPEG 优先</option>
+          </select>
+        )}
         <span>
           <FolderPlus size={14} />{" "}
           {trash ? "30 天内可恢复" : "新建图集后，导入一个文件夹开始整理"}
@@ -172,8 +196,9 @@ export function Albums({
           </div>
         )}
         {albums.map((album, index) => {
-          const photos = library.photos.filter((p) =>
-            p.album_ids.includes(album.id),
+          const photos = applyVariantPreference(
+            library.photos.filter((p) => p.album_ids.includes(album.id)),
+            variantMode,
           );
           const cover = photos
             .filter((p) => p.decision !== "reject")
@@ -197,17 +222,21 @@ export function Albums({
                 whileHover={{ y: -4 }}
               >
                 <div className={`album-cover cover-${cover.length}`}>
-                  {cover.length ? (
-                    cover.map((photo) => (
-                      <Picture key={photo.id} photo={photo} size={600} />
-                    ))
-                  ) : (
-                    <div className="album-empty-cover">
-                      <Images size={38} strokeWidth={0.8} />
-                      <span>等待第一张照片</span>
-                    </div>
-                  )}
-                  <span className="album-count">{album.count} 张照片</span>
+                  <div className="album-cover-grid">
+                    {cover.length ? (
+                      cover.map((photo) => (
+                        <Picture key={photo.id} photo={photo} size={600} />
+                      ))
+                    ) : (
+                      <div className="album-empty-cover">
+                        <Images size={38} strokeWidth={0.8} />
+                        <span>等待第一张照片</span>
+                      </div>
+                    )}
+                  </div>
+                  <span className="album-count">
+                    {trash ? album.count : photos.length} 张照片
+                  </span>
                   <span className="album-enter">
                     <ArrowUpRight size={17} />
                   </span>

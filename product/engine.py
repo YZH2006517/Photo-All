@@ -454,11 +454,19 @@ def render_pixels(path,recipe,max_size=None,preserve_alpha=False):
 
 
 
-def analyze(path):
+def analyze(path, cancel=None):
     path = Path(path)
+    if cancel: cancel.check()
+    digest = hashlib.sha256()
     with path.open('rb') as stream:
-        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-    image = open_image(path)
+        while True:
+            if cancel: cancel.check()
+            chunk = stream.read(1024 * 1024)
+            if not chunk: break
+            digest.update(chunk)
+    with cancellation_scope(cancel):
+        image = open_image(path)
+    if cancel: cancel.check()
     width, height = image.size
     gray = image.convert('L')
     gray.thumbnail((256, 256))
@@ -485,9 +493,11 @@ def analyze(path):
     except (OSError, ValueError, TypeError, KeyError):
         pass
     from workflow import visual_features
+    features = visual_features(image)
+    if cancel: cancel.check()
     return {'path': str(path.resolve()), 'name': path.name, 'width': width, 'height': height,
-            'digest': digest, 'phash': f'{int(bits, 2):016x}', 'captured': captured,
-            'time_source': time_source, 'score': score, 'features': json.dumps(visual_features(image))}
+            'digest': digest.hexdigest(), 'phash': f'{int(bits, 2):016x}', 'captured': captured,
+            'time_source': time_source, 'score': score, 'features': json.dumps(features)}
 
 
 class Catalog:
@@ -623,53 +633,70 @@ class Catalog:
                 self.db.execute('UPDATE composites SET document=? WHERE id=?', (json.dumps(document), identity))
         return dict(document, id=identity)
 
-    def import_files(self, paths, progress=None, album_id=None):
+    def import_files(self, paths, progress=None, album_id=None, cancel=None):
         self.purge_expired_albums()
         if album_id is not None and (type(album_id) is not int or not self.db.execute(
                 'SELECT 1 FROM albums WHERE id=? AND trashed_at IS NULL', (album_id,)).fetchone()):
             raise ValueError('图集不存在，请先新建图集')
-        imported, errors = [], []
-        paths = list(dict.fromkeys(str(Path(p).resolve()) for p in paths))
-        if album_id is None and paths:
-            legacy = self.db.execute("SELECT id FROM albums WHERE name='未归档照片' AND trashed_at IS NULL LIMIT 1").fetchone()
-            album_id = legacy['id'] if legacy else self.create_album('未归档照片')['id']
-        for index, path in enumerate(paths):
-            try:
-                existing = self.db.execute('SELECT id FROM photos WHERE path=?', (path,)).fetchone()
-                if existing:
-                    if album_id is not None:
+        imported, errors, seen = set(), [], set()
+        total = len(paths) if isinstance(paths, (list, tuple)) else 0
+        done = 0
+        if progress: progress(0, total)
+        try:
+            iterator = iter(paths)
+            while True:
+                if cancel: cancel.check()
+                try: candidate = next(iterator)
+                except StopIteration: break
+                if cancel: cancel.check()
+                path = str(Path(candidate).resolve())
+                if path in seen: continue
+                seen.add(path)
+                if album_id is None:
+                    legacy = self.db.execute("SELECT id FROM albums WHERE name='未归档照片' AND trashed_at IS NULL LIMIT 1").fetchone()
+                    album_id = legacy['id'] if legacy else self.create_album('未归档照片')['id']
+                try:
+                    existing = self.db.execute('SELECT id FROM photos WHERE path=?', (path,)).fetchone()
+                    if existing:
                         with self.db:
                             self.db.execute('BEGIN IMMEDIATE')
+                            if cancel: cancel.check()
                             self.require_active_album(album_id)
                             self.db.execute('INSERT OR IGNORE INTO album_photos VALUES (?,?)', (album_id, existing['id']))
                             self.db.execute('UPDATE photos SET hidden=0 WHERE id=?',(existing['id'],))
-                    continue
-                info = analyze(path)
-                columns = ','.join(info)
-                with self.db:
-                    self.db.execute('BEGIN IMMEDIATE')
-                    if album_id is not None: self.require_active_album(album_id)
-                    cursor = self.db.execute(f'INSERT INTO photos ({columns}) VALUES ({",".join("?" for _ in info)})',
-                                             tuple(info.values()))
-                    if album_id is not None:
-                        self.db.execute('INSERT INTO album_photos VALUES (?,?)', (album_id, cursor.lastrowid))
-                imported.append(path)
-            except (OSError, ValueError, RuntimeError) as exc:
-                errors.append({'path': path, 'error': str(exc)})
-            finally:
-                if progress:
-                    progress(index + 1, len(paths))
-        self.regroup()
+                    else:
+                        info = analyze(path, cancel=cancel)
+                        columns = ','.join(info)
+                        with self.db:
+                            self.db.execute('BEGIN IMMEDIATE')
+                            if cancel: cancel.check()
+                            self.require_active_album(album_id)
+                            cursor = self.db.execute(f'INSERT INTO photos ({columns}) VALUES ({",".join("?" for _ in info)})',
+                                                     tuple(info.values()))
+                            self.db.execute('INSERT INTO album_photos VALUES (?,?)', (album_id, cursor.lastrowid))
+                        imported.add(path)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    errors.append({'path': path, 'error': str(exc)})
+                done += 1
+                if progress: progress(done, total)
+            self.regroup(cancel=cancel)
+        except ExportCancelled:
+            # Per-photo transactions already committed remain available after cancel.
+            pass
+        finally:
+            if hasattr(iterator, 'close'): iterator.close()
+        if progress: progress(done, total if total and cancel and cancel.event.is_set() else done)
         return [p for p in self.photos() if p['path'] in imported], errors
 
     def require_active_album(self, identity):
         if not self.db.execute('SELECT 1 FROM albums WHERE id=? AND trashed_at IS NULL', (identity,)).fetchone():
             raise ValueError('图集已删除或不存在，请先还原或新建图集')
 
-    def regroup(self):
+    def regroup(self, cancel=None):
         seen, last, group = {}, None, None
         with self.db:
             for photo in self.photos():
+                if cancel: cancel.check()
                 if last is None or photo['captured'] - last > 45 * 60:
                     group = str(photo['id'])
                 duplicate = seen.get(photo['digest'])
