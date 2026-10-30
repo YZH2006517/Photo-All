@@ -43,7 +43,7 @@ import {
   resolveVariantSelection,
 } from "./model";
 import { Picture } from "./Preview";
-import { FilmTable } from "./FilmTable";
+import { FILM_DRAG_TYPE, FilmTable } from "./FilmTable";
 
 type Layout = "sheet" | "single" | "compare";
 export function Lighttable({
@@ -137,6 +137,11 @@ export function Lighttable({
     ),
     lastWake = useRef(0);
   const immersionInitialized = useRef(false);
+  const deskEntered = useRef(false);
+  const [tableMotion, setTableMotion] = useState(false);
+  const [deskReveal, setDeskReveal] = useState(0);
+  const [thumbnailDrag, setThumbnailDrag] = useState<number | null>(null);
+  const [deskIds, setDeskIds] = useState<number[]>([]);
   const callbacks = useRef({
     onDecision,
     onUndo,
@@ -544,7 +549,8 @@ export function Lighttable({
       </div>
     </div>
   );
-  const hudVisible = !immersive || controls || help;
+  const hudVisible =
+    !immersive || controls || help || tableMotion || thumbnailDrag !== null;
   const hudEvents = {
     onPointerEnter: () => {
       hoverHUD.current = true;
@@ -736,6 +742,14 @@ export function Lighttable({
             setPan({ x: 0, y: 0 });
           }}
           active={layout !== "single"}
+          intro={!deskEntered.current}
+          onIntroComplete={() => {
+            deskEntered.current = true;
+          }}
+          onMotionChange={setTableMotion}
+          reveal={deskReveal}
+          incomingId={thumbnailDrag}
+          onDeskChange={setDeskIds}
           light={light}
           onLight={() => setLight((v) => !v)}
         />
@@ -820,7 +834,40 @@ export function Lighttable({
               .map((photo) => (
                 <button
                   key={photo.id}
-                  className={photo.id === shownId ? "active" : ""}
+                  data-photo-id={photo.id}
+                  className={`${photo.id === shownId ? "active" : ""} ${layout === "sheet" && deskIds.includes(photo.id) ? "is-on-desk" : ""} ${thumbnailDrag === photo.id ? "is-dragging" : ""}`}
+                  draggable={layout === "sheet"}
+                  title={
+                    layout === "sheet"
+                      ? deskIds.includes(photo.id)
+                        ? "已在台面，拖动可重新摆放"
+                        : "拖到观片台摆放这张照片"
+                      : undefined
+                  }
+                  onDragStart={(event) => {
+                    if (layout !== "sheet") {
+                      event.preventDefault();
+                      return;
+                    }
+                    event.dataTransfer.effectAllowed = "copy";
+                    event.dataTransfer.setData(
+                      FILM_DRAG_TYPE,
+                      String(photo.id),
+                    );
+                    const image = event.currentTarget.querySelector("img");
+                    if (image)
+                      event.dataTransfer.setDragImage(
+                        image,
+                        image.width / 2,
+                        image.height / 2,
+                      );
+                    setThumbnailDrag(photo.id);
+                    setControls(true);
+                  }}
+                  onDragEnd={() => {
+                    setThumbnailDrag(null);
+                    wake();
+                  }}
                   aria-label={`跳转观片 ${photo.name}`}
                   onContextMenu={(e) => {
                     e.preventDefault();
@@ -838,6 +885,7 @@ export function Lighttable({
                     });
                   }}
                   onClick={() => {
+                    setDeskReveal((n) => n + 1);
                     setCurrentId(photo.id);
                     setPan({ x: 0, y: 0 });
                   }}
@@ -854,6 +902,9 @@ export function Lighttable({
         )}
         <div className="lt-footnote">
           <span>
+            {layout === "sheet"
+              ? `台面 ${deskIds.length} / ${photos.length} · `
+              : ""}
             {photos.filter((p) => decision(p) === "keep").length} 张精选 ·{" "}
             {photos.filter((p) => decision(p) === "reject").length} 张排除
           </span>

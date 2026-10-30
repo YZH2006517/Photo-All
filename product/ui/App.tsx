@@ -1147,7 +1147,7 @@ function Studio() {
           <div className="sidebar-bottom">
             <span className="online-dot" /> 本地引擎
             {library.capabilities.raw ? "已就绪" : "待连接"}
-            <span className="version">0.10.0</span>
+            <span className="version">0.10.5</span>
           </div>
         </aside>
 

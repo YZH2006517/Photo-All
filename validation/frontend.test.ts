@@ -1,5 +1,25 @@
 import { describe, expect, it } from 'vitest';
 import * as model from '../product/ui/model';
+describe('lighttable motion geometry',()=>{
+  const frames=[{id:1,x:40,y:40,width:300,height:260},{id:2,x:340,y:40,width:300,height:260},{id:3,x:640,y:40,width:300,height:260}];
+  it('sizes a docked photo to the actual footer thumbnail, including an offscreen source',()=>{
+    expect(typeof model.filmDockTransform).toBe('function');
+    expect(model.filmDockTransform({x:-100,y:50,width:600,height:400},{x:300,y:800,width:60,height:40})).toEqual({x:400,y:750,scaleX:.1,scaleY:.1});
+  });
+  it('plays at roughly six seconds per frame, clamps bounds and resumes smoothly',()=>{
+    expect(typeof model.filmRollPlayback).toBe('function');
+    const full=model.filmRollPlayback({x:10,y:0,scale:1},frames,600)!;
+    expect(full.start).toBe(10);expect(full.end).toBe(-390);expect(full.duration).toBe(8000);
+    expect(model.filmRollPlayback({x:-190,y:0,scale:1},frames,600)!.duration).toBe(4000);
+    expect(model.filmRollPlayback({x:-390,y:0,scale:1},frames,600)!.start).toBe(10);
+    expect(model.filmRollPlayback({x:999,y:0,scale:1},frames,600)!.start).toBe(10);
+  });
+  it('does not play an empty or fully visible short roll',()=>{
+    expect(typeof model.filmRollPlayback).toBe('function');
+    expect(model.filmRollPlayback({x:0,y:0,scale:1},[],600)).toBeNull();
+    expect(model.filmRollPlayback({x:0,y:0,scale:.3},frames,600)).toBeNull();
+  });
+});
 describe('filter thumbnail cache identity',()=>{
   const sample = {id:7,path:'C:/photos/frame.jpg',digest:'source',recipe:{exposure:0,style:'warm',filter_id:'one',filter_strength:.2}} as any;
   it('reuses thumbnails when only the selected filter, legacy style or strength changes',()=>{

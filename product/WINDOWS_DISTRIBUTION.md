@@ -96,7 +96,8 @@ original bundled license notices. Adwaita 50.0 artwork is LGPL-3.0-or-later OR
 CC-BY-SA-3.0; its source and notices are included too.
 
 Provide that corresponding-source ZIP at the same release download location as
-the installer and portable ZIP. Its packages can be rebuilt in MSYS2 with
+the installer and portable ZIP, either attached or directly linked to the identical
+previously published archive with its SHA-256. Its packages can be rebuilt in MSYS2 with
 `makepkg-mingw` and the recorded build environment. Original build/bundle steps
 are in RawTherapee's `.github/workflows/windows.yml`. Upstream source locations:
 <https://repo.msys2.org/mingw/sources/>, <https://packages.msys2.org/> and
@@ -125,7 +126,8 @@ output encoding. The runtime keeps `engines/open-filters/manifest.json`,
 The manifest records each original member/hash, source bit depth, conversion,
 attribution, license and converted LUT hash. These adaptations retain CC BY-SA
 4.0. The same release must offer `Photo-All-open-filter-sources.zip` alongside
-the binaries: it contains the complete unchanged original Hald archive, the
+the binaries, attached or directly linked to the identical previously published
+archive with its SHA-256. It contains the complete unchanged original Hald archive, the
 catalog, license, upstream attribution, modification notice and converter.
 The application source includes `open_filters.py`, `pixels.py`, the checked-in
 catalog and `filter-licenses/`; run `python product/film.py --setup-filters`

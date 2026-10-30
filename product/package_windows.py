@@ -401,6 +401,9 @@ def stage():
 
 
 def build():
+    target = Path(os.environ.get('CARGO_TARGET_DIR', str(ROOT / 'src-tauri/target')))
+    if not target.is_absolute():
+        target = (ROOT / target).resolve()
     if not (STAGE / 'runtime-manifest.json').is_file():
         raise RuntimeError('Run stage first')
     if not (STAGE / 'licenses/RawTherapee-dependencies.txt').is_file() or not (ROOT / 'dist/Photo-All-third-party-corresponding-source.zip').is_file():
@@ -432,11 +435,11 @@ def build():
     if portable.exists():
         shutil.rmtree(portable)
     portable.mkdir(exist_ok=True)
-    copy(ROOT / 'src-tauri/target/release/photo-all.exe', portable / 'Photo All Studio.exe')
+    copy(target / 'release/photo-all.exe', portable / 'Photo All Studio.exe')
     copy(STAGE, portable / 'runtime')
     copy(ROOT / 'WINDOWS_DISTRIBUTION.md', portable / 'README.txt')
     shutil.make_archive(str(portable), 'zip', root_dir=portable)
-    for installer in (ROOT / 'src-tauri/target/release/bundle/nsis').glob('*-setup.exe'):
+    for installer in (target / 'release/bundle/nsis').glob('*-setup.exe'):
         copy(installer, output / installer.name)
     files = [p for p in output.iterdir() if p.is_file() and p.suffix in {'.zip', '.exe'}]
     (output / 'SHA256SUMS.txt').write_text(''.join(f'{sha256(p)}  {p.name}\n' for p in sorted(files)), encoding='utf-8')

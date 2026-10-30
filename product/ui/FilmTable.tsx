@@ -8,7 +8,18 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { Grid2X2, Hand, Minus, Plus, Search, Sun, X } from "lucide-react";
+import {
+  Archive,
+  Grid2X2,
+  Hand,
+  Minus,
+  Pause,
+  Play,
+  Plus,
+  Search,
+  Sun,
+  X,
+} from "lucide-react";
 import {
   Photo,
   FilmTableFrame,
@@ -20,15 +31,21 @@ import {
   filmRefractionMap,
   photoDimensions,
   resizeFilmFrame,
+  filmDockTransform,
+  filmRollPlayback,
 } from "./model";
 import { Picture, sourceSize } from "./Preview";
 
 type Point = { x: number; y: number };
+export const FILM_DRAG_TYPE = "application/x-photoall-film";
 type Saved = {
+  layout?: number;
+  auto?: boolean;
   frames: Record<number, Point>;
   view: FilmTableView;
   brightness: number;
   scales?: Record<number, number>;
+  placed?: number[];
 };
 const finite = (n: unknown): n is number =>
   typeof n === "number" && Number.isFinite(n);
@@ -49,6 +66,11 @@ function loadDesk(key: string): Saved | null {
       return null;
     return {
       ...saved,
+      placed: Array.isArray(saved.placed)
+        ? saved.placed.filter(
+            (id: unknown) => Number.isSafeInteger(id) && Number(id) > 0,
+          )
+        : undefined,
       frames: Object.fromEntries(
         Object.entries(saved.frames || {}).filter(
           ([, p]: [string, any]) => finite(p.x) && finite(p.y),
@@ -96,6 +118,12 @@ export function FilmTable({
   onLight,
   roll = false,
   decorated = true,
+  intro = true,
+  onIntroComplete,
+  onMotionChange,
+  reveal = 0,
+  incomingId = null,
+  onDeskChange,
 }: {
   photos: Photo[];
   currentId: number;
@@ -109,6 +137,12 @@ export function FilmTable({
   onLight: () => void;
   roll?: boolean;
   decorated?: boolean;
+  intro?: boolean;
+  onIntroComplete?: () => void;
+  onMotionChange?: (busy: boolean) => void;
+  reveal?: number;
+  incomingId?: number | null;
+  onDeskChange?: (ids: number[]) => void;
 }) {
   const key = useMemo(
     () =>
@@ -133,12 +167,40 @@ export function FilmTable({
     initial?.scales || {},
   );
   const [lensSize, setLensSize] = useState(150);
+  const [placed, setPlaced] = useState<number[] | null>(
+    initial?.placed ?? null,
+  );
+  const [returning, setReturning] = useState<number[]>([]);
+  const [draggedId, setDraggedId] = useState<number | null>(null);
+  const [zoneHover, setZoneHover] = useState(false);
+  const returnFlights = useRef(new Map<number, Animation>());
+  const deskChange = useRef(onDeskChange);
+  deskChange.current = onDeskChange;
+  const [motion, setMotion] = useState<
+    "waiting" | "entering" | "stowing" | "stowed" | "idle"
+  >(
+    !roll && initial?.placed?.length === 0
+      ? "stowed"
+      : !roll && intro
+        ? "waiting"
+        : "idle",
+  );
+  const [playing, setPlaying] = useState(false);
+  const world = useRef<HTMLDivElement>(null);
+  const flights = useRef<Animation[]>([]),
+    playback = useRef<Animation | null>(null);
+  const entered = useRef(false),
+    motionCallbacks = useRef({ onIntroComplete, onMotionChange });
+  const lastSelection = useRef({ currentId, reveal, active });
+  motionCallbacks.current = { onIntroComplete, onMotionChange };
+  const reducedMotion = () =>
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   const [size, setSize] = useState({ width: 1440, height: 940 }),
     [hand, setHand] = useState(false),
     [limit, setLimit] = useState(96),
     [moving, setMoving] = useState(false);
   const viewport = useRef<HTMLDivElement>(null),
-    fitted = useRef(!!initial),
+    fitted = useRef(!!initial && initial.layout === 3),
     raf = useRef(0),
     pendingMove = useRef<(() => void) | null>(null);
   const drag = useRef<{
@@ -156,13 +218,78 @@ export function FilmTable({
       sy: number;
     };
   } | null>(null);
-  const desk = useRef({ positions, view, brightness, scales });
-  desk.current = { positions, view, brightness, scales };
-  const shown = photos.slice(0, limit),
-    columns = Math.min(
-      8,
-      Math.max(3, Math.ceil(Math.sqrt(Math.min(shown.length, 24) * 2))),
-    );
+  const desk = useRef({ positions, view, brightness, scales, placed });
+  desk.current = { positions, view, brightness, scales, placed };
+  // Snapshot the composited position before cancel, so pausing never jumps.
+  const pausePlayback = (paused = true) => {
+    const animation = playback.current;
+    if (animation && world.current) {
+      const matrix = new DOMMatrixReadOnly(
+        getComputedStyle(world.current).transform,
+      );
+      const next = { ...desk.current.view, x: matrix.m41, y: matrix.m42 };
+      desk.current.view = next;
+      world.current.style.transform = `translate(${next.x}px,${next.y}px) scale(${next.scale})`;
+      animation.cancel();
+      playback.current = null;
+      setView(next);
+    }
+    if (paused) setPlaying(false);
+  };
+  const cancelFlight = () => {
+    flights.current.forEach((animation) => animation.cancel());
+    flights.current = [];
+  };
+  const cancelReturns = () => {
+    returnFlights.current.forEach((animation) => animation.cancel());
+    returnFlights.current.clear();
+    setReturning([]);
+  };
+  const stopMotion = () => {
+    pausePlayback();
+    cancelFlight();
+    if (motion !== "idle" && motion !== "stowed") setMotion("idle");
+  };
+  const autoLayout = useRef(
+    initial?.auto ?? !Object.keys(initial?.frames || {}).length,
+  );
+  const placedSet = useMemo(
+    () => (placed === null ? null : new Set(placed)),
+    [placed],
+  );
+  const shown = photos.filter(
+    (photo, index) =>
+      index < limit ||
+      placedSet?.has(photo.id) ||
+      positions[photo.id] !== undefined,
+  );
+  const table = viewport.current,
+    root = table?.closest(".lighttable");
+  const header = root?.querySelector<HTMLElement>(".lt-header");
+  const footer = root?.querySelector<HTMLElement>(".lt-footer");
+  const toolbar = table?.querySelector<HTMLElement>(".ft-toolbar");
+  let origin = 0;
+  for (
+    let parent: HTMLElement | null = table;
+    parent && parent !== root;
+    parent = parent.offsetParent as HTMLElement | null
+  )
+    origin -= parent.offsetTop;
+  const top = Math.max(
+    24,
+    header ? origin + header.offsetTop + header.offsetHeight + 18 : 110,
+    toolbar ? toolbar.offsetTop + toolbar.offsetHeight + 18 : 160,
+  );
+  const bottom = Math.min(
+    size.height - 24,
+    footer ? origin + footer.offsetTop - 20 : size.height - 190,
+  );
+  const area = {
+    x: 48,
+    y: top,
+    width: Math.max(240, size.width - 96),
+    height: Math.max(120, bottom - top),
+  };
   const aspectKey = shown
     .map((p) => {
       const d = photoDimensions(p);
@@ -178,10 +305,10 @@ export function FilmTable({
           )
         : filmTableLayout(
             shown.map((p) => ({ ...p, ...photoDimensions(p) })),
-            columns,
+            area,
             decorated,
           ),
-    [aspectKey, columns, decorated, roll],
+    [aspectKey, area.width, area.height, decorated, roll],
   );
   const rollHeight = decorated ? 260 : 200;
   const frames = base.map((frame) =>
@@ -193,6 +320,129 @@ export function FilmTable({
           decorated,
         ),
   );
+  const visibleFrames = frames.filter(
+    (frame) => roll || placedSet === null || placedSet.has(frame.id),
+  );
+  const zoneWidth = Math.min(720, Math.max(280, size.width * 0.55));
+  const zoneHeight = 44;
+  const zoneLeft = (size.width - zoneWidth) / 2;
+  const zoneBottom = Math.min(
+    size.height - 4,
+    footer ? origin + footer.offsetTop + 2 : size.height - 170,
+  );
+  const overStowZone = (x: number, y: number) => {
+    const rect = viewport.current?.getBoundingClientRect();
+    if (!rect) return false;
+    const u = (x - rect.left - size.width / 2) / (zoneWidth / 2),
+      v = (zoneBottom - (y - rect.top)) / zoneHeight;
+    return Math.abs(u) <= 1 && v >= 0 && v <= 1 && u * u + v * v <= 1;
+  };
+  const dockBounds = () => {
+    const table = viewport.current!,
+      root = table.closest(".lighttable")!;
+    const footer = root.querySelector<HTMLElement>(".lt-footer");
+    const strip = root.querySelector<HTMLElement>(".lt-strip");
+    const origin = root.getBoundingClientRect();
+    return {
+      x:
+        origin.left +
+        (footer ? footer.offsetLeft + footer.offsetWidth / 2 : size.width / 2) -
+        28,
+      y:
+        origin.top +
+        (footer && strip
+          ? footer.offsetTop + strip.offsetTop + strip.offsetHeight / 2
+          : size.height - 72) -
+        20,
+      width: 56,
+      height: 40,
+    };
+  };
+  const stowOne = (id: number) => {
+    if (returning.includes(id)) return;
+    autoLayout.current = false;
+    setLoupe(false);
+    setPlaced((old) =>
+      (old ?? visibleFrames.map((frame) => frame.id)).filter(
+        (value) => value !== id,
+      ),
+    );
+    setReturning((old) => [...old, id]);
+  };
+  const placeOne = (id: number, client: Point) => {
+    const photo = photos.find((photo) => photo.id === id);
+    if (!photo || roll) return;
+    stopMotion();
+    returnFlights.current.get(id)?.cancel();
+    returnFlights.current.delete(id);
+    setReturning((old) => old.filter((value) => value !== id));
+    autoLayout.current = false;
+    setLoupe(false);
+    setMotion("idle");
+    const currentView =
+      visibleFrames.length || returning.length
+        ? desk.current.view
+        : { x: 0, y: 0, scale: 1 };
+    if (!visibleFrames.length) setView(currentView);
+    const original =
+      base.find((frame) => frame.id === id) ||
+      filmTableLayout(
+        [{ ...photo, ...photoDimensions(photo) }],
+        1,
+        decorated,
+      )[0];
+    const factor = visibleFrames.some((frame) => frame.id === id)
+      ? scales[id] || 1
+      : Math.max(
+          0.3,
+          Math.min(
+            4,
+            Math.min(
+              240 / original.width,
+              (area.height * 0.8) / original.height,
+            ) / currentView.scale,
+          ),
+        );
+    const resized = resizeFilmFrame(
+      { ...original, x: 0, y: 0 },
+      factor,
+      decorated,
+    );
+    const bounds = viewport.current!.getBoundingClientRect();
+    const x = Math.max(
+      area.x,
+      Math.min(
+        area.x + area.width - resized.width * currentView.scale,
+        client.x - bounds.left - (resized.width * currentView.scale) / 2,
+      ),
+    );
+    const y = Math.max(
+      area.y,
+      Math.min(
+        area.y + area.height - resized.height * currentView.scale,
+        client.y - bounds.top - (resized.height * currentView.scale) / 2,
+      ),
+    );
+    setPositions((old) => {
+      const next = { ...old };
+      // Pin existing photos before materialising a previously unseen source.
+      for (const frame of visibleFrames)
+        if (!next[frame.id]) {
+          const source = base.find((candidate) => candidate.id === frame.id)!;
+          next[frame.id] = { x: source.x, y: source.y };
+        }
+      next[id] = {
+        x: (x - currentView.x) / currentView.scale - resized.x,
+        y: (y - currentView.y) / currentView.scale - resized.y,
+      };
+      return next;
+    });
+    setScales((old) => ({ ...old, [id]: factor }));
+    setPlaced((old) => [
+      ...new Set([...(old ?? visibleFrames.map((frame) => frame.id)), id]),
+    ]);
+    onSelect(id);
+  };
   const panRoll = (x: number, scale = view.scale) => {
     const left = base[0]?.x || 40,
       right = base.length
@@ -219,12 +469,15 @@ export function FilmTable({
   }, [decorated]);
   const remember = () =>
     saveDesk(key, {
+      layout: 3,
+      auto: autoLayout.current,
       frames: desk.current.positions,
       view: desk.current.view,
       brightness: desk.current.brightness,
       scales: desk.current.scales,
+      placed: desk.current.placed ?? undefined,
     });
-  const fit = (arranged: FilmTableFrame[] = frames) => {
+  const fit = (arranged: FilmTableFrame[] = visibleFrames) => {
     if (!arranged.length) return;
     if (roll) {
       const scale = Math.max(
@@ -250,23 +503,222 @@ export function FilmTable({
       maxX = Math.max(...arranged.map((f) => f.x + f.width)),
       maxY = Math.max(...arranged.map((f) => f.y + f.height));
     const scale = Math.min(
-      1.3,
-      Math.max(
-        0.15,
-        Math.min(
-          (size.width - 140) / (maxX - minX),
-          (size.height - 300) / (maxY - minY),
-        ),
-      ),
+      3,
+      area.width / (maxX - minX),
+      area.height / (maxY - minY),
     );
     setView({
       scale,
-      x: (size.width - (maxX - minX) * scale) / 2 - minX * scale,
-      y: 130 + (size.height - 300 - (maxY - minY) * scale) / 2 - minY * scale,
+      x: area.x + (area.width - (maxX - minX) * scale) / 2 - minX * scale,
+      y: area.y + (area.height - (maxY - minY) * scale) / 2 - minY * scale,
     });
   };
+  const spread = () => {
+    pausePlayback();
+    cancelFlight();
+    cancelReturns();
+    setPlaced(null);
+    setLoupe(false);
+    autoLayout.current = true;
+    setPositions({});
+    setScales({});
+    fit(base);
+    setMotion(roll ? "idle" : "entering");
+  };
+  // Opening waits for visible source pixels, with a bounded fallback for slow disks.
+  useEffect(() => {
+    if (!active || roll || motion !== "waiting" || entered.current) return;
+    const start = performance.now();
+    const ready = () => {
+      if (!fitted.current) return;
+      // Let the existing modal entrance finish before launching individual frames.
+      if (!reducedMotion() && performance.now() - start < 260) return;
+      const nodes = [
+        ...(world.current?.querySelectorAll<HTMLElement>(
+          '.lt-contact-frame:not([data-shelved="true"])',
+        ) || []),
+      ];
+      const visible = nodes.filter((node) => {
+        const r = node.getBoundingClientRect();
+        return (
+          r.right > 0 &&
+          r.left < size.width &&
+          r.bottom > 0 &&
+          r.top < size.height
+        );
+      });
+      if (
+        performance.now() - start < 4000 &&
+        (!visible.length ||
+          visible.some((n) => n.querySelector(".picture.loading")))
+      )
+        return;
+      entered.current = true;
+      motionCallbacks.current.onIntroComplete?.();
+      setMotion("entering");
+    };
+    const timer = setInterval(ready, 80);
+    ready();
+    return () => clearInterval(timer);
+  }, [active, roll, motion, size.width, size.height]);
+  useEffect(() => {
+    motionCallbacks.current.onMotionChange?.(
+      active &&
+        (motion !== "idle" || draggedId !== null || returning.length > 0),
+    );
+    return () => motionCallbacks.current.onMotionChange?.(false);
+  }, [motion, active, draggedId, returning.length]);
+  useEffect(() => {
+    if (active && !roll)
+      deskChange.current?.(visibleFrames.map((frame) => frame.id));
+  }, [active, roll, visibleFrames.map((frame) => frame.id).join(",")]);
+  useLayoutEffect(() => {
+    for (const [id, animation] of returnFlights.current)
+      if (!returning.includes(id)) {
+        animation.cancel();
+        returnFlights.current.delete(id);
+      }
+    for (const id of returning) {
+      if (returnFlights.current.has(id)) continue;
+      const node = world.current?.querySelector<HTMLElement>(
+        `.lt-contact-frame[data-photo-id="${id}"]`,
+      );
+      if (!node || reducedMotion()) {
+        setReturning((old) => old.filter((value) => value !== id));
+        continue;
+      }
+      const delta = filmDockTransform(
+        node.getBoundingClientRect(),
+        dockBounds(),
+      );
+      const animation = node.animate(
+        [
+          { transform: "translate(0px,0px) scale(1,1)", opacity: 1 },
+          {
+            transform: `translate(${delta.x / view.scale}px,${delta.y / view.scale}px) scale(${delta.scaleX},${delta.scaleY})`,
+            opacity: 0,
+          },
+        ],
+        { duration: 460, easing: "cubic-bezier(.4,0,.65,1)", fill: "forwards" },
+      );
+      returnFlights.current.set(id, animation);
+      void animation.finished
+        .then(() => setReturning((old) => old.filter((value) => value !== id)))
+        .catch(() => {});
+    }
+  }, [returning]);
+  useLayoutEffect(() => {
+    if (!active || !["entering", "stowing"].includes(motion)) return;
+    const stow = motion === "stowing";
+    if (reducedMotion()) {
+      if (stow) setPlaced([]);
+      setMotion(stow ? "stowed" : "idle");
+      return;
+    }
+    const table = viewport.current!,
+      root = table.closest(".lighttable")!;
+    const nodes = [
+      ...(world.current?.querySelectorAll<HTMLElement>(
+        '.lt-contact-frame:not([data-shelved="true"])',
+      ) || []),
+    ];
+    const screen = table.getBoundingClientRect();
+    const dock = dockBounds();
+    const animations = nodes.map((node, index) => {
+      const rect = node.getBoundingClientRect();
+      const delta = filmDockTransform(rect, dock);
+      const folded = {
+        transform: `translate(${delta.x / view.scale}px,${delta.y / view.scale}px) scale(${delta.scaleX},${delta.scaleY})`,
+        opacity: 0,
+      };
+      const flat = { transform: "translate(0px,0px) scale(1,1)", opacity: 1 };
+      const visible =
+        rect.right > screen.left &&
+        rect.left < screen.right &&
+        rect.bottom > screen.top &&
+        rect.top < screen.bottom;
+      return node.animate(stow ? [flat, folded] : [folded, flat], {
+        duration: visible ? (stow ? 480 : 780) : 1,
+        delay: visible ? Math.min(index, 18) * (stow ? 7 : 17) : 0,
+        easing: stow
+          ? "cubic-bezier(.55,0,.8,.35)"
+          : "cubic-bezier(.16,1,.3,1)",
+        fill: "both",
+      });
+    });
+    flights.current = animations;
+    let cancelled = false;
+    void Promise.all(animations.map((a) => a.finished))
+      .then(() => {
+        if (!cancelled) {
+          if (stow) setPlaced([]);
+          setMotion(stow ? "stowed" : "idle");
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      cancelFlight();
+    };
+  }, [motion, active]);
+  useEffect(() => {
+    if (!active || !roll || !playing || !world.current) return;
+    const track = filmRollPlayback(desk.current.view, base, size.width);
+    if (!track) {
+      setPlaying(false);
+      return;
+    }
+    const node = world.current,
+      current = desk.current.view;
+    const transform = (x: number) =>
+      `translate(${x}px,${current.y}px) scale(${current.scale})`;
+    const animation = node.animate(
+      [
+        { transform: transform(track.start) },
+        { transform: transform(track.end) },
+      ],
+      { duration: track.duration, easing: "linear", fill: "forwards" },
+    );
+    playback.current = animation;
+    animation.onfinish = () => {
+      const next = { ...desk.current.view, x: track.end };
+      desk.current.view = next;
+      node.style.transform = transform(track.end);
+      setView(next);
+      if (photos.length > limit) setLimit((n) => n + 96);
+      else setPlaying(false);
+    };
+    return () => {
+      animation.onfinish = null;
+      if (playback.current === animation) pausePlayback(false);
+    };
+  }, [playing, active, roll, limit, size.width, size.height, decorated]);
+  useEffect(() => {
+    const hide = () => {
+      if (document.hidden) pausePlayback();
+    };
+    document.addEventListener("visibilitychange", hide);
+    return () => document.removeEventListener("visibilitychange", hide);
+  }, []);
+  useEffect(() => {
+    pausePlayback();
+  }, [photos.map((p) => p.id).join(",")]);
+  useEffect(() => {
+    if (!active && motion !== "waiting") stopMotion();
+  }, [active]);
   useEffect(() => {
     if (!active || !fitted.current || drag.current) return;
+    const previous = lastSelection.current;
+    lastSelection.current = { currentId, reveal, active };
+    if (
+      playing &&
+      previous.currentId === currentId &&
+      previous.reveal === reveal &&
+      previous.active === active
+    )
+      return;
+    pausePlayback();
+    if (!roll && placedSet && !placedSet.has(currentId)) return;
     const index = photos.findIndex((p) => p.id === currentId);
     if (index >= limit) {
       setLimit(Math.ceil((index + 1) / 96) * 96);
@@ -294,7 +746,7 @@ export function FilmTable({
           ? old.y
           : (size.height - 60) / 2 - (frame.y + frame.height / 2) * old.scale,
       }));
-  }, [currentId, active, limit]);
+  }, [currentId, active, limit, reveal]);
   useLayoutEffect(() => {
     if (!active || !viewport.current) return;
     const observer = new ResizeObserver(([entry]) =>
@@ -312,6 +764,8 @@ export function FilmTable({
     const wheel = (event: WheelEvent) => {
       if ((event.target as HTMLElement).closest(".ft-toolbar")) return;
       event.preventDefault();
+      stopMotion();
+      autoLayout.current = false;
       if (roll && !event.ctrlKey && !event.metaKey) {
         setView((old) => ({
           ...old,
@@ -340,18 +794,26 @@ export function FilmTable({
     roll,
     decorated,
   ]);
-  useEffect(() => {
-    if (active && !fitted.current && size.width) {
-      fit(base);
+  useLayoutEffect(() => {
+    if (
+      active &&
+      size.width &&
+      (!fitted.current || (!roll && autoLayout.current))
+    ) {
+      fit(visibleFrames);
       fitted.current = true;
     }
-  }, [active, size.width, size.height]);
+  }, [active, area.width, area.height, area.y, aspectKey, decorated]);
   useEffect(() => {
     if (!active) setLoupe(false);
   }, [active]);
   useEffect(
     () => () => {
       cancelAnimationFrame(raf.current);
+      cancelFlight();
+      returnFlights.current.forEach((animation) => animation.cancel());
+      returnFlights.current.clear();
+      pausePlayback();
       if (pendingMove.current) pendingMove.current();
       remember();
     },
@@ -360,7 +822,7 @@ export function FilmTable({
   useEffect(() => {
     const timer = setTimeout(remember, 300);
     return () => clearTimeout(timer);
-  }, [view, positions, brightness, scales]);
+  }, [view, positions, brightness, scales, placed]);
   const schedule = (work: () => void) => {
     pendingMove.current = work;
     if (!raf.current)
@@ -374,8 +836,13 @@ export function FilmTable({
   const zoom = (
     scale: number,
     point: Point = { x: size.width / 2, y: size.height / 2 },
-  ) => setView((old) => constrainView(filmTableZoom(old, point, scale)));
+  ) => {
+    autoLayout.current = false;
+    stopMotion();
+    setView((old) => constrainView(filmTableZoom(old, point, scale)));
+  };
   const showLoupe = () => {
+    stopMotion();
     const frame = frames.find((f) => f.id === currentId);
     if (!loupe && frame)
       setCenter({
@@ -412,6 +879,7 @@ export function FilmTable({
       }
       if (key === "0") {
         event.preventDefault();
+        stopMotion();
         fit();
       }
       if (key === "+" || key === "=") {
@@ -466,6 +934,8 @@ export function FilmTable({
   };
   const film = (frame: FilmTableFrame, lens = false) => {
     const photo = available.get(frame.id)!;
+    const displayed = roll || placedSet === null || placedSet.has(photo.id);
+    const isReturning = returning.includes(photo.id);
     const stock = String(photo.recipe.film_stock || "none");
     const label =
       stock !== "none"
@@ -483,15 +953,20 @@ export function FilmTable({
           top: frame.y,
           width: frame.width,
           height: frame.height,
+          visibility: !displayed && !isReturning ? "hidden" : undefined,
+          pointerEvents: !displayed || isReturning ? "none" : undefined,
         }}
-        tabIndex={lens ? undefined : 0}
-        aria-hidden={lens ? true : undefined}
+        tabIndex={lens ? undefined : displayed ? 0 : -1}
+        aria-hidden={lens || !displayed ? true : undefined}
         aria-label={lens ? undefined : `观片 ${photo.name}`}
+        data-photo-id={photo.id}
+        data-shelved={!displayed}
         onPointerDown={
           lens
             ? undefined
             : (e) => {
                 if (e.button !== 0) return;
+                stopMotion();
                 e.preventDefault();
                 e.currentTarget.focus({ preventScroll: true });
                 e.stopPropagation();
@@ -504,7 +979,7 @@ export function FilmTable({
                   start: { x: e.clientX, y: e.clientY },
                   origin:
                     hand || roll
-                      ? { x: view.x, y: view.y }
+                      ? { x: desk.current.view.x, y: desk.current.view.y }
                       : positions[photo.id] ||
                         base.find((f) => f.id === photo.id)!,
                   scale: view.scale,
@@ -572,6 +1047,7 @@ export function FilmTable({
         )}
         {!lens &&
           !roll &&
+          displayed &&
           photo.id === currentId &&
           !loupe &&
           !hand &&
@@ -584,6 +1060,7 @@ export function FilmTable({
               title="拖动缩放这张照片"
               onPointerDown={(e) => {
                 if (e.button !== 0) return;
+                stopMotion();
                 e.preventDefault();
                 e.stopPropagation();
                 e.currentTarget.setPointerCapture(e.pointerId);
@@ -654,8 +1131,29 @@ export function FilmTable({
     <div
       ref={viewport}
       hidden={!active}
-      className={`film-table ${decorated ? "" : "is-plain"} ${roll ? "is-roll" : ""} ${light ? "lamp-on" : "lamp-off"} ${loupe ? "loupe-active" : ""} ${hand ? "hand-mode" : ""} ${moving ? "is-moving" : ""}`}
+      className={`film-table motion-${motion} ${incomingId !== null && !roll ? "accepting-photo" : ""} ${decorated ? "" : "is-plain"} ${roll ? "is-roll" : ""} ${light ? "lamp-on" : "lamp-off"} ${loupe ? "loupe-active" : ""} ${hand ? "hand-mode" : ""} ${moving ? "is-moving" : ""}`}
       data-light={light ? "on" : "off"}
+      data-motion={motion}
+      data-playing={playing}
+      data-visible-photos={visibleFrames.length}
+      onDragOver={(event) => {
+        if (roll || !event.dataTransfer.types.includes(FILM_DRAG_TYPE)) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "copy";
+      }}
+      onDrop={(event) => {
+        if (
+          roll ||
+          !event.dataTransfer.types.includes(FILM_DRAG_TYPE) ||
+          (event.target as HTMLElement).closest(".ft-toolbar")
+        )
+          return;
+        event.preventDefault();
+        event.stopPropagation();
+        const id = Number(event.dataTransfer.getData(FILM_DRAG_TYPE));
+        if (Number.isSafeInteger(id))
+          placeOne(id, { x: event.clientX, y: event.clientY });
+      }}
       style={
         {
           "--ft-transmission": light ? brightness / 100 : 0.12,
@@ -671,13 +1169,14 @@ export function FilmTable({
         )
           return;
         e.preventDefault();
+        stopMotion();
         e.currentTarget.focus();
         if (loupe) return;
         e.currentTarget.setPointerCapture(e.pointerId);
         drag.current = {
           pointer: e.pointerId,
           start: { x: e.clientX, y: e.clientY },
-          origin: { x: view.x, y: view.y },
+          origin: { x: desk.current.view.x, y: desk.current.view.y },
           scale: view.scale,
         };
         setMoving(true);
@@ -692,6 +1191,15 @@ export function FilmTable({
         if (!session) return;
         const dx = e.clientX - session.start.x,
           dy = e.clientY - session.start.y;
+        if (Math.abs(dx) + Math.abs(dy) > 1) autoLayout.current = false;
+        if (
+          session.id !== undefined &&
+          Math.abs(dx) + Math.abs(dy) > 5 &&
+          !roll
+        ) {
+          setDraggedId(session.id);
+          setZoneHover(overStowZone(e.clientX, e.clientY));
+        }
         if (session.resize) {
           const r = session.resize;
           const distance =
@@ -729,13 +1237,26 @@ export function FilmTable({
           pendingMove.current();
           pendingMove.current = null;
         }
+        const session = drag.current;
+        if (
+          session?.id !== undefined &&
+          Math.hypot(e.clientX - session.start.x, e.clientY - session.start.y) >
+            5 &&
+          !roll &&
+          overStowZone(e.clientX, e.clientY)
+        )
+          stowOne(session.id);
         drag.current = null;
+        setDraggedId(null);
+        setZoneHover(false);
         setMoving(false);
         if (e.currentTarget.hasPointerCapture(e.pointerId))
           e.currentTarget.releasePointerCapture(e.pointerId);
       }}
       onPointerCancel={() => {
         drag.current = null;
+        setDraggedId(null);
+        setZoneHover(false);
         setMoving(false);
       }}
     >
@@ -746,7 +1267,9 @@ export function FilmTable({
         {light ? "BACKLIGHT ON" : "BACKLIGHT OFF"}
       </span>
       <div
+        ref={world}
         className="ft-world"
+        inert={motion === "stowed" || motion === "waiting"}
         style={{
           transform: `translate(${view.x}px,${view.y}px) scale(${view.scale})`,
         }}
@@ -860,7 +1383,7 @@ export function FilmTable({
                 transform: `translate(${lensView.x}px,${lensView.y}px) scale(${lensView.scale})`,
               }}
             >
-              {frames.filter(visibleInLens).map((f) => film(f, true))}
+              {visibleFrames.filter(visibleInLens).map((f) => film(f, true))}
             </div>
           </div>
           <div className="ft-lens-reflection" />
@@ -891,22 +1414,59 @@ export function FilmTable({
         >
           <Hand size={15} />
         </button>
-        <button
-          aria-label="一键平铺胶片"
-          onClick={() => {
-            setPositions({});
-            setScales({});
-            fit(base);
-          }}
-        >
+        <button aria-label="一键平铺胶片" onClick={spread}>
           <Grid2X2 size={14} />
           一键平铺
         </button>
+        {!roll && (
+          <button
+            aria-label="一键收纳胶片"
+            aria-pressed={motion === "stowed"}
+            disabled={
+              !visibleFrames.length ||
+              motion === "stowed" ||
+              motion === "stowing"
+            }
+            onClick={() => {
+              pausePlayback();
+              cancelFlight();
+              cancelReturns();
+              setLoupe(false);
+              setMotion("stowing");
+            }}
+          >
+            <Archive size={14} />
+            一键收纳
+          </button>
+        )}
+        {roll && (
+          <button
+            aria-label={playing ? "暂停胶卷播放" : "播放胶卷"}
+            aria-pressed={playing}
+            disabled={!filmRollPlayback(view, base, size.width)}
+            onClick={() => {
+              if (playing) pausePlayback();
+              else {
+                setLoupe(false);
+                setPlaying(true);
+              }
+            }}
+          >
+            {playing ? <Pause size={14} /> : <Play size={14} />}{" "}
+            {playing ? "暂停" : "播放"}
+          </button>
+        )}
         <div className="ft-tool-divider" />
         <button aria-label="桌面缩小" onClick={() => zoom(view.scale / 1.2)}>
           <Minus size={13} />
         </button>
-        <button aria-label="桌面适合全台" onClick={() => fit()}>
+        <button
+          aria-label="桌面适合全台"
+          onClick={() => {
+            stopMotion();
+            fit();
+          }}
+        >
           {Math.round(view.scale * 100)}%
         </button>
         <button aria-label="桌面放大" onClick={() => zoom(view.scale * 1.2)}>
@@ -970,12 +1530,27 @@ export function FilmTable({
           <button onClick={() => setLimit((n) => n + 96)}>再摆 96 张</button>
         )}
       </div>
+      {!roll && (
+        <div
+          className={`ft-stow-zone ${draggedId !== null ? "is-visible" : ""} ${zoneHover ? "is-targeted" : ""}`}
+          style={{
+            left: zoneLeft,
+            top: zoneBottom - zoneHeight,
+            width: zoneWidth,
+            height: zoneHeight,
+          }}
+          aria-hidden={draggedId === null}
+        >
+          <Archive size={16} />
+          <span>收纳</span>
+        </div>
+      )}
       <div className="ft-instruction">
         {loupe
           ? "移动鼠标查看细节 · V / Esc 收起放大镜"
           : roll
             ? "一卷光影 · 拖动或滚轮左右滑动 · Ctrl+滚轮缩放 · V 放大镜"
-            : `${light ? "灯箱已开启" : "按 L 打开背光"} · 拖动胶片自由摆放 · 拖动空白平移 · 滚轮缩放 · V 放大镜`}
+            : `${light ? "灯箱已开启" : "按 L 打开背光"} · 从底部拖入照片 · 拖到准备区上方收纳 · 滚轮缩放 · V 放大镜`}
       </div>
     </div>
   );

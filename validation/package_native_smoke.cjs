@@ -103,6 +103,26 @@ async function exercise(executable, phase, port, expectedPhoto) {
   const preservedPhoto = (await api('/library')).photos[0];
   await page.reload();
   await page.getByRole('heading', {name: '图集', exact: true}).waitFor();
+  let lighttableMotion = false;
+  if (phase !== 'installed-before-upgrade') {
+    const version = JSON.parse(fs.readFileSync(path.join(__dirname,'../product/package.json'),'utf8')).version;
+    if (await page.locator('.version').textContent() !== version) throw Error('Bundled frontend version mismatch');
+    const album = await api('/albums', {name:'独立安装动效验证'});
+    const job = await api('/import', {paths:[preservedPhoto.path],album_id:album.id});
+    await waitFor(async()=>(await api('/jobs/'+job.id)).status==='done');
+    await page.reload();await page.getByRole('button',{name:'打开图集 独立安装动效验证'}).click();
+    await page.getByRole('button',{name:'电子观片台',exact:true}).click();
+    const table = page.locator('.film-table');
+    await waitFor(async()=>await table.getAttribute('data-motion')==='idle');
+    await page.mouse.move(700,5);await page.getByRole('button',{name:'一键收纳胶片'}).click();
+    await waitFor(async()=>await table.getAttribute('data-motion')==='stowed');
+    if (await page.getByText('照片已收纳到底部导览',{exact:true}).count() || await page.locator('.ft-table-caption').isVisible()) throw Error('Installed lighttable stow is not blank');
+    await page.screenshot({path:path.join(output,phase+'-stowed.png')});
+    await page.getByRole('button',{name:'一键平铺胶片'}).click();
+    await waitFor(async()=>await table.getAttribute('data-motion')==='idle');
+    await page.keyboard.press('Escape');await page.getByRole('dialog',{name:'电子观片台'}).waitFor({state:'detached'});
+    lighttableMotion = true;
+  }
   await page.screenshot({path: path.join(output, phase + '.png')});
   const backend = spawnSync(path.join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe'), ['-NoProfile', '-Command',
     `Get-CimInstance Win32_Process -Filter "ParentProcessId = ${active.pid}" | Select-Object ProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress`],
@@ -123,7 +143,7 @@ async function exercise(executable, phase, port, expectedPhoto) {
   return {native_started: true, authenticated_api: true, import: !expectedPhoto, isolated_appdata: true,
     bundled_interpreter: true, no_workspace_path: true, native_close: true, backend_cleanup: true,
     ...(expectedPhoto ? {upgrade_library_preserved: true, upgrade_recipe_preserved: true} : {}),
-    photo: preservedPhoto};
+    lighttable_motion: lighttableMotion, photo: preservedPhoto};
 }
 (async () => {
   if (existsKey(uninstallKey) || existsKey(settingsKey)) throw Error('An existing user installation/profile registry entry must be preserved; test installation aborted');

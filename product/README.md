@@ -2,7 +2,7 @@
 
 ## 当前主入口
 
-双击 `start.cmd`，打开新的浅色桌面工作台。前端为 TypeScript + React + Motion，桌面外壳为 Tauri，照片处理通过私有本地服务连接现有 Python/Pillow/RawTherapee。所有照片在本机处理，无需账号。0.9 发行版提供包含 Python、图像依赖、RAW 与离线资源的独立 Windows 安装 EXE 和便携 ZIP，使用方法与构建见 WINDOWS_DISTRIBUTION.md。
+双击 `start.cmd`，打开新的浅色桌面工作台。前端为 TypeScript + React + Motion，桌面外壳为 Tauri，照片处理通过私有本地服务连接现有 Python/Pillow/RawTherapee。所有照片在本机处理，无需账号。0.10.5 发行版提供包含 Python、图像依赖、RAW 与离线资源的独立 Windows 安装 EXE 和便携 ZIP，使用方法与构建见 WINDOWS_DISTRIBUTION.md。
 
 首页为持久图集：新建图集后导入文件夹，拼贴封面显示照片数。进入图集后可叠加日期、主色、冷暖、亮度与内容筛选，选择匹配照片批量套滤镜；保留每张照片各自的曝光等参数，批量修改可整体撤销。同一原片可以属于多个图集，重新按时间分组不会修改图集成员。旧照片库自动迁入“已有照片”图集。
 

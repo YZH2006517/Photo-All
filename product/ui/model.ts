@@ -951,6 +951,23 @@ export async function persistRecipes(
 }
 
 export type FilmTableView = { x: number; y: number; scale: number };
+export function filmDockTransform(
+  frame: { x: number; y: number; width: number; height: number },
+  dock: { x: number; y: number; width: number; height: number },
+) {
+  return { x: dock.x - frame.x, y: dock.y - frame.y,
+    scaleX: dock.width / Math.max(1, frame.width),
+    scaleY: dock.height / Math.max(1, frame.height) };
+}
+export function filmRollPlayback(view: FilmTableView, frames: FilmTableFrame[], width: number) {
+  if (!frames.length) return null;
+  const left = frames[0].x, right = frames.at(-1)!.x + frames.at(-1)!.width;
+  const end = width - 50 - right * view.scale, beginning = 50 - left * view.scale;
+  if (end >= beginning) return null;
+  const start = view.x <= end + .5 ? beginning : Math.max(end, Math.min(beginning, view.x));
+  const speed = Math.max(48, Math.min(120, (right - left) * view.scale / frames.length / 6));
+  return {start, end, duration: (start - end) / speed * 1000};
+}
 // SVG displacement uses neutral 128 in sRGB. The radius-squared field gives
 // smoothly increasing refraction; separate RGB scales model edge dispersion.
 export function filmRefractionMap(size = 128) {
@@ -1011,9 +1028,28 @@ export function filmRollLayout(
 }
 export function filmTableLayout(
   photos: { id: number; width: number; height: number }[],
-  columns = 8,
+  columns: number | {width: number; height: number} = 8,
   decorated = true,
 ): FilmTableFrame[] {
+  if (typeof columns !== 'number') {
+    if (!photos.length) return [];
+    const width = Math.max(240, columns.width);
+    const height = Math.max(120, columns.height);
+    let best: FilmTableFrame[] = [], bestScale = -1;
+    // Keep the original equal-width frames, 28px column gaps and 48px row gaps.
+    // Only the number of columns adapts; image and film rails scale together.
+    for (let count = 1; count <= photos.length; count++) {
+      const candidate = filmTableLayout(photos, count, decorated);
+      const right = Math.max(...candidate.map(frame => frame.x + frame.width));
+      const bottom = Math.max(...candidate.map(frame => frame.y + frame.height));
+      const scale = Math.min(3, width / (right - 40), height / (bottom - 40));
+      if (scale > bestScale) {
+        bestScale = scale;
+        best = candidate;
+      }
+    }
+    return best;
+  }
   const count = Math.max(1, Math.floor(columns)),
     width = 180,
     gap = 28;
