@@ -1,11 +1,12 @@
-// Standalone release QA: relocate portable files, install per-user, launch, uninstall.
+// Standalone release QA: relocate, install, optionally upgrade an older release, uninstall.
 const fs = require('node:fs');
+const {createHash} = require('node:crypto');
 const os = require('node:os');
 const path = require('node:path');
 const {spawn, spawnSync} = require('node:child_process');
 const {chromium} = require(process.env.PHOTOALL_PLAYWRIGHT || 'C:/Users/Administrator/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
-const [portableSource, installer] = process.argv.slice(2).map(p => path.resolve(p));
-if (!portableSource || !installer) throw Error('Pass portable directory and NSIS installer');
+const [portableSource, installer, previousInstaller] = process.argv.slice(2).map(p => path.resolve(p));
+if (!portableSource || !installer) throw Error('Pass portable directory, NSIS installer and optional previous installer');
 const output = path.join(__dirname, 'artifacts', 'package-native-' + Date.now());
 fs.mkdirSync(output, {recursive: true});
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'Photo All 独立发布 '));
@@ -15,6 +16,10 @@ env.APPDATA = path.join(temporary, 'profile', 'Roaming');
 env.LOCALAPPDATA = path.join(temporary, 'profile', 'Local');
 const uninstallKey = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Photo All Studio';
 const settingsKey = 'HKCU\\Software\\photoall\\Photo All Studio';
+// LOCALAPPDATA can be redirected by a sandbox; guard the real Windows user profile.
+const protectedDatabase = path.join(os.homedir(), 'AppData', 'Local', 'org.photoall.studio', 'library.sqlite');
+const databaseHash = file => fs.existsSync(file) ? createHash('sha256').update(fs.readFileSync(file)).digest('hex') : null;
+const protectedDatabaseBefore = databaseHash(protectedDatabase);
 const run = (file, args, options = {}) => new Promise((resolve, reject) => {
   const process = spawn(file, args, {windowsHide: true, ...options});
   let stdout = '', stderr = '';
@@ -44,8 +49,10 @@ function copyDirectory(source, destination) {
     else fs.copyFileSync(input, target);
   }
 }
-async function exercise(executable, phase, port) {
-  const data = path.join(temporary, 'profile', phase, 'Local', 'org.photoall.studio');
+async function exercise(executable, phase, port, expectedPhoto) {
+  // Both installed versions deliberately share one isolated library for upgrade QA.
+  const dataPhase = phase.startsWith('installed') ? 'installed' : phase;
+  const data = path.join(temporary, 'profile', dataPhase, 'Local', 'org.photoall.studio');
   const appEnv = {...env, PHOTOALL_DATA_DIR: data,
     WEBVIEW2_USER_DATA_FOLDER: path.join(temporary, 'webview-' + phase),
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port} --remote-debugging-address=127.0.0.1`};
@@ -72,13 +79,28 @@ async function exercise(executable, phase, port) {
     if (!response.ok) throw Error(`${route}: ${response.status}`);
     return response.json();
   };
-  if ((await api('/library')).photos.length !== 0) throw Error('Isolated AppData profile is not empty');
-  const fixture = path.join(temporary, phase + '.png');
-  await run(path.join(path.dirname(executable), 'runtime/python/python.exe'), ['-c',
-    "from PIL import Image; import sys; Image.new('RGB',(360,240),(73,129,173)).save(sys.argv[1])", fixture], {env: appEnv});
-  const job = await api('/import', {paths: [fixture]});
-  await waitFor(async () => (await api('/jobs/' + job.id)).status === 'done');
-  if ((await api('/library')).photos.length !== 1) throw Error('Imported photo missing');
+  const before = (await api('/library')).photos;
+  if (expectedPhoto) {
+    if (before.length !== 1) throw Error('Upgrade did not preserve the isolated library');
+    for (const field of ['id', 'path', 'digest', 'decision']) {
+      if (before[0][field] !== expectedPhoto[field]) throw Error('Upgrade changed photo ' + field);
+    }
+    for (const [key, value] of Object.entries(expectedPhoto.recipe)) {
+      if (JSON.stringify(before[0].recipe[key]) !== JSON.stringify(value)) throw Error('Upgrade changed recipe ' + key);
+    }
+    if (!fs.existsSync(before[0].path)) throw Error('Upgrade deleted the original photo');
+  } else {
+    if (before.length !== 0) throw Error('Isolated AppData profile is not empty');
+    const fixture = path.join(temporary, phase + '.png');
+    await run(path.join(path.dirname(executable), 'runtime/python/python.exe'), ['-c',
+      "from PIL import Image; import sys; Image.new('RGB',(360,240),(73,129,173)).save(sys.argv[1])", fixture], {env: appEnv});
+    const job = await api('/import', {paths: [fixture]});
+    await waitFor(async () => (await api('/jobs/' + job.id)).status === 'done');
+    const photos = (await api('/library')).photos;
+    if (photos.length !== 1) throw Error('Imported photo missing');
+    await api('/edit', {ids: [photos[0].id], recipe_patch: {exposure: 0.375, contrast: 1.125}, decision: 'keep'});
+  }
+  const preservedPhoto = (await api('/library')).photos[0];
   await page.reload();
   await page.getByRole('heading', {name: '图集', exact: true}).waitFor();
   await page.screenshot({path: path.join(output, phase + '.png')});
@@ -98,20 +120,36 @@ async function exercise(executable, phase, port) {
   await browser.close().catch(() => {});
   browser = undefined;
   active = undefined;
-  return {native_started: true, authenticated_api: true, import: true, isolated_appdata: true,
-    bundled_interpreter: true, no_workspace_path: true, native_close: true, backend_cleanup: true};
+  return {native_started: true, authenticated_api: true, import: !expectedPhoto, isolated_appdata: true,
+    bundled_interpreter: true, no_workspace_path: true, native_close: true, backend_cleanup: true,
+    ...(expectedPhoto ? {upgrade_library_preserved: true, upgrade_recipe_preserved: true} : {}),
+    photo: preservedPhoto};
 }
 (async () => {
   if (existsKey(uninstallKey) || existsKey(settingsKey)) throw Error('An existing user installation/profile registry entry must be preserved; test installation aborted');
   const portable = path.join(temporary, '便携 application');
   copyDirectory(portableSource, portable);
   report.portable = await exercise(path.join(portable, 'Photo All Studio.exe'), 'portable', 9438);
-  const install = await run(installer, ['/S', '/NS', '/D=' + installedFolder], {env, windowsVerbatimArguments: true, argv0: '"' + installer + '"'});
+  const firstInstaller = previousInstaller || installer;
+  const install = await run(firstInstaller, ['/S', '/NS', '/D=' + installedFolder], {env, windowsVerbatimArguments: true, argv0: '"' + firstInstaller + '"'});
   fs.writeFileSync(path.join(output, 'install-process.json'), JSON.stringify(install, null, 2));
   installed = true;
   if (!existsKey(uninstallKey) || !fs.existsSync(path.join(installedFolder, 'photo-all.exe'))) throw Error('Per-user installer did not register/install the application');
   report.installer = {per_user_registry: true, no_shortcuts: true,
-    ...await exercise(path.join(installedFolder, 'photo-all.exe'), 'installed', 9439)};
+    ...await exercise(path.join(installedFolder, 'photo-all.exe'), previousInstaller ? 'installed-before-upgrade' : 'installed', 9439)};
+  if (previousInstaller) {
+    const database = path.join(temporary, 'profile/installed/Local/org.photoall.studio/library.sqlite');
+    const libraryHash = databaseHash(database);
+    const upgrade = await run(installer, ['/S', '/NS', '/D=' + installedFolder], {env, windowsVerbatimArguments: true, argv0: '"' + installer + '"'});
+    fs.writeFileSync(path.join(output, 'upgrade-process.json'), JSON.stringify(upgrade, null, 2));
+    if (!fs.existsSync(database) || databaseHash(database) !== libraryHash) throw Error('Installer upgrade changed the library before launch');
+    const version = spawnSync(reg, ['query', uninstallKey, '/v', 'DisplayVersion'], {env, windowsHide: true, encoding: 'utf8'});
+    const expectedVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '../product/package.json'), 'utf8')).version;
+    if (version.status !== 0 || !version.stdout.includes(expectedVersion)) throw Error('Upgrade registry version mismatch: ' + version.stdout);
+    report.upgrade = {previous_installer: previousInstaller, installer, version: expectedVersion,
+      installer_preserved_library: true,
+      ...await exercise(path.join(installedFolder, 'photo-all.exe'), 'installed-after-upgrade', 9440, report.installer.photo)};
+  }
   const uninstaller = path.join(installedFolder, 'uninstall.exe');
   const uninstall = await run(uninstaller, ['/S', '_?=' + installedFolder], {env, windowsVerbatimArguments: true, argv0: '"' + uninstaller + '"'});
   fs.writeFileSync(path.join(output, 'uninstall-process.json'), JSON.stringify(uninstall, null, 2));
@@ -123,6 +161,9 @@ async function exercise(executable, phase, port) {
   // NSIS retains its last-install-location preference after an ordinary uninstall.
   // This key did not exist before this test, so restore the original absence.
   await run(reg, ['delete', settingsKey, '/f'], {env}).catch(() => {});
+  if (databaseHash(protectedDatabase) !== protectedDatabaseBefore) throw Error('Real AppData library changed during isolated QA');
+  report.real_appdata_unchanged = true;
+  report.real_appdata_sha256 = protectedDatabaseBefore;
   report.status = 'passed';
   fs.writeFileSync(path.join(output, 'report.json'), JSON.stringify(report, null, 2));
   console.log(JSON.stringify({output, ...report}, null, 2));

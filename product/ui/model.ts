@@ -84,6 +84,22 @@ export type Library = {
   albums: Album[];
   trash_albums?: Album[];
   composites: CompositeDocument[];
+  filters: {
+    items: Record<
+      string,
+      {
+        label: string;
+        group: string;
+        source: string;
+        license: string;
+        ready: boolean;
+      }
+    >;
+    count: number;
+    attribution: string;
+    source: string;
+    mode: string;
+  };
   film: {
     engine: string;
     mode: string;
@@ -597,6 +613,40 @@ export function photoBlob(
       );
       if (!response.ok)
         throw new Error((await response.json()).error || "预览生成失败");
+      return response.blob();
+    },
+    signal,
+  );
+}
+export function filterPreviewKey(photo: Photo, id: string, size = 240) {
+  const recipe: Recipe = {
+    ...(photo.committed_recipe ?? photo.recipe),
+    style: id.startsWith("style:") ? id.slice(6) : "natural",
+    filter_id: id.startsWith("style:") ? "none" : id,
+    filter_strength: 1,
+  };
+  return `filter/${photoPreviewFamily({ ...photo, recipe, committed_recipe: recipe }, false, 0, "preview")}/${encodeURIComponent(id)}/${size}`;
+}
+export function filterBlob(
+  photo: Photo,
+  id: string,
+  size = 240,
+  signal?: AbortSignal,
+  _revision = 0,
+): Promise<Blob> {
+  return previews.read(
+    filterPreviewKey(photo, id, size),
+    async (requestSignal) => {
+      const { port, token } = await connect();
+      const response = await fetch(
+        `http://127.0.0.1:${port}/api/filter-preview/${photo.id}?filter_id=${encodeURIComponent(id)}&size=${size}`,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: requestSignal,
+        },
+      );
+      if (!response.ok)
+        throw Error((await response.json()).error || "滤镜预览生成失败");
       return response.blob();
     },
     signal,

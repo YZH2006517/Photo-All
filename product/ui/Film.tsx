@@ -1,7 +1,99 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import React from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Film, Check, Sparkles } from "lucide-react";
 import { Library, Photo, Recipe } from "./model";
+
+export function numericEntry(
+  draft: string,
+  previous: number,
+  min: number,
+  max: number,
+) {
+  const parsed = draft.trim() ? Number(draft) : NaN;
+  return Number.isFinite(parsed)
+    ? Math.max(min, Math.min(max, parsed))
+    : previous;
+}
+
+export function numericText(value: number, step: number) {
+  const decimals = (String(step).split(".")[1] || "").length;
+  return value.toLocaleString("en-US", {
+    useGrouping: false,
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: 12,
+  });
+}
+
+// A draft stays local until Enter or blur so each typed edit is one history step.
+export function NumericValue({
+  value,
+  label,
+  min,
+  max,
+  step = 0.01,
+  disabled,
+  onChange,
+  unit = "",
+}: {
+  value: number;
+  label: string;
+  min: number;
+  max: number;
+  step?: number;
+  disabled?: boolean;
+  onChange: (value: number) => void;
+  unit?: string;
+}) {
+  const format = (v: number) => numericText(v, step);
+  const [draft, setDraft] = useState(format(value));
+  const editing = useRef(false),
+    cancelled = useRef(false);
+  useEffect(() => {
+    if (!editing.current) setDraft(format(value));
+  }, [value, step]);
+  return (
+    <span className="numeric-value">
+      <input
+        type="text"
+        inputMode="decimal"
+        aria-label={`${label}数值`}
+        title={`输入${label}（${min}–${max}）`}
+        value={draft}
+        disabled={disabled}
+        onFocus={() => {
+          editing.current = true;
+          cancelled.current = false;
+        }}
+        onChange={(e) => setDraft(e.target.value)}
+        onPointerDown={(e) => e.stopPropagation()}
+        onBlur={() => {
+          editing.current = false;
+          if (cancelled.current) {
+            cancelled.current = false;
+            return;
+          }
+          const next = numericEntry(draft, value, min, max);
+          setDraft(format(next));
+          if (next !== value) onChange(next);
+        }}
+        onKeyDown={(e) => {
+          e.stopPropagation();
+          if (e.key === "Enter") {
+            e.preventDefault();
+            e.currentTarget.blur();
+          }
+          if (e.key === "Escape") {
+            e.preventDefault();
+            cancelled.current = true;
+            setDraft(format(value));
+            e.currentTarget.blur();
+          }
+        }}
+      />
+      {unit && <span>{unit}</span>}
+    </span>
+  );
+}
 
 export function FilmControls({
   photo,
@@ -25,7 +117,16 @@ export function FilmControls({
     <label className="slider-row">
       <span>
         {label}
-        <output>{Math.round(Number(photo.recipe[key] || 0) * 100)}%</output>
+        <NumericValue
+          label={label}
+          value={Number(photo.recipe[key] || 0) * 100}
+          min={0}
+          max={100}
+          step={1}
+          unit="%"
+          disabled={disabled || current === "none"}
+          onChange={(value) => update({ [key]: value / 100 })}
+        />
       </span>
       <input
         aria-label={label}
@@ -47,7 +148,7 @@ export function FilmControls({
         </span>
         <div>
           <strong>胶片暗房</strong>
-            <small>spektrafilm · 胶片色彩</small>
+          <small>spektrafilm · 胶片色彩</small>
         </div>
         <b>{ready} 款</b>
       </div>

@@ -41,6 +41,38 @@ class ServiceTests(unittest.TestCase):
             time.sleep(.02)
         self.fail('Job timed out')
 
+    def test_filter_previews_are_real_authenticated_and_do_not_persist(self):
+        import open_filters
+        from urllib.parse import quote
+        path=self.root/'filter-input.png'
+        image=Image.new('RGB',(64,32),(120,170,65));image.save(path)
+        self.call('/api/import',{'paths':[str(path)]})
+        import time
+        for _ in range(100):
+            library=self.call('/api/library')
+            if library['photos']:break
+            time.sleep(.02)
+        photo=library['photos'][0]
+        identity=next(key for key,item in open_filters.catalog()['items'].items() if item['group']=='黑白')
+        route=f"/api/filter-preview/{photo['id']}?filter_id={identity}&size=240"
+        before=self.call('/api/library')
+        request=Request(self.base+route,headers={'Authorization':'Bearer test-secret'})
+        with urlopen(request) as response:
+            result=response.read();self.assertEqual(response.headers['Content-Type'],'image/jpeg')
+        from io import BytesIO
+        preview=Image.open(BytesIO(result));r,g,b=preview.getpixel((10,10))
+        self.assertLess(abs(r-g)+abs(g-b),5)
+        self.assertEqual(preview.size,(64,32))
+        self.assertEqual(self.call('/api/library')['photos'][0]['recipe'],before['photos'][0]['recipe'])
+        self.assertEqual(self.call('/api/library')['history'],before['history'])
+        with self.assertRaises(HTTPError) as exc:urlopen(self.base+route)
+        self.assertEqual(exc.exception.code,401)
+        legacy=Request(self.base+f"/api/filter-preview/{photo['id']}?filter_id=style:mono&size=240",headers={'Authorization':'Bearer test-secret'})
+        with urlopen(legacy) as response:self.assertEqual(response.status,200)
+        bad=Request(self.base+f"/api/filter-preview/{photo['id']}?filter_id=../bad",headers={'Authorization':'Bearer test-secret'})
+        with self.assertRaises(HTTPError) as exc:urlopen(bad)
+        self.assertEqual(exc.exception.code,400)
+
     def test_album_trash_and_restore_routes_expose_recycle_bin(self):
         album = self.call('/api/albums', {'name': '回收'})
         self.assertTrue(self.call(f"/api/albums/{album['id']}/trash", {})['changed'])

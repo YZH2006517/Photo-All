@@ -4,11 +4,9 @@ describe("precision editor workspace contracts", () => {
   it("offers a single composition tool and omits retired advanced tool entries", async () => {
     const { editorTools } = await import("../product/ui/Editor");
     expect(editorTools.map(({ id, label }) => [id, label])).toEqual([
-      ["move", "移动与缩放"],
       ["composition", "构图"],
-      ["tone", "光线与色调"],
-      ["curves", "曲线"],
-      ["color", "色彩与 HSL"],
+      ["adjust", "调节"],
+      ["filters", "滤镜"],
       ["film", "胶片模拟"],
       ["raw", "RAW 显影"],
     ]);
@@ -16,10 +14,11 @@ describe("precision editor workspace contracts", () => {
   it("routes keyboard tools through the simplified tool set", async () => {
     const { editorToolShortcut } = await import("../product/ui/Editor");
     expect(editorToolShortcut("C")).toBe("composition");
-    expect(editorToolShortcut("h")).toBe("move");
-    expect(editorToolShortcut("l")).toBe("tone");
-    expect(editorToolShortcut("u")).toBe("curves");
-    expect(editorToolShortcut("s")).toBe("color");
+    expect(editorToolShortcut("h")).toBeNull();
+    expect(editorToolShortcut("l")).toBe("adjust");
+    expect(editorToolShortcut("u")).toBe("adjust");
+    expect(editorToolShortcut("s")).toBe("adjust");
+    expect(editorToolShortcut("k")).toBe("filters");
     expect(editorToolShortcut("g")).toBe("film");
     expect(editorToolShortcut("r")).toBe("raw");
     expect(editorToolShortcut("b")).toBeNull();
@@ -163,4 +162,23 @@ describe("precision editor workspace contracts", () => {
       ),
     ).toBe(true);
   });
+});
+
+describe("direct numeric entry", () => {
+  it("accepts finite typed values, clamps limits and leaves invalid input unchanged", async () => {
+    const { numericEntry } = await import("../product/ui/Film");
+    expect(numericEntry("0.37", 0.2, -1, 1)).toBe(0.37);
+    expect(numericEntry("99", 0.2, -1, 1)).toBe(1);
+    expect(numericEntry("-9", 0.2, -1, 1)).toBe(-1);
+    for (const invalid of ["", " ", "NaN", "Infinity", "oops"])
+      expect(numericEntry(invalid, 0.2, -1, 1)).toBe(0.2);
+  });
+});
+
+it("preserves typed precision beyond a slider step in the numeric readout", async () => {
+  const { numericText } = await import("../product/ui/Film");
+  expect(numericText(0.371, 0.01)).toBe("0.371");
+  expect(numericText(0.911, 0.01)).toBe("0.911");
+  expect(numericText(0.3, 0.01)).toBe("0.30");
+  expect(numericText(6500, 100)).toBe("6500");
 });

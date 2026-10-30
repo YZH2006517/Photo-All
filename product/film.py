@@ -198,6 +198,9 @@ def setup():
 
 
 if __name__ == '__main__':
-    if '--setup' in sys.argv: setup()
+    if '--setup-filters' in sys.argv:
+        import open_filters
+        open_filters.setup()
+    elif '--setup' in sys.argv: setup()
     elif '--bake' in sys.argv: bake_stocks(sys.argv[sys.argv.index('--bake')+1:] or None)
     else: print(json.dumps(catalog(),ensure_ascii=False,indent=2))

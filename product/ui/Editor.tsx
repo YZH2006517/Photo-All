@@ -7,10 +7,6 @@ import {
   Check,
   ChevronDown,
   Crop,
-  Move,
-  Hand,
-  Sun,
-  Spline,
   Palette,
   CircleDot,
   Film,
@@ -35,10 +31,11 @@ import {
   Recipe,
   Library,
   photoDimensions,
+  filterBlob,
   geometrySignature,
 } from "./model";
 import { Comparison, Picture } from "./Preview";
-import { FilmControls } from "./Film";
+import { FilmControls, NumericValue } from "./Film";
 
 type Point = { x: number; y: number };
 export type CropRect = Point & { w: number; h: number };
@@ -47,6 +44,8 @@ type Operation = Point & Record<string, string | number>;
 type Tool =
   | "move"
   | "composition"
+  | "adjust"
+  | "filters"
   | "tone"
   | "curves"
   | "color"
@@ -218,11 +217,14 @@ export const editorTools: {
   shortcut?: string;
   icon: React.ComponentType<{ size?: number }>;
 }[] = [
-  { id: "move", label: "移动与缩放", shortcut: "V / H", icon: Move },
   { id: "composition", label: "构图", shortcut: "C", icon: Crop },
-  { id: "tone", label: "光线与色调", shortcut: "L", icon: Sun },
-  { id: "curves", label: "曲线", shortcut: "U", icon: Spline },
-  { id: "color", label: "色彩与 HSL", shortcut: "S", icon: Palette },
+  {
+    id: "adjust",
+    label: "调节",
+    shortcut: "L / U / S",
+    icon: SlidersHorizontal,
+  },
+  { id: "filters", label: "滤镜", shortcut: "K", icon: Palette },
   { id: "film", label: "胶片模拟", shortcut: "G", icon: Film },
   { id: "raw", label: "RAW 显影", shortcut: "R", icon: Aperture },
 ];
@@ -402,10 +404,45 @@ function CurveEditor({
         ))}
       </svg>
       <div className="ew-curve-meta">
-        <span>
-          输入 {Math.round((points[selected]?.[0] || 0) * 255)} / 输出{" "}
-          {Math.round((points[selected]?.[1] || 0) * 255)}
-        </span>
+        <div className="ew-curve-values">
+          输入{" "}
+          <NumericValue
+            label="曲线输入"
+            value={(points[selected]?.[0] || 0) * 255}
+            min={0}
+            max={255}
+            step={1}
+            disabled={selected === 0 || selected === points.length - 1}
+            onChange={(x) => {
+              const next = moveCurvePoint(
+                points,
+                selected,
+                x / 255,
+                points[selected][1],
+              );
+              setPoints(next);
+              onChange(JSON.stringify(next));
+            }}
+          />
+          输出{" "}
+          <NumericValue
+            label="曲线输出"
+            value={(points[selected]?.[1] || 0) * 255}
+            min={0}
+            max={255}
+            step={1}
+            onChange={(y) => {
+              const next = moveCurvePoint(
+                points,
+                selected,
+                points[selected][0],
+                y / 255,
+              );
+              setPoints(next);
+              onChange(JSON.stringify(next));
+            }}
+          />
+        </div>
         <button
           disabled={selected === 0 || selected === points.length - 1}
           onClick={() => {
@@ -423,6 +460,238 @@ function CurveEditor({
   );
 }
 
+function FilterThumbnail({
+  photo,
+  id,
+  revision,
+}: {
+  photo: Photo;
+  id: string;
+  revision: number;
+}) {
+  const host = useRef<HTMLSpanElement>(null);
+  const [url, setUrl] = useState("");
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    const controller = new AbortController();
+    let objectUrl = "",
+      started = false;
+    setUrl("");
+    setFailed(false);
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((entry) => entry.isIntersecting) || started) return;
+        started = true;
+        observer.disconnect();
+        filterBlob(photo, id, 180, controller.signal, revision)
+          .then((blob) => {
+            if (controller.signal.aborted) return;
+            objectUrl = URL.createObjectURL(blob);
+            setUrl(objectUrl);
+          })
+          .catch(() => {
+            if (!controller.signal.aborted) setFailed(true);
+          });
+      },
+      {
+        root: host.current?.closest(".ew-inspector-scroll"),
+        rootMargin: "60px",
+      },
+    );
+    if (host.current) observer.observe(host.current);
+    return () => {
+      controller.abort();
+      observer.disconnect();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [photo.id, id, revision]);
+  return (
+    <span className="ew-filter-thumbnail" ref={host}>
+      {url ? (
+        <img src={url} alt="" draggable={false} />
+      ) : (
+        <small>{failed ? "预览不可用" : "预览"}</small>
+      )}
+    </span>
+  );
+}
+
+function FilterControls({
+  photo,
+  revision,
+  catalog,
+  update,
+  disabled,
+}: {
+  photo: Photo;
+  revision: number;
+  catalog?: Library["filters"];
+  update: (patch: Recipe) => void;
+  disabled: boolean;
+}) {
+  const [query, setQuery] = useState(""),
+    [group, setGroup] = useState("all"),
+    [page, setPage] = useState(0);
+  const items = Object.entries(catalog?.items || {});
+  const groups = [...new Set(items.map(([, item]) => item.group))].sort();
+  const matches = items.filter(
+    ([, item]) =>
+      (group === "all" || item.group === group) &&
+      `${item.label} ${item.group}`
+        .toLocaleLowerCase()
+        .includes(query.trim().toLocaleLowerCase()),
+  );
+  const pages = Math.max(1, Math.ceil(matches.length / 24)),
+    currentPage = Math.min(page, pages - 1);
+  const current = String(photo.recipe.filter_id || "none");
+  return (
+    <div className="ew-filters">
+      <h3>基础风格</h3>
+      <div className="ew-style-grid">
+        {Object.entries({
+          natural: "自然原色",
+          warm: "暖日",
+          cool: "清透冷调",
+          film: "柔和胶片",
+          mono: "经典黑白",
+        }).map(([id, label]) => (
+          <button
+            key={id}
+            disabled={disabled}
+            className={photo.recipe.style === id ? "active" : ""}
+            aria-pressed={photo.recipe.style === id}
+            onClick={() => update({ style: id, filter_id: "none" })}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      <h3>LUT 滤镜库 · {items.length} 款</h3>
+      <label className="ew-field">
+        搜索滤镜
+        <input
+          type="search"
+          aria-label="搜索滤镜"
+          placeholder="名称或分组"
+          value={query}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            setPage(0);
+          }}
+        />
+      </label>
+      <label className="ew-field">
+        滤镜分组
+        <select
+          aria-label="滤镜分组"
+          value={group}
+          onChange={(e) => {
+            setGroup(e.target.value);
+            setPage(0);
+          }}
+        >
+          <option value="all">全部分组</option>
+          {groups.map((name) => (
+            <option key={name} value={name}>
+              {name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <button
+        className="ew-filter-clear"
+        aria-pressed={current === "none"}
+        disabled={disabled}
+        onClick={() => update({ filter_id: "none" })}
+      >
+        关闭 LUT 滤镜
+      </button>
+      <label className="ew-range">
+        <span>
+          滤镜强度
+          <NumericValue
+            label="滤镜强度"
+            value={Number(photo.recipe.filter_strength ?? 1)}
+            min={0}
+            max={1}
+            disabled={disabled || current === "none"}
+            onChange={(v) => update({ filter_strength: v })}
+          />
+        </span>
+        <input
+          type="range"
+          aria-label="滤镜强度"
+          min={0}
+          max={1}
+          step={0.01}
+          value={Number(photo.recipe.filter_strength ?? 1)}
+          disabled={disabled || current === "none"}
+          onChange={(e) => update({ filter_strength: Number(e.target.value) })}
+        />
+      </label>
+      <div className="ew-filter-grid">
+        {matches
+          .slice(currentPage * 24, currentPage * 24 + 24)
+          .map(([id, item]) => (
+            <button
+              key={id}
+              aria-label={`应用滤镜 ${item.label}`}
+              aria-pressed={current === id}
+              className={current === id ? "active" : ""}
+              disabled={disabled || !item.ready}
+              onClick={() =>
+                update({ style: "natural", filter_id: id, filter_strength: 1 })
+              }
+              title={`${item.label} · ${item.source} · ${item.license}`}
+            >
+              {item.ready && (
+                <FilterThumbnail photo={photo} id={id} revision={revision} />
+              )}
+              <strong>{item.label}</strong>
+              <small>
+                {item.group}
+                {item.ready ? "" : " · 未准备"}
+              </small>
+            </button>
+          ))}
+      </div>
+      {!matches.length && (
+        <p className="ew-description">
+          {items.length ? "没有匹配的滤镜" : "滤镜资源未准备"}
+        </p>
+      )}
+      <div className="ew-filter-paging">
+        <button
+          aria-label="上一页滤镜"
+          disabled={currentPage === 0}
+          onClick={() => setPage(currentPage - 1)}
+        >
+          上一页
+        </button>
+        <span>
+          {currentPage + 1} / {pages} · {matches.length} 款
+        </span>
+        <button
+          aria-label="下一页滤镜"
+          disabled={currentPage + 1 >= pages}
+          onClick={() => setPage(currentPage + 1)}
+        >
+          下一页
+        </button>
+      </div>
+      {catalog?.items[current] && (
+        <p className="ew-description">
+          {catalog.items[current].label}
+          <br />
+          来源：{catalog.items[current].source}
+          <br />
+          许可：{catalog.items[current].license}
+        </p>
+      )}
+    </div>
+  );
+}
+
 export type EditorWorkspaceProps = {
   photo: Photo;
   photos: Photo[];
@@ -430,6 +699,7 @@ export type EditorWorkspaceProps = {
   busy: boolean;
   saving: boolean;
   film: Library["film"];
+  filters?: Library["filters"];
   capabilities: Library["capabilities"];
   history: { undo: number; redo: number };
   onPatch: (patch: Recipe) => void;
@@ -453,6 +723,7 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
     busy,
     saving,
     film,
+    filters,
     capabilities,
     history,
     onPatch,
@@ -469,13 +740,14 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
   } = props;
   const recipe = photo.recipe,
     revision = revisions[photo.id] || 0;
-  const [tool, setTool] = useState<Tool>("tone"),
+  const [tool, setTool] = useState<Tool>("adjust"),
     [compare, setCompare] = useState(false),
     [zoom, setZoom] = useState(1),
     [pan, setPan] = useState<Point>({ x: 0, y: 0 });
   const [bounds, setBounds] = useState({ width: 800, height: 600 }),
     [image, setImage] = useState<HTMLImageElement | null>(null),
     [histVersion, setHistVersion] = useState(0);
+  const [adjustTab, setAdjustTab] = useState("light");
   const [crop, setCrop] = useState<CropRect>(cropFrom(recipe)),
     [aspect, setAspect] = useState("free"),
     [curveChannel, setCurveChannel] = useState("rgb"),
@@ -584,7 +856,7 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
   const applyCrop = () => {
     if (!requireReady()) return;
     patch({ crop_x: crop.x, crop_y: crop.y, crop_w: crop.w, crop_h: crop.h });
-    setTool("move");
+    setTool("adjust");
     setNote("裁剪已保存；原始像素始终保留。");
   };
   const chooseTool = async (id: Tool) => {
@@ -624,9 +896,23 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
     <label className="ew-range" key={key}>
       <span>
         {label}
-        <output>
-          {number(recipe, key, fallback).toFixed(step >= 1 ? 0 : 2)}
-        </output>
+        <NumericValue
+          label={label}
+          value={number(recipe, key, fallback)}
+          min={
+            key === "white_point"
+              ? Math.max(min, number(recipe, "black_point") + 0.011)
+              : min
+          }
+          max={
+            key === "black_point"
+              ? Math.min(max, number(recipe, "white_point", 1) - 0.011)
+              : max
+          }
+          step={step}
+          disabled={busy}
+          onChange={(value) => patch({ [key]: value })}
+        />
         <button
           type="button"
           title={`重置${label}`}
@@ -666,7 +952,15 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
     <label className="ew-range">
       <span>
         {label}
-        <output>{value.toFixed(step >= 1 ? 0 : 2)}</output>
+        <NumericValue
+          label={label}
+          value={value}
+          min={min}
+          max={max}
+          step={step}
+          disabled={busy}
+          onChange={change}
+        />
       </span>
       <input
         aria-label={label}
@@ -900,7 +1194,7 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
     if (e.currentTarget.hasPointerCapture(e.pointerId))
       e.currentTarget.releasePointerCapture(e.pointerId);
   };
-  const activeTool = editorTools.find((t) => t.id === tool)!;
+  const activeTool = editorTools.find((t) => t.id === tool) || editorTools[1];
   const neutralGeometry = {
     ...fullCrop,
     quarter_turns: 0,
@@ -927,25 +1221,18 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
       ),
     });
   const panel = () => {
-    switch (tool) {
-      case "move":
-        return (
-          <>
-            <p className="ew-description">
-              拖动画布平移，滚轮缩放。适合画布只改变查看比例，不会重采样原图。
-            </p>
-            <div className="ew-actions">
-              <button onClick={fitView}>
-                <Maximize2 size={15} />
-                适合画布 F
-              </button>
-              <button onClick={() => setZoom(1 / Math.max(0.01, fit))}>
-                100% 像素
-              </button>
-            </div>
-            <button onClick={onReview}>在阅片台查看这一组</button>
-          </>
-        );
+    const section =
+      tool === "adjust"
+        ? {
+            light: "tone",
+            shadows: "shadows",
+            levels: "levels",
+            color: "color",
+            curves: "curves",
+            texture: "detail",
+          }[adjustTab] || "tone"
+        : tool;
+    switch (section) {
       case "composition":
         return (
           <>
@@ -1032,7 +1319,7 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
               <button
                 onClick={() => {
                   setCrop(cropFrom(recipe));
-                  setTool("move");
+                  setTool("adjust");
                 }}
               >
                 取消
@@ -1063,35 +1350,20 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
       case "tone":
         return (
           <>
-            <div className="ew-style-grid">
-              {Object.entries({
-                natural: "自然原色",
-                warm: "暖日胶片",
-                cool: "清透冷调",
-                film: "柔和胶片",
-                mono: "经典黑白",
-              }).map(([id, label]) => (
-                <button
-                  key={id}
-                  className={recipe.style === id ? "active" : ""}
-                  onClick={() => patch({ style: id })}
-                >
-                  <i className={`ew-style-${id}`} />
-                  {label}
-                </button>
-              ))}
-            </div>
             <h3>基础曝光</h3>
             {range("exposure", "亮度曝光", -2, 2)}
             {range("contrast", "对比度", 0.5, 1.5, 0.01, 1)}
+            {reset({ exposure: 0, contrast: 1 })}
+          </>
+        );
+      case "shadows":
+        return (
+          <>
+            <h3>阴影与高光</h3>
             {range("highlights", "高光", -1, 1)}
             {range("shadows", "阴影", -1, 1)}
             {range("whites", "白色色阶", -1, 1)}
             {range("blacks", "黑色色阶", -1, 1)}
-            <h3>色阶</h3>
-            {range("black_point", "黑场", 0, 0.9)}
-            {range("white_point", "白场", 0.1, 1, 0.01, 1)}
-            {range("gamma", "中间调伽马", 0.2, 5, 0.01, 1)}
             <div className="ew-actions">
               <button
                 onClick={() =>
@@ -1108,13 +1380,17 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
                 鲜明层次
               </button>
             </div>
+            {reset({ highlights: 0, shadows: 0, whites: 0, blacks: 0 })}
+          </>
+        );
+      case "levels":
+        return (
+          <>
+            <h3>黑白色阶与伽马</h3>
+            {range("black_point", "黑场", 0, 0.9)}
+            {range("white_point", "白场", 0.1, 1, 0.01, 1)}
+            {range("gamma", "中间调伽马", 0.2, 5, 0.01, 1)}
             {reset({
-              exposure: 0,
-              contrast: 1,
-              highlights: 0,
-              shadows: 0,
-              whites: 0,
-              blacks: 0,
               black_point: 0,
               white_point: 1,
               gamma: 1,
@@ -1335,6 +1611,16 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
             </button>
           </>
         );
+      case "filters":
+        return (
+          <FilterControls
+            photo={photo}
+            revision={revision}
+            catalog={filters}
+            update={patch}
+            disabled={busy}
+          />
+        );
       case "film":
         return (
           <FilmControls
@@ -1424,8 +1710,13 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
           return;
         e.preventDefault();
         e.stopPropagation();
-        if (shortcutTool) void chooseTool(shortcutTool);
-        else if (key === "f") fitView();
+        if (shortcutTool) {
+          if (shortcutTool === "adjust")
+            setAdjustTab(
+              key === "u" ? "curves" : key === "s" ? "color" : "light",
+            );
+          void chooseTool(shortcutTool);
+        } else if (key === "f") fitView();
         else if (key === "+" || key === "=")
           setZoom((z) => clamp(z * 1.25, 0.1, 20));
         else if (key === "-") setZoom((z) => clamp(z / 1.25, 0.1, 20));
@@ -1435,7 +1726,7 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
           cropDrag.current = null;
           setStamps([]);
           setCrop(cropFrom(recipe));
-          setTool("move");
+          setTool("adjust");
         }
       }}
     >
@@ -1503,7 +1794,7 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
             </button>
             <button
               onClick={() => {
-                setTool("move");
+                setTool("adjust");
                 setCrop(cropFrom(recipe));
               }}
             >
@@ -1515,7 +1806,7 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
           <small>
             {brush
               ? "源像素笔刷 · 抬起鼠标时保存"
-              : "32-bit 浮点处理 · 原始文件始终保留"}
+              : "拖动画布平移 · 滚轮缩放 · F 适合画布"}
           </small>
         )}
         <div className="ew-options-spacer" />
@@ -1560,7 +1851,7 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
         </nav>
         <main className="ew-canvas-column">
           <div
-            className={`ew-canvas ${tool === "move" ? "is-hand" : ""}`}
+            className={`ew-canvas ${tool !== "composition" && !brush ? "is-hand" : ""}`}
             ref={viewport}
             tabIndex={0}
             aria-label="编辑画布"
@@ -1569,13 +1860,15 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
               setZoom((z) => clamp(z * (e.deltaY > 0 ? 0.9 : 1.1), 0.1, 20));
             }}
             onPointerDown={(e) => {
-              if (tool !== "move" || e.button !== 0) return;
+              if (tool === "composition" || brush || e.button !== 0) return;
               if (
                 (e.target as HTMLElement).closest(
-                  'button,input,select,[role="slider"]',
+                  'button,input,select,textarea,[contenteditable="true"],[role="slider"],svg,.ew-interaction,.compare-slider',
                 )
               )
                 return;
+              e.preventDefault();
+              viewport.current?.focus({ preventScroll: true });
               panDrag.current = { x: e.clientX, y: e.clientY, origin: pan };
               e.currentTarget.setPointerCapture(e.pointerId);
             }}
@@ -1788,7 +2081,45 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
               </div>
               <activeTool.icon size={20} />
             </div>
-            <div className="ew-panel-controls">{panel()}</div>
+            <div className="ew-panel-controls">
+              {tool === "adjust" && (
+                <div
+                  className="ew-adjust-tabs"
+                  role="tablist"
+                  aria-label="调节分组"
+                >
+                  {Object.entries({
+                    light: "基础光线",
+                    shadows: "阴影 / 高光",
+                    levels: "色阶 / 伽马",
+                    color: "色彩 / HSL",
+                    curves: "曲线",
+                    texture: "质感",
+                  }).map(([id, label]) => (
+                    <button
+                      key={id}
+                      id={`adjust-tab-${id}`}
+                      role="tab"
+                      aria-selected={adjustTab === id}
+                      aria-controls="adjust-panel"
+                      className={adjustTab === id ? "active" : ""}
+                      onClick={() => setAdjustTab(id)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div
+                id="adjust-panel"
+                role={tool === "adjust" ? "tabpanel" : undefined}
+                aria-labelledby={
+                  tool === "adjust" ? `adjust-tab-${adjustTab}` : undefined
+                }
+              >
+                {panel()}
+              </div>
+            </div>
           </div>
           <footer className="ew-inspector-footer">
             <button disabled={busy} onClick={onSync}>

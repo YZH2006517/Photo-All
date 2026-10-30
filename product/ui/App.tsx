@@ -83,6 +83,7 @@ const EMPTY: Library = {
   photos: [],
   albums: [],
   composites: [],
+  filters: { items: {}, count: 0, attribution: "", source: "", mode: "" },
   film: {
     engine: "",
     mode: "",
@@ -720,17 +721,23 @@ function Studio() {
       const filmId = batchStyle.startsWith("film:")
         ? batchStyle.slice(5)
         : null;
+      const filterId = batchStyle.startsWith("filter:")
+        ? batchStyle.slice(7)
+        : null;
       await api("/edit", {
         ids,
-        recipe_patch: filmId
-          ? {
-              style: "natural",
-              film_stock: filmId,
-              film_strength: 1,
-              film_grain: 0,
-              film_halation: 0,
-            }
-          : { style: batchStyle, film_stock: "none" },
+        recipe_patch: filterId
+          ? { style: "natural", filter_id: filterId, filter_strength: 1 }
+          : filmId
+            ? {
+                style: "natural",
+                film_stock: filmId,
+                film_strength: 1,
+                film_grain: 0,
+                film_halation: 0,
+                filter_id: "none",
+              }
+            : { style: batchStyle, film_stock: "none", filter_id: "none" },
       });
       await reload();
       setRevisions((r) => ({
@@ -738,7 +745,7 @@ function Studio() {
         ...Object.fromEntries(ids.map((id) => [id, (r[id] || 0) + 1])),
       }));
       notify(
-        `已给 ${ids.length} 张照片应用${filmId ? library.film.stocks[filmId].label : styleLabel[batchStyle]}`,
+        `已给 ${ids.length} 张照片应用${filterId ? library.filters.items[filterId].label : filmId ? library.film.stocks[filmId].label : styleLabel[batchStyle]}`,
       );
     });
   const recommend = () => {
@@ -1140,7 +1147,7 @@ function Studio() {
           <div className="sidebar-bottom">
             <span className="online-dot" /> 本地引擎
             {library.capabilities.raw ? "已就绪" : "待连接"}
-            <span className="version">0.9.1</span>
+            <span className="version">0.10.0</span>
           </div>
         </aside>
 
@@ -1658,6 +1665,7 @@ function Studio() {
                   busy={!!busy}
                   saving={saving}
                   film={library.film}
+                  filters={library.filters}
                   capabilities={library.capabilities}
                   history={library.history}
                   onPatch={updateRecipe}
@@ -1718,6 +1726,17 @@ function Studio() {
                         disabled={!stock.ready}
                       >
                         {stock.label}
+                      </option>
+                    ))}
+                  </optgroup>
+                  <optgroup label="开放 LUT 滤镜">
+                    {Object.entries(library.filters.items).map(([id, item]) => (
+                      <option
+                        key={id}
+                        value={`filter:${id}`}
+                        disabled={!item.ready}
+                      >
+                        {item.group} · {item.label}
                       </option>
                     ))}
                   </optgroup>

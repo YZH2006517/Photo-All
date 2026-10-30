@@ -1,0 +1,44 @@
+// Homepage album context menu against a real isolated catalog and source file.
+const {spawn,spawnSync}=require('node:child_process');
+const fs=require('node:fs'),path=require('node:path'),readline=require('node:readline'),crypto=require('node:crypto');
+const {chromium}=require(process.env.PHOTOALL_PLAYWRIGHT||'C:/Users/Administrator/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
+const root=path.resolve(__dirname,'..'),output=path.join(__dirname,'artifacts','album-context-'+Date.now());
+const python=process.env.PHOTOALL_PYTHON||'C:/Users/Administrator/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe';
+fs.mkdirSync(output,{recursive:true});
+const source=path.join(output,'source.png');
+const generated=spawnSync(python,['-c',`from PIL import Image;Image.new('RGB',(100,80),'coral').save(r'${source}')`],{encoding:'utf8',windowsHide:true});
+if(generated.status)throw Error(generated.stderr);
+const hash=()=>crypto.createHash('sha256').update(fs.readFileSync(source)).digest('hex'),before=hash();
+const child=spawn(python,['-u',path.join(root,'product/service.py'),'--data-dir',path.join(output,'data')],{windowsHide:true});
+child.stderr.on('data',d=>process.stderr.write(d));let browser;
+async function until(fn){const end=Date.now()+20000;while(Date.now()<end){if(await fn())return;await new Promise(r=>setTimeout(r,75));}throw Error('Album context verification timeout');}
+(async()=>{
+ const connection=JSON.parse(await new Promise((resolve,reject)=>{readline.createInterface({input:child.stdout}).once('line',resolve);child.once('error',reject);}));
+ const call=async(route,body)=>{const r=await fetch(`http://127.0.0.1:${connection.port}/api${route}`,{method:body?'POST':'GET',headers:{Authorization:'Bearer '+connection.token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const data=await r.json();if(!r.ok)throw Error(data.error);return data;};
+ const album=await call('/albums',{name:'右键图集'}),job=await call('/import',{album_id:album.id,paths:[source]});
+ await until(async()=>(await call('/jobs/'+job.id)).status==='done');
+ const photo=(await call('/library')).photos[0];
+ browser=await chromium.launch({channel:'chrome',headless:true});const page=await browser.newPage({viewport:{width:1080,height:800}}),errors=[];page.on('pageerror',e=>errors.push(e.message));
+ await page.goto(`http://127.0.0.1:1420/#port=${connection.port}&token=${connection.token}`);
+ const tile=page.getByRole('button',{name:'打开图集 右键图集',exact:true}),menu=page.getByRole('menu',{name:'图集菜单'});
+ await tile.click({button:'right'});await menu.waitFor({timeout:4500});await page.keyboard.press('Escape');await menu.waitFor({state:'detached'});
+ await tile.click({button:'right'});await menu.waitFor();await page.mouse.click(1000,780);await menu.waitFor({state:'detached'});
+ await tile.focus();await tile.press('Shift+F10');await menu.waitFor();
+ const bounds=await menu.boundingBox();if(bounds.x<0||bounds.y<0||bounds.x+bounds.width>1081||bounds.y+bounds.height>801)throw Error('Context menu escaped viewport');
+ await page.screenshot({path:path.join(output,'album-context-menu.png')});await menu.getByRole('menuitem',{name:'移到回收站',exact:true}).click();
+ await until(async()=>(await call('/library')).trash_albums.some(a=>a.id===album.id));
+ await page.getByLabel('打开回收站',{exact:true}).click();await page.getByRole('button',{name:'还原图集 右键图集',exact:true}).click();
+ await until(async()=>(await call('/library')).albums.some(a=>a.id===album.id));
+ const restored=(await call('/library')).photos[0];if(restored.id!==photo.id||!restored.album_ids.includes(album.id)||hash()!==before)throw Error('Delete/restore changed a source or membership');
+ await call('/edit',{ids:[photo.id],recipe_patch:{exposure:.37}});await page.reload();
+ await page.getByLabel('返回全部图集',{exact:true}).click();await page.getByRole('button',{name:'打开图集 右键图集',exact:true}).click();
+ await page.locator('.photo-card').first().click();
+ const filters=(await call('/library')).filters.items,filterId=Object.keys(filters).find(id=>filters[id].ready);if(!filterId)throw Error('No real open filter is ready');
+ await page.getByLabel('批量滤镜',{exact:true}).selectOption('filter:'+filterId);await page.getByRole('button',{name:'应用滤镜',exact:true}).click();
+ await until(async()=>{const recipe=(await call('/library')).photos[0].recipe;return recipe.filter_id===filterId;});
+ const graded=(await call('/library')).photos[0].recipe;if(graded.exposure!==.37||graded.style!=='natural')throw Error('Batch filter changed individual exposure or stacked a legacy style');
+ await page.getByLabel('撤销上次修改',{exact:true}).click();await until(async()=>(await call('/library')).photos[0].recipe.filter_id==='none');
+ if(errors.length)throw Error(errors.join('\n'));
+ const report={status:'passed',right_click:true,escape_dismisses:true,outside_dismisses:true,keyboard_context_menu:true,viewport_clamped:true,trash_restore:true,open_filter_batch_undo:true,individual_exposure_preserved:true,source_unchanged:true,browser_errors:errors};
+ fs.writeFileSync(path.join(output,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({output,...report},null,2));
+})().catch(error=>{console.error(error);process.exitCode=1;}).finally(async()=>{if(browser)await browser.close();child.kill();});

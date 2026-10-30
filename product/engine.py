@@ -23,6 +23,7 @@ import time
 
 from PIL import Image, ImageCms, ImageEnhance, ImageFilter, ImageOps, ImageStat
 import film
+import open_filters
 
 RASTER = {'.jpg', '.jpeg', '.png', '.webp', '.tif', '.tiff', '.bmp'}
 RAW = {'.dng', '.nef', '.arw', '.cr2', '.cr3', '.raf', '.rw2', '.orf', '.pef'}
@@ -35,6 +36,7 @@ RAW_DEFAULTS = {'raw_exposure': 0, 'raw_wb': 'camera', 'raw_temperature': 6500,
                 'raw_tint': 1, 'raw_highlights': 0, 'raw_denoise': 0, 'raw_sharpen': 0}
 DEFAULT_RECIPE.update(RAW_DEFAULTS)
 DEFAULT_RECIPE.update(film_stock='none', film_strength=1, film_grain=0, film_halation=0)
+DEFAULT_RECIPE.update(filter_id='none', filter_strength=1)
 IDENTITY_CURVE = '[[0,0],[1,1]]'
 EDITOR_RANGES = {
     'straighten': (-45, 45), 'crop_x': (0, 1), 'crop_y': (0, 1),
@@ -330,6 +332,8 @@ def validate_recipe(recipe):
         raise ValueError('未知风格')
     if result['film_stock'] != 'none' and result['film_stock'] not in film.STOCKS:
         raise ValueError('未知胶片型号')
+    if result['filter_id'] != 'none' and not open_filters.known(result['filter_id']):
+        raise ValueError('未知开放滤镜')
     if result['raw_wb'] not in {'camera', 'auto', 'custom'}:
         raise ValueError('未知 RAW 白平衡模式')
     for name, low, high in [('exposure', -2, 2), ('contrast', .5, 1.5),
@@ -338,6 +342,7 @@ def validate_recipe(recipe):
                             ('raw_tint', .2, 5), ('raw_highlights', 0, 100),
                             ('raw_denoise', 0, 100), ('raw_sharpen', 0, 300),
                             ('film_strength',0,1), ('film_grain',0,1), ('film_halation',0,1),
+                            ('filter_strength',0,1),
                             *((name, *bounds) for name, bounds in EDITOR_RANGES.items())]:
         try: value = float(result[name])
         except (ValueError, TypeError) as exc: raise ValueError(f'参数 {name} 无效') from exc
@@ -873,6 +878,11 @@ def export_photo(photo, folder, template='plain', size=2400, format='jpeg', canc
             'recipe_applied':format!='original','lossless_encoding':format!='jpeg',
             'film_simulation':{'engine':'spektrafilm 0.3.4','revision':film.REVISION,'stock':photo['recipe'].get('film_stock'),
                 'mode':'33^3 sRGB float LUT','spatial_effects':'Photo All additions'} if format!='original' and photo['recipe'].get('film_stock','none')!='none' else None}
+        identity=photo['recipe'].get('filter_id','none')
+        metadata['open_filter']=({'id':identity,'strength':photo['recipe'].get('filter_strength',1),
+            'revision':open_filters.REVISION,**{key:open_filters.manifest()['items'][identity][key]
+            for key in ('label','source','license','sha256')},'mode':'33^3 encoded-sRGB float32 LUT'}
+            if format!='original' and identity!='none' else None)
         with sidecar.open('x',encoding='utf-8') as stream:
             sidecar_created=True
             json.dump(metadata,stream,ensure_ascii=False,indent=2)

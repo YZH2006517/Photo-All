@@ -8,14 +8,19 @@ time requires an internet connection. Existing WebView2 installations can run
 Photo All offline. A portable ZIP does not install WebView2.
 
 Python, NumPy, Pillow, TIFF/PNG codecs, the CPU ONNX inference runtime/tokenizer,
-the local CLIP model, film LUTs, and the complete official RawTherapee portable
+the local CLIP model, film LUTs, the open-filter library, and the complete
+official RawTherapee portable
 distribution are included. End users do not need Python, Node, Rust, pip, or the
 source checkout. HEIC is available only if `pillow_heif` appears in the included
 runtime manifest; this release does not claim an unbundled HEIC codec.
 
 Database, thumbnail/RAW caches and backend diagnostics are stored at
 `%LOCALAPPDATA%\org.photoall.studio`. Original photos stay at their imported paths.
-Uninstalling the application preserves this library. Portable here means the
+Installing a newer release into the same application directory preserves this
+library and its edits. Download the new installer from GitHub Releases and run
+it manually; Photo All does not download or install upgrades automatically.
+Uninstalling preserves this library by default; selecting the installer's
+explicit option to delete application data removes it. Portable here means the
 application folder is movable; the library profile stays in AppData.
 
 ## Build and verify
@@ -23,17 +28,26 @@ application folder is movable; the library profile stays in AppData.
 On a Windows x64 builder install Rust/MSVC Build Tools, Node, project npm
 dependencies, and the Python packages listed in `requirements.txt`. Prepare
 the pinned CLIP assets with `setup_recognition.py` and the film LUTs with
-`film.py --setup`. Put the unmodified RawTherapee 5.13 release directory under
+`film.py --setup` and the open-filter assets with `film.py --setup-filters`.
+The latter verifies the pinned original archive and each source/converted LUT.
+Put the unmodified RawTherapee 5.13 release directory under
 `engines/RawTherapee-5.13/`. Use a CPython 3.12 builder containing Tkinter and the
 NumPy/Pillow packages. Set `VCToolsRedistDir` if the Build Tools redistributable
 directory differs from the default. Run `python package_windows.py sources`
 first to retrieve matching third-party source and original dependency notices.
+An unchanged, already verified `Photo-All-third-party-corresponding-source.zip`
+and `build/third-party-sources` can be reused for a subsequent release; there is
+no need to download or recompress those unchanged source packages.
+Run `python package_windows.py filter-sources` to package the original open-filter
+archive and its licenses separately as `dist/Photo-All-open-filter-sources.zip`.
 Then `python package_windows.py stage` creates `build/runtime`;
 `python package_windows.py build` builds NSIS plus portable ZIP in `dist`.
-`python package_windows.py all` runs these three steps in order.
+`python package_windows.py all` runs both source steps, staging and building.
 The stage is a deliberately selected runtime, not a copy of the
 builder environment. Package versions and per-file SHA-256 hashes are recorded
-in `runtime/runtime-manifest.json`.
+in `runtime/runtime-manifest.json`. Both staging and building verify every
+open-filter LUT against the pinned catalog and require its attribution,
+license text and modification notice.
 
 From the repository root run `python validation/packaging_smoke.py product/build/runtime
 --raw validation/inputs/D7000.NEF --output validation/artifacts/packaging-report.json`.
@@ -44,6 +58,15 @@ companion and LittleCMS loading, starts the API, and verifies a separate AppData
 profile. Also run the native executable smoke against the portable EXE. No build
 cache, user library, photos, film training environment or model training code is
 included. Build artifacts and downloads are ignored by Git.
+
+To verify a manual upgrade, run `node validation/package_native_smoke.cjs
+<new-portable-directory> <new-installer> <previous-installer>` from the repository
+root. It refuses to install when the application already has an HKCU installer
+entry, installs into an isolated temporary directory, imports and edits a test
+photo in an isolated `PHOTOALL_DATA_DIR`, installs the newer version over it,
+and checks the saved photo, recipe, original file and registry version. It also
+checks that uninstalling preserves this isolated library. It never uses the
+real AppData photo library.
 
 ## Licenses, attribution and corresponding source
 
@@ -88,6 +111,25 @@ LUT's JSON records the stock, paper, source revision, hash and modification.
 Share adaptations under the same license and retain attribution. The upstream
 license files are copied to `runtime/licenses/spektrafilm/`. CC BY-SA 4.0 text:
 <https://creativecommons.org/licenses/by-sa/4.0/legalcode>.
+
+The **RawTherapee Film Simulation Collection 2015-09-20** supplies the additional
+open looks, attributed upstream to Pat David, Pavlov Dmitry and Michael Ezra,
+under **CC BY-SA 4.0**. Source and background:
+<https://patdavid.net/2015/03/film-emulation-in-rawtherapee/>; original archive:
+<https://rawtherapee.com/shared/HaldCLUT.zip>, pinned SHA-256
+`0ffca81f30c72d7bbb85adab0ed98bbdeb0e1034cd6f5986f9f993bb66999dc2`.
+Photo All converts the original 8/16-bit Hald look samples to deduplicated 33³
+float32 LUT adaptations; the photo rendering pipeline remains float32 until
+output encoding. The runtime keeps `engines/open-filters/manifest.json`,
+`UPSTREAM-README.txt`, `LICENSE-CC-BY-SA-4.0.txt` and `CHANGES.txt` beside the LUTs.
+The manifest records each original member/hash, source bit depth, conversion,
+attribution, license and converted LUT hash. These adaptations retain CC BY-SA
+4.0. The same release must offer `Photo-All-open-filter-sources.zip` alongside
+the binaries: it contains the complete unchanged original Hald archive, the
+catalog, license, upstream attribution, modification notice and converter.
+The application source includes `open_filters.py`, `pixels.py`, the checked-in
+catalog and `filter-licenses/`; run `python product/film.py --setup-filters`
+from that source checkout to reproduce the installed adaptations.
 
 CLIP ViT-B/32 is the local quantized Xenova conversion, revision
 `6b7c523703ae26e39be4b03774966f8571c7f523`,

@@ -1,5 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import * as model from '../product/ui/model';
+describe('filter thumbnail cache identity',()=>{
+  const sample = {id:7,path:'C:/photos/frame.jpg',digest:'source',recipe:{exposure:0,style:'warm',filter_id:'one',filter_strength:.2}} as any;
+  it('reuses thumbnails when only the selected filter, legacy style or strength changes',()=>{
+    expect(typeof model.filterPreviewKey).toBe('function');
+    const changed={...sample,recipe:{...sample.recipe,style:'cool',filter_id:'two',filter_strength:.9}};
+    expect(model.filterPreviewKey(sample,'target',180)).toBe(model.filterPreviewKey(changed,'target',180));
+  });
+  it('invalidates for adjusted source pixels and different target looks',()=>{
+    expect(typeof model.filterPreviewKey).toBe('function');
+    const changed={...sample,recipe:{...sample.recipe,exposure:1}};
+    expect(model.filterPreviewKey(sample,'target',180)).not.toBe(model.filterPreviewKey(changed,'target',180));
+    expect(model.filterPreviewKey(sample,'target',180)).not.toBe(model.filterPreviewKey(sample,'style:mono',180));
+  });
+});
 import { selectPhotos, exportIds, recommendIds, persistRecipes, classifyPhotos, createCloseHandler, facetCounts, PreviewPool, splitPosition, mergeLibraryRecipes, reviewStep, reviewPair, reviewPhotos } from '../product/ui/model';
 const photos = [
   {id:1,name:'海边.jpg',group_id:'a',decision:'keep',duplicate_of:null,score:70,captured:10,path:'a.jpg'},

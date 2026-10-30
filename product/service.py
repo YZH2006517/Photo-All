@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 import engine
 import workflow
 import film
+import open_filters
 
 ORIGINS = {'http://127.0.0.1:1420', 'http://localhost:1420', 'http://tauri.localhost', 'tauri://localhost', 'https://tauri.localhost'}
 
@@ -57,7 +58,7 @@ class StudioServer(ThreadingHTTPServer):
         self.preview_pruned = 0
         self.preview_dir = self.data_dir / 'previews'
         self.preview_dir.mkdir(parents=True, exist_ok=True)
-        self.preview_version = tuple(p.stat().st_mtime_ns for p in [Path(engine.__file__),Path(__file__),Path(film.__file__),Path(engine.__file__).with_name('pixels.py')])
+        self.preview_version = tuple(p.stat().st_mtime_ns for p in [Path(engine.__file__),Path(__file__),Path(film.__file__),Path(open_filters.__file__),Path(engine.__file__).with_name('pixels.py')])
         engine.RAW_CACHE = self.data_dir / 'raw-cache'
         engine.Catalog(self.data_dir / 'library.sqlite').close()
         super().__init__(address, Handler)
@@ -120,8 +121,13 @@ class StudioServer(ThreadingHTTPServer):
         if recipe['film_stock'] != 'none':
             asset = film.LUTS / (recipe['film_stock'] + '.npy')
             film_identity = [film.REVISION, asset.stat().st_mtime_ns if asset.exists() else None]
+        filter_identity = None
+        if recipe['filter_id'] != 'none':
+            asset = open_filters.asset_path(recipe['filter_id'])
+            filter_identity = [open_filters.REVISION, asset.stat().st_mtime_ns if asset.exists() else None,
+                               open_filters.manifest()['items'][recipe['filter_id']]['sha256']]
         key = hashlib.sha256(json.dumps([self.preview_version, photo['path'], stat.st_mtime_ns,
-            stat.st_size, size, quality, recipe, raw_identity, film_identity], sort_keys=True).encode()).hexdigest()
+            stat.st_size, size, quality, recipe, raw_identity, film_identity, filter_identity], sort_keys=True).encode()).hexdigest()
         lossless=quality=='source'
         path = self.preview_dir / (key + ('.png' if lossless else '.jpg'))
         def cached():
@@ -270,6 +276,7 @@ class Handler(BaseHTTPRequestHandler):
         catalog = engine.Catalog(self.server.data_dir / 'library.sqlite')
         try:
             return {'photos': catalog.photos(), 'albums': catalog.albums(), 'trash_albums': catalog.trash_albums(), 'composites': catalog.composites(), 'history': catalog.history_state(), 'film': film.catalog(),
+                    'filters': open_filters.catalog(),
                     'recognition': workflow.recognition_status(), 'capabilities': engine.capabilities(), 'styles': engine.STYLES,
                     'templates': engine.TEMPLATES, 'defaults': engine.DEFAULT_RECIPE}
         finally:
@@ -297,7 +304,7 @@ class Handler(BaseHTTPRequestHandler):
                 with self.server.lock:
                     job = copy.deepcopy(self.server.jobs.get(route.path.rsplit('/', 1)[1], {}))
                 return self.reply(job or {'error': '任务不存在'}, 200 if job else 404)
-            if route.path.startswith('/api/image/') and self.command == 'GET':
+            if (route.path.startswith('/api/image/') or route.path.startswith('/api/filter-preview/')) and self.command == 'GET':
                 identity = int(route.path.rsplit('/', 1)[1])
                 with closing(sqlite3.connect((self.server.data_dir / 'library.sqlite').as_uri() + '?mode=ro', uri=True)) as database:
                     database.row_factory = sqlite3.Row
@@ -307,6 +314,19 @@ class Handler(BaseHTTPRequestHandler):
                 if not photo:
                     return self.reply({'error': '照片不存在'}, 404)
                 query = parse_qs(route.query)
+                if route.path.startswith('/api/filter-preview/'):
+                    identity=query.get('filter_id',['none'])[0]
+                    recipe={**photo['recipe'],'filter_id':'none','filter_strength':1}
+                    if identity.startswith('style:'):
+                        style=identity[6:]
+                        if style not in engine.STYLES:raise ValueError('未知风格')
+                        recipe['style']=style
+                    else:
+                        if identity!='none' and not open_filters.known(identity):raise ValueError('未知开放滤镜')
+                        recipe.update(style='natural',filter_id=identity)
+                    photo={**photo,'recipe':engine.validate_recipe(recipe)}
+                    size=min(480,max(120,int(query.get('size',['240'])[0])))
+                    return self.reply(self.server.preview(photo,size,False),content_type='image/jpeg')
                 quality=query.get('quality',['preview'])[0]
                 if quality not in {'source','preview'}:raise ValueError('显示质量无效')
                 requested=int(query.get('size',['1200'])[0])

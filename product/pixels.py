@@ -557,6 +557,13 @@ def render(path, recipe, max_size=None, preserve_alpha=False):
             for start in range(0, rgb.shape[0], 64):
                 graded[start:start+64] = rgb[start:start+64]+(graded[start:start+64]-rgb[start:start+64])*np.float32(strength)
         rgb = graded
+    if recipe['filter_id'] != 'none' and recipe['filter_strength']:
+        import open_filters
+        graded = apply_lut(rgb, open_filters.load_table(recipe['filter_id']))
+        if recipe['filter_strength'] != 1:
+            for start in range(0, rgb.shape[0], 64):
+                graded[start:start+64] = rgb[start:start+64]+(graded[start:start+64]-rgb[start:start+64])*np.float32(recipe['filter_strength'])
+        rgb = graded
     np.clip(rgb, 0, 1, out=rgb)
     _editor_tone(rgb, recipe)
     _editor_details(rgb, recipe)

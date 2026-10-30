@@ -36,11 +36,13 @@ def main():
         check = """
 import json, sys
 from pathlib import Path
-import numpy, PIL, png, tifffile, imagecodecs, pixels, engine, film, workflow, tkinter
+import numpy, PIL, png, tifffile, imagecodecs, pixels, engine, film, open_filters, workflow, tkinter
 from PIL import Image
 assert engine.capabilities()['raw']
 assert workflow.recognition_status()['ready']
 assert all(item['ready'] for item in film.catalog()['stocks'].values())
+looks = open_filters.catalog()
+assert looks['count'] >= 100 and all(item['ready'] for item in looks['items'].values())
 image = Image.new('RGB',(80,64),(40,130,70))
 image.save(sys.argv[1])
 workspace = Path(sys.argv[1]).parent
@@ -53,6 +55,11 @@ for format, suffix in [('png16','.png'),('tiff16','.tif')]:
 pixels._lcms()
 graded = film.apply_film(image, {'film_stock':'kodak_portra_400','film_strength':1,'film_grain':0,'film_halation':0})
 assert graded.tobytes() != image.tobytes()
+look = next(iter(looks['items']))
+base = engine.render_pixels(sys.argv[1], {})
+filtered = engine.render_pixels(sys.argv[1], {'filter_id':look, 'filter_strength':1})
+assert filtered.dtype == numpy.float32 and numpy.isfinite(filtered).all()
+assert numpy.max(numpy.abs(filtered-base)) > 1e-5
 widget = tkinter.Tk()
 widget.withdraw()
 widget.destroy()
@@ -63,7 +70,7 @@ if raw.is_file():
     assert decoded.width > 100 and decoded.height > 100
 classifier = workflow.LocalClassifier()
 features = classifier.classify(image)
-print(json.dumps({'python':sys.version,'prefix':sys.prefix,'raw':str(engine.raw_executable()),'raw_decoded':raw.is_file(),'precision_roundtrips':True,'lcms_loaded':True,'film_rendered':True,'tk_companion':True,'classification':features,'numpy':numpy.__version__,'Pillow':PIL.__version__}))
+print(json.dumps({'python':sys.version,'prefix':sys.prefix,'raw':str(engine.raw_executable()),'raw_decoded':raw.is_file(),'precision_roundtrips':True,'lcms_loaded':True,'film_rendered':True,'open_filter_rendered':True,'open_filter_count':looks['count'],'tk_companion':True,'classification':features,'numpy':numpy.__version__,'Pillow':PIL.__version__}))
 """
         fixture = temporary / 'synthetic.png'
         result = subprocess.run([str(python), '-c', check, str(fixture), str(raw)], env=env,

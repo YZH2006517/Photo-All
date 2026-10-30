@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import { motion } from "motion/react";
 import {
   Plus,
@@ -95,6 +96,51 @@ export function Albums({
     [name, setName] = useState(""),
     [error, setError] = useState(""),
     [saving, setSaving] = useState(false);
+  const [menu, setMenu] = useState<{
+    album: Album;
+    x: number;
+    y: number;
+    trigger: HTMLElement;
+  } | null>(null);
+  useEffect(() => {
+    if (!menu) return;
+    const outside = (event: PointerEvent) => {
+      if (!(event.target as HTMLElement).closest(".album-context-menu"))
+        setMenu(null);
+    };
+    const key = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        setMenu(null);
+        menu.trigger.focus();
+      }
+    };
+    const dismiss = () => setMenu(null);
+    window.addEventListener("pointerdown", outside);
+    window.addEventListener("keydown", key, true);
+    window.addEventListener("resize", dismiss);
+    return () => {
+      window.removeEventListener("pointerdown", outside);
+      window.removeEventListener("keydown", key, true);
+      window.removeEventListener("resize", dismiss);
+    };
+  }, [menu]);
+  const context = (
+    album: Album,
+    trigger: HTMLElement,
+    x: number,
+    y: number,
+  ) => {
+    if (busy) return;
+    const rect = trigger.getBoundingClientRect();
+    setMenu({
+      album,
+      trigger,
+      x: Math.max(8, Math.min(x || rect.left + 16, window.innerWidth - 216)),
+      y: Math.max(8, Math.min(y || rect.bottom, window.innerHeight - 110)),
+    });
+  };
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     setSaving(true);
@@ -208,7 +254,19 @@ export function Albums({
             .flatMap((p) => p.features.palette || [])
             .slice(0, 5);
           return (
-            <div className="album-tile" key={album.id}>
+            <div
+              className="album-tile"
+              key={album.id}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                const trigger =
+                  event.currentTarget.querySelector<HTMLElement>(
+                    ".album-card",
+                  )!;
+                context(album, trigger, event.clientX, event.clientY);
+              }}
+            >
               <motion.button
                 key={album.id}
                 className="album-card"
@@ -216,6 +274,16 @@ export function Albums({
                   trash ? `恢复图集 ${album.name}` : `打开图集 ${album.name}`
                 }
                 onClick={() => (trash ? restoreAlbum(album) : open(album))}
+                onKeyDown={(event) => {
+                  if (
+                    event.key === "ContextMenu" ||
+                    (event.shiftKey && event.key === "F10")
+                  ) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    context(album, event.currentTarget, 0, 0);
+                  }
+                }}
                 initial={{ opacity: 0, y: 14 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ delay: Math.min(index * 0.04, 0.24) }}
@@ -282,6 +350,35 @@ export function Albums({
           <small>日期、主色、冷暖、亮度与内容，可以一起筛选。</small>
         </span>
       </div>
+      {menu &&
+        createPortal(
+          <div
+            className="photo-context-menu album-context-menu"
+            role="menu"
+            aria-label="图集菜单"
+            style={{ position: "fixed", left: menu.x, top: menu.y }}
+            onContextMenu={(event) => event.preventDefault()}
+          >
+            <button
+              role="menuitem"
+              autoFocus
+              disabled={busy}
+              onClick={() => {
+                const album = menu.album;
+                setMenu(null);
+                if (trash) restoreAlbum(album);
+                else removeAlbum(album);
+              }}
+            >
+              {trash ? <RotateCcw size={15} /> : <Trash2 size={15} />}
+              {trash ? "恢复图集" : "移到回收站"}
+            </button>
+            <small>
+              {trash ? "还原图集及照片成员" : "30 天内可恢复 · 保留原片"}
+            </small>
+          </div>,
+          document.body,
+        )}
       {creating && (
         <div className="modal-backdrop">
           <form

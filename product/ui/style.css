@@ -3858,3 +3858,25 @@ a {
 .variant-preference { min-width: 108px; max-width: 138px; height: 32px; border: 1px solid #e1e7dc; border-radius: 8px; background: #f4f7ef; color: #6b816c; padding: 0 8px; font-size: 11px; }
 .library-toolbar { gap: 10px; flex-wrap: wrap; }
 .lt-header-actions select[aria-label="观片格式偏好"] { color-scheme: dark; color: #e4debf; background: #343b36; border: 1px solid #626c5d; border-radius: 8px; padding: 6px 9px; font-size: 11px; }
+
+/* 0.10 editor: direct numeric entry, grouped adjustment controls and bounded LUT pages. */
+.editor-workspace .ew-adjust-tabs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;margin-bottom:18px;padding:4px;border:1px solid #ffffff12;border-radius:6px;background:#191f22;}
+.editor-workspace .ew-adjust-tabs button{min-width:0;font-size:10px;padding:7px 4px;}
+.editor-workspace .ew-range>span>.numeric-value,.film-controls .slider-row>span>.numeric-value{margin-left:auto;}
+.editor-workspace .numeric-value,.film-controls .numeric-value{display:inline-flex;align-items:center;gap:2px;flex:0 0 auto;font-variant-numeric:tabular-nums;}
+.editor-workspace .numeric-value input,.film-controls .numeric-value input{display:inline-block;width:58px;height:23px;min-height:23px;margin:0;padding:3px 5px;border:1px solid #ffffff16;border-radius:3px;background:#191f22;color:#d8d6bd;font:inherit;font-size:11px;text-align:right;cursor:text;}
+.editor-workspace .numeric-value input:hover,.film-controls .numeric-value input:hover{border-color:#d2c49e60;}
+.editor-workspace .numeric-value input:focus,.film-controls .numeric-value input:focus{border-color:#d2c49e;background:#11171a;outline:1px solid #d2c49e;outline-offset:1px;}
+.editor-workspace .ew-curve-values{display:flex;align-items:center;gap:4px;flex-wrap:wrap;}
+.editor-workspace .ew-curve-values .numeric-value input{width:39px;}
+.editor-workspace .ew-field input[type=search]{width:100%;min-height:31px;padding:7px 9px;border:1px solid #ffffff1a;border-radius:4px;background:#191e22;color:#e0e1d7;font:inherit;}
+.editor-workspace .ew-filter-clear{width:100%;border-color:#ffffff20;}
+.editor-workspace .ew-filter-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;}
+.editor-workspace .ew-filter-grid>button{display:flex;min-width:0;flex-direction:column;align-items:stretch;gap:5px;padding:5px;border:1px solid #ffffff17;font-size:10px;text-align:left;}
+.editor-workspace .ew-filter-grid strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;}
+.editor-workspace .ew-filter-grid small{font-size:9px;color:#8c9b94;}
+.editor-workspace .ew-filter-thumbnail{display:flex;width:100%;height:68px;align-items:center;justify-content:center;overflow:hidden;background:#141a1d;border-radius:2px;}
+.editor-workspace .ew-filter-thumbnail img{display:block;width:100%;height:100%;object-fit:cover;pointer-events:none;}
+.editor-workspace .ew-filter-paging{display:flex;align-items:center;justify-content:space-between;gap:4px;margin:15px 0;font-size:9px;color:#9ca99c;}
+.editor-workspace .ew-filter-paging button{padding:5px;font-size:9px;}
+.editor-workspace .ew-canvas img{user-select:none;-webkit-user-drag:none;}

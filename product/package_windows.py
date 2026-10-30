@@ -33,6 +33,7 @@ DOWNLOADS = WORKSPACE / 'validation/downloads'
 PYTHON_URL = 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip'
 PYTHON_SHA256 = '4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3'
 RUNTIME_FILES = ['service.py', 'engine.py', 'pixels.py', 'workflow.py', 'film.py',
+                 'open_filters.py', 'open-filters-manifest.json',
                  'app.py', 'companion.cmd', 'LICENSE', 'README.md']
 
 # Exact binary ownership is confirmed by SHA-256, never inferred from the name
@@ -238,6 +239,58 @@ def sha256(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def verify_open_filters(base):
+    """Reject partial look libraries and omitted upstream/adaptation notices."""
+    base = Path(base)
+    manifest = base / 'open-filters-manifest.json'
+    assets = base / 'engines/open-filters'
+    if not manifest.is_file():
+        raise RuntimeError('Open-filter manifest is missing; run film.py --setup-filters')
+    data = json.loads(manifest.read_text(encoding='utf-8'))
+    for name in ['manifest.json', 'UPSTREAM-README.txt', 'LICENSE-CC-BY-SA-4.0.txt', 'CHANGES.txt']:
+        if not (assets / name).is_file():
+            raise RuntimeError('Open-filter notice is missing: ' + name)
+    if (assets / 'manifest.json').read_bytes() != manifest.read_bytes():
+        raise RuntimeError('Open-filter asset manifest is outdated; run film.py --setup-filters')
+    if not data.get('items'):
+        raise RuntimeError('Open-filter manifest has no assets')
+    for identity, entry in data['items'].items():
+        asset = assets / (identity + '.npy')
+        if not asset.is_file() or sha256(asset) != entry['sha256']:
+            raise RuntimeError('Open-filter asset is missing or has changed: ' + identity)
+    return data
+
+
+def open_filter_sources():
+    """Package the original look archive separately; leave existing sources intact."""
+    data = verify_open_filters(ROOT)
+    original = DOWNLOADS / 'open-filters/RawTherapee-HaldCLUT.zip'
+    if not original.is_file() or sha256(original) != data['archive_sha256']:
+        raise RuntimeError('Open-filter original archive checksum mismatch; run film.py --setup-filters')
+    output = ROOT / 'dist/Photo-All-open-filter-sources.zip'
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # The upstream ZIP is already compressed. Store it verbatim rather than
+    # recompressing it or rebuilding the unrelated MSYS2 source distribution.
+    with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_STORED) as target:
+        target.write(original, original.name)
+        for name in ['open-filters-manifest.json', 'open_filters.py', 'LICENSE']:
+            target.write(ROOT / name, name)
+        for name in ['UPSTREAM-README.txt', 'LICENSE-CC-BY-SA-4.0.txt', 'CHANGES.txt']:
+            target.write(ROOT / 'engines/open-filters' / name, name)
+        target.writestr('README.txt',
+            'Original RawTherapee Film Simulation Collection lookup assets and notices.\n'
+            f"Pinned revision: {data['revision']}\n"
+            f"Original archive SHA-256: {data['archive_sha256']}\n"
+            'See open-filters-manifest.json for every source member and converted LUT hash.\n'
+            'The application source archive attached to this release includes the converter,\n'
+            'its dependencies, license and build instructions. To reproduce the float32 LUTs,\n'
+            'place RawTherapee-HaldCLUT.zip in validation/downloads/open-filters/ and run\n'
+            'python product/film.py --setup-filters from that source checkout.\n')
+    print(json.dumps({'source_archive': str(output), 'bytes': output.stat().st_size,
+                      'sha256': sha256(output), 'looks': len(data['items'])}, indent=2), flush=True)
+    return output
+
+
 def dependency_notices():
     notices = []
     names = ['react', 'react-dom', 'scheduler', 'lucide-react', 'motion', 'framer-motion',
@@ -277,6 +330,7 @@ def copy(source, destination):
 
 
 def stage():
+    verify_open_filters(ROOT)
     DOWNLOADS.mkdir(parents=True, exist_ok=True)
     archive = DOWNLOADS / PYTHON_URL.rsplit('/', 1)[1]
     if not archive.is_file():
@@ -325,8 +379,9 @@ def stage():
         raise RuntimeError('Microsoft.VC143.CRT redistributable DLL directory is required (VCToolsRedistDir)')
     for name in RUNTIME_FILES:
         copy(ROOT / name, STAGE / name)
-    for name in ['RawTherapee-5.13', 'clip-vit-base-patch32', 'film-luts']:
+    for name in ['RawTherapee-5.13', 'clip-vit-base-patch32', 'film-luts', 'open-filters']:
         copy(ROOT / 'engines' / name, STAGE / 'engines' / name)
+    verify_open_filters(STAGE)
     copy(ROOT / 'WINDOWS_DISTRIBUTION.md', STAGE / 'THIRD_PARTY_NOTICES.md')
     if (ROOT / 'build/third-party-sources/LICENSES.txt').is_file():
         copy(ROOT / 'build/third-party-sources/LICENSES.txt', STAGE / 'licenses/RawTherapee-dependencies.txt')
@@ -350,6 +405,15 @@ def build():
         raise RuntimeError('Run stage first')
     if not (STAGE / 'licenses/RawTherapee-dependencies.txt').is_file() or not (ROOT / 'dist/Photo-All-third-party-corresponding-source.zip').is_file():
         raise RuntimeError('Corresponding source and notices are required; run sources, then stage')
+    verify_open_filters(ROOT)
+    verify_open_filters(STAGE)
+    filter_source = ROOT / 'dist/Photo-All-open-filter-sources.zip'
+    if not filter_source.is_file():
+        raise RuntimeError('Open-filter corresponding source is required; run filter-sources')
+    with zipfile.ZipFile(filter_source) as source:
+        for name in ['open-filters-manifest.json', 'open_filters.py', 'LICENSE']:
+            if source.read(name) != (ROOT / name).read_bytes():
+                raise RuntimeError('Open-filter source bundle is outdated; run filter-sources')
     for name in RUNTIME_FILES:
         if not (STAGE / name).is_file() or sha256(STAGE / name) != sha256(ROOT / name):
             raise RuntimeError(f'Staged {name} is outdated; run stage again')
@@ -381,10 +445,12 @@ def build():
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['stage', 'build', 'all', 'sources'])
+    parser.add_argument('action', choices=['stage', 'build', 'all', 'sources', 'filter-sources'])
     options = parser.parse_args()
     if options.action in {'sources', 'all'}:
         corresponding_sources()
+    if options.action in {'filter-sources', 'all'}:
+        open_filter_sources()
     if options.action in {'stage', 'all'}:
         stage()
     if options.action in {'build', 'all'}:

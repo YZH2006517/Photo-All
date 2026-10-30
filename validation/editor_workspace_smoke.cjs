@@ -86,7 +86,7 @@ async function verifyReadiness(page, editor, current) {
     return route.continue();
   });
   await editor.getByLabel("顺时针旋转90度").click();
-  await editor.getByRole("button", { name: "移动与缩放", exact: true }).click();
+  await editor.getByRole("button", { name: "调节", exact: true }).click();
   const composition = editor.getByRole("button", { name: "构图", exact: true });
   await composition.click();
   await page.waitForTimeout(120);
@@ -147,6 +147,12 @@ async function verifyInspector(page, editor, current, output) {
   for (const height of [720, 620, 1020]) {
     await page.setViewportSize({ width: 1540, height });
     for (const name of ["亮度曝光", "白场", "中间调伽马"]) {
+      await editor
+        .getByRole("tab", {
+          name: name === "亮度曝光" ? "基础光线" : "色阶 / 伽马",
+          exact: true,
+        })
+        .click();
       const input = editor.getByRole("slider", { name, exact: true });
       await input.scrollIntoViewIfNeeded();
       const bounds = await input.boundingBox();
@@ -160,11 +166,98 @@ async function verifyInspector(page, editor, current, output) {
         path: path.join(output, "tone-small-window.png"),
       });
   }
+  const black = editor.getByRole("textbox", { name: "黑场数值", exact: true });
+  const white = editor.getByRole("textbox", { name: "白场数值", exact: true });
+  await black.fill("0.99");
+  await black.press("Enter");
+  await until(async () => (await current()).recipe.black_point === 0.9);
+  await white.fill("0");
+  await white.press("Enter");
+  await until(
+    async () =>
+      (await current()).recipe.white_point > 0.9 &&
+      (await current()).recipe.white_point < 0.92,
+  );
+  await black.fill("0");
+  await black.press("Tab");
+  await until(async () => (await current()).recipe.black_point === 0);
   await editor.getByRole("slider", { name: "白场", exact: true }).fill("0.92");
   await until(
     async () => Math.abs((await current()).recipe.white_point - 0.92) < 0.001,
   );
   return true;
+}
+
+async function verifyFilters(page, editor, current, call) {
+  const catalog = (await call("/library")).filters;
+  const items = Object.entries(catalog?.items || {}).filter(
+    ([, item]) => item.ready,
+  );
+  if (items.length < 100)
+    throw Error("The real LUT library has fewer than 100 ready filters");
+  const requests = [];
+  const record = (request) => {
+    if (request.url().includes("/api/filter-preview/"))
+      requests.push(new URL(request.url()));
+  };
+  page.on("request", record);
+  await editor.getByRole("button", { name: "滤镜", exact: true }).click();
+  const cards = editor.locator(".ew-filter-grid>button");
+  if ((await cards.count()) > 24)
+    throw Error("Filter catalog rendered more than one bounded page");
+  await editor
+    .locator(".ew-inspector-scroll")
+    .evaluate((element) => (element.scrollTop = 0));
+  await page.waitForTimeout(350);
+  if (
+    requests.length > 24 ||
+    requests.some((url) => Number(url.searchParams.get("size")) > 240)
+  )
+    throw Error(
+      "Filter catalog eagerly fetched full-resolution or unbounded previews",
+    );
+  const firstPage = await cards.first().getAttribute("aria-label");
+  await editor.getByLabel("下一页滤镜", { exact: true }).click();
+  if ((await cards.first().getAttribute("aria-label")) === firstPage)
+    throw Error("Filter pagination did not advance");
+  const [id, item] = items[items.length - 1];
+  await editor.getByLabel("搜索滤镜", { exact: true }).fill(item.label);
+  const candidate = editor.getByRole("button", {
+    name: `应用滤镜 ${item.label}`,
+    exact: true,
+  });
+  await candidate.click();
+  await until(async () => (await current()).recipe.filter_id === id);
+  if ((await current()).recipe.style !== "natural")
+    throw Error("External LUT retained a hidden legacy style");
+  await editor
+    .getByRole("textbox", { name: "滤镜强度数值", exact: true })
+    .fill("0.35");
+  await editor
+    .getByRole("textbox", { name: "滤镜强度数值", exact: true })
+    .press("Enter");
+  await until(async () => (await current()).recipe.filter_strength === 0.35);
+  await editor.getByLabel("撤销上次修改", { exact: true }).click();
+  await until(async () => (await current()).recipe.filter_strength === 1);
+  await editor
+    .getByLabel("搜索滤镜", { exact: true })
+    .fill("no-filter-matches-0987654321");
+  if (await cards.count())
+    throw Error("Filter search returned unrelated cards");
+  await editor.getByLabel("搜索滤镜", { exact: true }).fill("");
+  await editor.getByLabel("滤镜分组", { exact: true }).selectOption(item.group);
+  if ((await cards.count()) > 24)
+    throw Error("Filter group bypassed pagination");
+  await editor
+    .getByRole("button", { name: "关闭 LUT 滤镜", exact: true })
+    .click();
+  await until(async () => (await current()).recipe.filter_id === "none");
+  page.off("request", record);
+  return {
+    ready_filters: items.length,
+    bounded_page: true,
+    search_group_apply_strength_undo: true,
+  };
 }
 
 (async () => {
@@ -222,7 +315,17 @@ async function verifyInspector(page, editor, current, output) {
     return;
   }
 
-  for (const name of ["裁剪", "旋转与校正", "细节", "修复与仿制", "局部调整"]) {
+  for (const name of [
+    "移动与缩放",
+    "光线与色调",
+    "曲线",
+    "色彩与 HSL",
+    "裁剪",
+    "旋转与校正",
+    "细节",
+    "修复与仿制",
+    "局部调整",
+  ]) {
     if (
       await editor
         .getByRole("navigation", { name: "编辑工具" })
@@ -237,6 +340,25 @@ async function verifyInspector(page, editor, current, output) {
     current,
     output,
   );
+  await editor.getByRole("tab", { name: "基础光线", exact: true }).click();
+  const numeric = editor.getByRole("textbox", {
+    name: "亮度曝光数值",
+    exact: true,
+  });
+  await numeric.fill("0.37");
+  await numeric.press("Enter");
+  await until(async () => (await current()).recipe.exposure === 0.37);
+  await numeric.fill("0.92");
+  await numeric.press("Escape");
+  if ((await numeric.inputValue()) !== "0.37")
+    throw Error("Escape did not restore numeric entry");
+  await numeric.fill("oops");
+  await numeric.press("Enter");
+  if ((await current()).recipe.exposure !== 0.37)
+    throw Error("Invalid numeric entry changed recipe");
+  await numeric.fill("0");
+  await numeric.press("Tab");
+  await until(async () => (await current()).recipe.exposure === 0);
   await editor
     .getByRole("slider", { name: "亮度曝光", exact: true })
     .fill("0.5");
@@ -244,12 +366,37 @@ async function verifyInspector(page, editor, current, output) {
   await editor.getByLabel("编辑画布").focus();
   await page.keyboard.press("Control+z");
   await until(async () => (await current()).recipe.exposure === 0);
-  await editor.getByRole("button", { name: "移动与缩放", exact: true }).click();
+  await editor.getByRole("button", { name: "调节", exact: true }).click();
   const zoomBefore = await editor.locator(".ew-zoom-number").textContent();
   await editor.getByTitle("放大", { exact: true }).click();
   if ((await editor.locator(".ew-zoom-number").textContent()) === zoomBefore)
     throw Error("Canvas pan captured the zoom button click");
   await editor.getByTitle("适合画布", { exact: true }).click();
+  for (const toolName of ["调节", "滤镜", "胶片模拟", "RAW 显影"]) {
+    await editor.getByRole("button", { name: toolName, exact: true }).click();
+    await editor.getByTitle("100% 原始像素", { exact: true }).click();
+    const canvas = await editor.getByLabel("编辑画布").boundingBox();
+    const beforePan = await editor
+      .locator(".ew-image-frame")
+      .getAttribute("style");
+    await page.mouse.move(
+      canvas.x + canvas.width * 0.5,
+      canvas.y + canvas.height * 0.5,
+    );
+    await page.mouse.down();
+    await page.mouse.move(
+      canvas.x + canvas.width * 0.5 + 62,
+      canvas.y + canvas.height * 0.5 + 28,
+      { steps: 5 },
+    );
+    await page.mouse.up();
+    if (
+      (await editor.locator(".ew-image-frame").getAttribute("style")) ===
+      beforePan
+    )
+      throw Error("Ordinary canvas drag did not pan in " + toolName);
+    await editor.getByTitle("适合画布", { exact: true }).click();
+  }
 
   await editor.getByRole("button", { name: "构图", exact: true }).click();
   await waitReady(editor);
@@ -284,7 +431,8 @@ async function verifyInspector(page, editor, current, output) {
   await editor.getByLabel("重做上次修改", { exact: true }).click();
   await until(async () => (await current()).recipe.quarter_turns === 1);
 
-  await editor.getByRole("button", { name: "曲线", exact: true }).click();
+  await editor.getByRole("button", { name: "调节", exact: true }).click();
+  await editor.getByRole("tab", { name: "曲线", exact: true }).click();
   const curve = await editor.getByLabel("分段线性曲线编辑器").boundingBox();
   await page.mouse.dblclick(
     curve.x + curve.width * 0.5,
@@ -293,7 +441,7 @@ async function verifyInspector(page, editor, current, output) {
   await until(
     async () => JSON.parse((await current()).recipe.curve_rgb).length === 3,
   );
-  await editor.getByRole("button", { name: "色彩与 HSL", exact: true }).click();
+  await editor.getByRole("tab", { name: "色彩 / HSL", exact: true }).click();
   await editor.getByLabel("HSL 蓝", { exact: true }).click();
   await editor
     .getByRole("slider", { name: "分色色相", exact: true })
@@ -311,6 +459,7 @@ async function verifyInspector(page, editor, current, output) {
       (entry) => entry.band === 5 && entry.saturation === 0.24,
     ),
   );
+  const filters = await verifyFilters(page, editor, current, call);
   const photo = await current();
   const job = await call("/export", {
     ids: [photo.id],
@@ -352,6 +501,9 @@ print(json.dumps({'width':w,'height':h,'bits':info['bitdepth'],'source_preserved
     inspector_parameters_accessible: inspectorAccessible,
     simplified_tools: true,
     hsl_saved: true,
+    normal_canvas_pan: true,
+    numeric_entry_commit_cancel_invalid: true,
+    filters,
     export: JSON.parse(verification),
     browser_errors: errors,
   };
