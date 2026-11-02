@@ -107,6 +107,19 @@ export function Lighttable({
       return true;
     }
   });
+  const [offColor, setOffColor] = useState(() => {
+    try {
+      const saved = localStorage.getItem("photoall-table-off-color");
+      return saved && /^#[0-9a-f]{6}$/i.test(saved) ? saved : "#dfd5b5";
+    } catch {
+      return "#dfd5b5";
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("photoall-table-off-color", offColor);
+    } catch {}
+  }, [offColor]);
   useEffect(() => {
     try {
       localStorage.setItem("photoall-film-borders", filmBorders ? "on" : "off");
@@ -142,6 +155,7 @@ export function Lighttable({
   const [deskReveal, setDeskReveal] = useState(0);
   const [thumbnailDrag, setThumbnailDrag] = useState<number | null>(null);
   const [deskIds, setDeskIds] = useState<number[]>([]);
+  const [collect, setCollect] = useState({ dragging: false, hover: false });
   const callbacks = useRef({
     onDecision,
     onUndo,
@@ -567,6 +581,7 @@ export function Lighttable({
     <div
       ref={root}
       className={`lighttable ${immersive ? "immersive" : ""} ${hudVisible ? "hud-visible" : "hud-hidden"} ${light ? "backlit" : ""}`}
+      style={{ "--lt-off-color": offColor } as React.CSSProperties}
       role="dialog"
       aria-modal="true"
       aria-label="电子观片台"
@@ -679,6 +694,39 @@ export function Lighttable({
             {light ? <Sun size={16} /> : <Moon size={16} />}
             {light ? "关灯" : "开灯"}
           </button>
+          <details className="lt-background-picker">
+            <summary title="选择关灯底色" aria-label="选择关灯底色">
+              <span style={{ background: offColor }} />
+              底色
+            </summary>
+            <div className="lt-background-options">
+              <strong>关灯底色</strong>
+              {[
+                ["米黄色", "#dfd5b5"],
+                ["暖灰色", "#a5a49d"],
+                ["灰黑色", "#272c2e"],
+              ].map(([label, color]) => (
+                <button
+                  key={color}
+                  aria-pressed={offColor === color}
+                  onClick={() => setOffColor(color)}
+                >
+                  <span style={{ background: color }} />
+                  {label}
+                  {offColor === color && <Check size={12} />}
+                </button>
+              ))}
+              <label>
+                自定义
+                <input
+                  type="color"
+                  aria-label="自定义关灯底色"
+                  value={offColor}
+                  onChange={(e) => setOffColor(e.target.value)}
+                />
+              </label>
+            </div>
+          </details>
           <button
             aria-label="切换沉浸模式"
             aria-pressed={immersive}
@@ -710,7 +758,8 @@ export function Lighttable({
       </header>
       <div className={`lt-stage layout-${layout}`}>
         <button
-          className={`lt-corner-heart ${current && decision(current) === "keep" ? "is-kept" : ""}`}
+          className={`lt-corner-heart lt-hud ${current && decision(current) === "keep" ? "is-kept" : ""}`}
+          {...hudEvents}
           aria-label="观片收藏"
           aria-pressed={!!current && decision(current) === "keep"}
           disabled={!current || closing}
@@ -750,7 +799,9 @@ export function Lighttable({
           reveal={deskReveal}
           incomingId={thumbnailDrag}
           onDeskChange={setDeskIds}
+          onCollectChange={setCollect}
           light={light}
+          offColor={offColor}
           onLight={() => setLight((v) => !v)}
         />
         {layout === "single" && (
@@ -763,7 +814,13 @@ export function Lighttable({
           </div>
         )}
       </div>
-      <footer className="lt-footer lt-hud" {...hudEvents}>
+      <footer
+        className={`lt-footer lt-hud ${collect.dragging ? "is-collecting" : ""} ${collect.hover ? "collect-hover" : ""}`}
+        {...hudEvents}
+      >
+        <div className="lt-collect-overlay" aria-hidden={!collect.dragging}>
+          松手收纳到准备区
+        </div>
         <div className="lt-tools">
           <div className="lt-navigation">
             <button

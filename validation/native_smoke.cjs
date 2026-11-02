@@ -18,6 +18,30 @@ async function waitFor(check,timeout=30000){const end=Date.now()+timeout;while(D
   const context=browser.contexts()[0];let page;
   await waitFor(async()=>{page=context.pages().find(p=>p.url().includes('tauri.localhost'));return !!page;});
   await page.getByRole('heading',{name:'图集',exact:true}).waitFor();
+  if(process.env.PHOTOALL_NATIVE_CHROME==='1'){
+    const state=command=>page.evaluate(command=>window.__TAURI_INTERNALS__.invoke('plugin:window|'+command,{label:'main'}),command);
+    const errors=[];page.on('pageerror',error=>errors.push(error.message));
+    await page.getByRole('banner',{name:'窗口标题栏'}).waitFor();
+    if(await state('is_decorated'))throw Error('Windows native title bar remains');
+    await page.getByRole('button',{name:'最大化窗口',exact:true}).click();
+    await waitFor(()=>state('is_maximized'));
+    await page.getByRole('button',{name:'还原窗口',exact:true}).click();
+    await waitFor(async()=>!await state('is_maximized'));
+    await page.locator('.window-drag').dblclick();
+    await waitFor(()=>state('is_maximized'));
+    await page.getByRole('button',{name:'还原窗口',exact:true}).click();
+    await waitFor(async()=>!await state('is_maximized'));
+    await page.screenshot({path:path.join(output,'window-chrome.png')});
+    await page.getByRole('button',{name:'最小化窗口',exact:true}).click();
+    await waitFor(()=>state('is_minimized'));
+    // DOM click works while minimized, and still exercises the guarded close path.
+    await page.getByRole('button',{name:'关闭窗口',exact:true}).evaluate(button=>button.click());
+    await waitFor(()=>closed);
+    if(errors.length)throw Error(errors.join('\n'));
+    const report={status:'passed',version:'0.10.6',frameless:true,maximize_restore:true,double_click_maximize:true,minimize:true,guarded_close:true,browser_errors:errors};
+    fs.writeFileSync(path.join(output,'report.json'),JSON.stringify(report,null,2));
+    console.log(JSON.stringify({output,...report},null,2));return;
+  }
   const session=await page.evaluate(()=>window.__TAURI_INTERNALS__.invoke('connection'));
   const call=async(route,body)=>{const response=await fetch(`http://127.0.0.1:${session.port}/api${route}`,{method:body?'POST':'GET',headers:{Authorization:'Bearer '+session.token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});return response.json();};
   const job=await call('/import',{paths:[path.join(__dirname,'inputs/recognition-fixture.jpg')]});

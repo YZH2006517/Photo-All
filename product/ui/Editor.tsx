@@ -25,6 +25,14 @@ import {
   X,
   CheckCheck,
   SlidersHorizontal,
+  ArrowUp,
+  ArrowDown,
+  Eye,
+  EyeOff,
+  Search,
+  SquareSlash,
+  Sun,
+  Moon,
 } from "lucide-react";
 import {
   Photo,
@@ -33,6 +41,12 @@ import {
   photoDimensions,
   filterBlob,
   geometrySignature,
+  FilterLayer,
+  filterLayers,
+  filtersPatch,
+  newFilterLayer,
+  styleLabel,
+  selectFilterPreset,
 } from "./model";
 import { Comparison, Picture } from "./Preview";
 import { FilmControls, NumericValue } from "./Film";
@@ -100,8 +114,14 @@ export function geometryToSource(
   const px = left + x * (right - left) - tw / 2,
     py = top + y * (bottom - top) - th / 2;
   const angle = (number(r, "straighten") * Math.PI) / 180;
-  let u = (Math.cos(angle) * px - Math.sin(angle) * py + tw / 2) / tw;
-  let v = (Math.sin(angle) * px + Math.cos(angle) * py + th / 2) / th;
+  const c = Math.abs(Math.cos(angle)),
+    s = Math.abs(Math.sin(angle));
+  const scale = angle
+    ? Math.max(c + (s * th) / tw, c + (s * tw) / th) *
+      (1 + 2 / Math.max(1, Math.min(tw, th)))
+    : 1;
+  let u = ((Math.cos(angle) * px - Math.sin(angle) * py) / scale + tw / 2) / tw;
+  let v = ((Math.sin(angle) * px + Math.cos(angle) * py) / scale + th / 2) / th;
   if (number(r, "flip_x")) u = 1 - u;
   if (number(r, "flip_y")) v = 1 - v;
   for (let i = 0; i < turns; i++) [u, v] = [v, 1 - u];
@@ -516,6 +536,15 @@ function FilterThumbnail({
   );
 }
 
+type FilterPreset = {
+  key: string;
+  kind: FilterLayer["kind"];
+  id: string;
+  label: string;
+  group: string;
+  ready: boolean;
+};
+
 function FilterControls({
   photo,
   revision,
@@ -529,164 +558,485 @@ function FilterControls({
   update: (patch: Recipe) => void;
   disabled: boolean;
 }) {
-  const [query, setQuery] = useState(""),
-    [group, setGroup] = useState("all"),
-    [page, setPage] = useState(0);
-  const items = Object.entries(catalog?.items || {});
-  const groups = [...new Set(items.map(([, item]) => item.group))].sort();
-  const matches = items.filter(
-    ([, item]) =>
-      (group === "all" || item.group === group) &&
-      `${item.label} ${item.group}`
-        .toLocaleLowerCase()
-        .includes(query.trim().toLocaleLowerCase()),
+  const host = useRef<HTMLDivElement>(null),
+    layers = filterLayers(photo.recipe);
+  const [selectedUid, setSelectedUid] = useState<string | null>(
+    () => layers.at(-1)?.uid ?? null,
   );
-  const pages = Math.max(1, Math.ceil(matches.length / 24)),
-    currentPage = Math.min(page, pages - 1);
-  const current = String(photo.recipe.filter_id || "none");
-  return (
-    <div className="ew-filters">
-      <h3>基础风格</h3>
-      <div className="ew-style-grid">
-        {Object.entries({
-          natural: "自然原色",
-          warm: "暖日",
-          cool: "清透冷调",
-          film: "柔和胶片",
-          mono: "经典黑白",
-        }).map(([id, label]) => (
-          <button
-            key={id}
-            disabled={disabled}
-            className={photo.recipe.style === id ? "active" : ""}
-            aria-pressed={photo.recipe.style === id}
-            onClick={() => update({ style: id, filter_id: "none" })}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
-      <h3>LUT 滤镜库 · {items.length} 款</h3>
-      <label className="ew-field">
-        搜索滤镜
-        <input
-          type="search"
-          aria-label="搜索滤镜"
-          placeholder="名称或分组"
-          value={query}
-          onChange={(e) => {
-            setQuery(e.target.value);
-            setPage(0);
-          }}
-        />
-      </label>
-      <label className="ew-field">
-        滤镜分组
-        <select
-          aria-label="滤镜分组"
-          value={group}
-          onChange={(e) => {
-            setGroup(e.target.value);
-            setPage(0);
-          }}
-        >
-          <option value="all">全部分组</option>
-          {groups.map((name) => (
-            <option key={name} value={name}>
-              {name}
-            </option>
-          ))}
-        </select>
-      </label>
-      <button
-        className="ew-filter-clear"
-        aria-pressed={current === "none"}
-        disabled={disabled}
-        onClick={() => update({ filter_id: "none" })}
-      >
-        关闭 LUT 滤镜
-      </button>
-      <label className="ew-range">
+  const [draftIndex, setDraftIndex] = useState(layers.length),
+    [tab, setTab] = useState<"filters" | "favorites">("filters");
+  const [query, setQuery] = useState(""),
+    [searchOpen, setSearchOpen] = useState(false);
+  const [closed, setClosed] = useState<Record<string, boolean>>({}),
+    [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [favorites, setFavorites] = useState<string[]>(() => {
+    try {
+      const saved = JSON.parse(
+        localStorage.getItem("photoall-filter-favorites-v1") || "[]",
+      );
+      return Array.isArray(saved)
+        ? saved.filter((v) => typeof v === "string")
+        : [];
+    } catch {
+      return [];
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "photoall-filter-favorites-v1",
+        JSON.stringify(favorites),
+      );
+    } catch {}
+  }, [favorites]);
+  useEffect(() => {
+    if (selectedUid && !layers.some((layer) => layer.uid === selectedUid))
+      setSelectedUid(null);
+  }, [layers.map((layer) => layer.uid).join("|")]);
+  const presets: FilterPreset[] = [
+    ...Object.entries(styleLabel)
+      .filter(([id]) => id !== "natural")
+      .map(([id, label]) => ({
+        key: `style:${id}`,
+        kind: "style" as const,
+        id,
+        label,
+        group: "基础风格",
+        ready: true,
+      })),
+    ...Object.entries(catalog?.items || {}).map(([id, item]) => ({
+      key: `lut:${id}`,
+      kind: "lut" as const,
+      id,
+      label: item.label,
+      group: item.group,
+      ready: item.ready,
+    })),
+  ];
+  const index = layers.findIndex((layer) => layer.uid === selectedUid),
+    active = layers[index];
+  const activeKey = active ? `${active.kind}:${active.id}` : "";
+  const current = presets.find((preset) => preset.key === activeKey);
+  useEffect(() => {
+    if (!current) return;
+    const group = tab === "favorites" ? "我的收藏" : current.group;
+    setClosed((old) => ({ ...old, [group]: false }));
+    setExpanded((old) => ({ ...old, [group]: true }));
+  }, [activeKey, tab]);
+  const name = (layer: FilterLayer) =>
+    presets.find((preset) => preset.key === `${layer.kind}:${layer.id}`)
+      ?.label || layer.id;
+  const save = (next: FilterLayer[]) => update(filtersPatch(next));
+  const choose = (preset: FilterPreset) => {
+    const next = selectFilterPreset(
+      layers,
+      selectedUid,
+      preset.kind,
+      preset.id,
+      draftIndex,
+    );
+    setSelectedUid(next.uid);
+    if (next.layers !== layers) save(next.layers);
+  };
+  const original = () => {
+    if (index >= 0) {
+      save(layers.filter((_, i) => i !== index));
+      setDraftIndex(index);
+    }
+    setSelectedUid(null);
+  };
+  const remove = () => {
+    const next = layers.filter((_, i) => i !== index);
+    save(next);
+    setSelectedUid(next[Math.min(index, next.length - 1)]?.uid ?? null);
+    setDraftIndex(next.length);
+  };
+  const move = (offset: number) => {
+    const next = [...layers];
+    [next[index], next[index + offset]] = [next[index + offset], next[index]];
+    save(next);
+  };
+  const toggleFavorite = (key: string) =>
+    setFavorites((old) =>
+      old.includes(key) ? old.filter((item) => item !== key) : [...old, key],
+    );
+  const selectLayer = (layer: FilterLayer) => {
+    setSelectedUid(layer.uid);
+    const preset = presets.find(
+      (item) => item.key === `${layer.kind}:${layer.id}`,
+    );
+    if (!preset) return;
+    const group =
+      tab === "favorites" && favorites.includes(preset.key)
+        ? "我的收藏"
+        : preset.group;
+    if (tab === "favorites" && !favorites.includes(preset.key))
+      setTab("filters");
+    setClosed((old) => ({ ...old, [group]: false }));
+    setExpanded((old) => ({ ...old, [group]: true }));
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        [
+          ...(host.current?.querySelectorAll<HTMLElement>(
+            "[data-preset-key]",
+          ) || []),
+        ]
+          .find((node) => node.dataset.presetKey === preset.key)
+          ?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }),
+    );
+  };
+  const filtered = presets.filter(
+    (preset) =>
+      (tab !== "favorites" || favorites.includes(preset.key)) &&
+      `${preset.label} ${preset.group}`
+        .toLocaleLowerCase()
+        .includes(query.toLocaleLowerCase().trim()),
+  );
+  const groups =
+    tab === "favorites"
+      ? ["我的收藏"]
+      : [...new Set(filtered.map((preset) => preset.group))];
+  const strength = () =>
+    active && (
+      <label className="fb-intensity" key="strength">
         <span>
-          滤镜强度
+          强度
           <NumericValue
-            label="滤镜强度"
-            value={Number(photo.recipe.filter_strength ?? 1)}
+            label="当前滤镜强度"
+            value={active.strength * 100}
             min={0}
-            max={1}
-            disabled={disabled || current === "none"}
-            onChange={(v) => update({ filter_strength: v })}
+            max={100}
+            step={1}
+            disabled={disabled || !active.enabled}
+            onChange={(value) =>
+              save(
+                layers.map((layer, i) =>
+                  i === index ? { ...layer, strength: value / 100 } : layer,
+                ),
+              )
+            }
           />
         </span>
         <input
           type="range"
-          aria-label="滤镜强度"
+          aria-label="当前滤镜强度"
           min={0}
           max={1}
           step={0.01}
-          value={Number(photo.recipe.filter_strength ?? 1)}
-          disabled={disabled || current === "none"}
-          onChange={(e) => update({ filter_strength: Number(e.target.value) })}
+          value={active.strength}
+          disabled={disabled || !active.enabled}
+          onChange={(e) =>
+            save(
+              layers.map((layer, i) =>
+                i === index
+                  ? { ...layer, strength: Number(e.target.value) }
+                  : layer,
+              ),
+            )
+          }
         />
       </label>
-      <div className="ew-filter-grid">
-        {matches
-          .slice(currentPage * 24, currentPage * 24 + 24)
-          .map(([id, item]) => (
+    );
+  return (
+    <div className="filter-browser" ref={host} aria-label="滤镜浏览器">
+      <div className="fb-top">
+        <div className="fb-tabs" role="tablist" aria-label="滤镜资源">
+          <button
+            role="tab"
+            aria-selected={tab === "filters"}
+            onClick={() => setTab("filters")}
+          >
+            滤镜
+          </button>
+          <button
+            role="tab"
+            aria-selected={tab === "favorites"}
+            onClick={() => setTab("favorites")}
+          >
+            收藏
+          </button>
+          <button
+            aria-label="搜索滤镜"
+            title="搜索滤镜"
+            onClick={() => {
+              if (searchOpen) setQuery("");
+              setSearchOpen((v) => !v);
+            }}
+          >
+            <Search size={15} />
+          </button>
+        </div>
+        <div className="fb-layer-strip" role="group" aria-label="已叠加的滤镜">
+          {layers.map((layer, i) => (
             <button
-              key={id}
-              aria-label={`应用滤镜 ${item.label}`}
-              aria-pressed={current === id}
-              className={current === id ? "active" : ""}
-              disabled={disabled || !item.ready}
-              onClick={() =>
-                update({ style: "natural", filter_id: id, filter_strength: 1 })
-              }
-              title={`${item.label} · ${item.source} · ${item.license}`}
+              className={`fb-layer-chip ${selectedUid === layer.uid ? "selected" : ""} ${layer.enabled ? "" : "is-disabled"}`}
+              key={layer.uid}
+              aria-label={`选择滤镜层 ${i + 1} ${name(layer)}`}
+              aria-pressed={selectedUid === layer.uid}
+              title={`${name(layer)} · ${Math.round(layer.strength * 100)}%`}
+              onClick={() => selectLayer(layer)}
             >
-              {item.ready && (
-                <FilterThumbnail photo={photo} id={id} revision={revision} />
-              )}
-              <strong>{item.label}</strong>
-              <small>
-                {item.group}
-                {item.ready ? "" : " · 未准备"}
-              </small>
+              <FilterThumbnail
+                photo={photo}
+                id={layer.kind === "style" ? `style:${layer.id}` : layer.id}
+                revision={revision}
+              />
+              <span>{i + 1}</span>
+              {!layer.enabled && <EyeOff size={13} />}
             </button>
           ))}
+          <button
+            className={`fb-add-layer ${selectedUid === null ? "selected" : ""}`}
+            title="新建滤镜层，再从下方选择"
+            aria-label="新增滤镜层"
+            aria-pressed={selectedUid === null}
+            disabled={disabled || layers.length >= 16}
+            onClick={() => {
+              setSelectedUid(null);
+              setDraftIndex(layers.length);
+            }}
+          >
+            <Plus size={24} />
+          </button>
+        </div>
+        <div className="fb-layer-actions">
+          <span>
+            {active
+              ? `${index + 1}/${layers.length} · ${name(active)}`
+              : layers.length >= 16
+                ? "最多叠加 16 层"
+                : "选择预设，新建一层"}
+          </span>
+          {active && (
+            <>
+              <button
+                aria-label="当前滤镜提前应用"
+                title="更早应用"
+                disabled={disabled || index === 0}
+                onClick={() => move(-1)}
+              >
+                <ArrowLeft size={14} />
+              </button>
+              <button
+                aria-label="当前滤镜延后应用"
+                title="更晚应用"
+                disabled={disabled || index === layers.length - 1}
+                onClick={() => move(1)}
+              >
+                <ArrowRight size={14} />
+              </button>
+              <button
+                aria-label="当前滤镜开关"
+                title={active.enabled ? "暂时关闭此层" : "启用此层"}
+                aria-pressed={active.enabled}
+                disabled={disabled}
+                onClick={() =>
+                  save(
+                    layers.map((layer, i) =>
+                      i === index
+                        ? { ...layer, enabled: !layer.enabled }
+                        : layer,
+                    ),
+                  )
+                }
+              >
+                {active.enabled ? <Eye size={14} /> : <EyeOff size={14} />}
+              </button>
+              <button
+                aria-label="移除当前滤镜层"
+                title="移除此层"
+                disabled={disabled}
+                onClick={remove}
+              >
+                <X size={14} />
+              </button>
+            </>
+          )}
+        </div>
+        {searchOpen && (
+          <input
+            className="fb-search"
+            aria-label="搜索滤镜名称"
+            placeholder="搜索名称或分组"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        )}
       </div>
-      {!matches.length && (
-        <p className="ew-description">
-          {items.length ? "没有匹配的滤镜" : "滤镜资源未准备"}
-        </p>
+      {tab === "favorites" && !filtered.length && (
+        <div className="fb-empty">
+          <Heart size={22} />
+          <p>收藏喜欢的滤镜</p>
+          <small>点击预设右上角的爱心，在这里快速找到它。</small>
+        </div>
       )}
-      <div className="ew-filter-paging">
-        <button
-          aria-label="上一页滤镜"
-          disabled={currentPage === 0}
-          onClick={() => setPage(currentPage - 1)}
-        >
-          上一页
-        </button>
-        <span>
-          {currentPage + 1} / {pages} · {matches.length} 款
-        </span>
-        <button
-          aria-label="下一页滤镜"
-          disabled={currentPage + 1 >= pages}
-          onClick={() => setPage(currentPage + 1)}
-        >
-          下一页
-        </button>
-      </div>
-      {catalog?.items[current] && (
-        <p className="ew-description">
-          {catalog.items[current].label}
-          <br />
-          来源：{catalog.items[current].source}
-          <br />
-          许可：{catalog.items[current].license}
-        </p>
+      {groups.map((group, groupIndex) => {
+        const entries = filtered.filter(
+          (preset) => tab === "favorites" || preset.group === group,
+        );
+        if (!entries.length) return null;
+        const more = entries.length > 7 && !expanded[group];
+        const visible = more ? entries.slice(0, 6) : entries;
+        type Tile = FilterPreset | { key: "original" | "more"; label: string };
+        const tiles: Tile[] = [
+          ...(groupIndex === 0
+            ? [{ key: "original" as const, label: "原图" }]
+            : []),
+          ...visible,
+          ...(more ? [{ key: "more" as const, label: "展开更多" }] : []),
+        ];
+        const rows = Array.from(
+          { length: Math.ceil(tiles.length / 4) },
+          (_, i) => tiles.slice(i * 4, i * 4 + 4),
+        );
+        return (
+          <section
+            className="fb-group"
+            key={group}
+            aria-label={`滤镜分组 ${group}`}
+          >
+            <button
+              className="fb-group-title"
+              aria-expanded={!closed[group]}
+              onClick={() =>
+                setClosed((old) => ({ ...old, [group]: !old[group] }))
+              }
+            >
+              <span className={`fb-group-icon tone-${groupIndex % 5}`}>
+                <Film size={16} />
+              </span>
+              <strong>{group}</strong>
+              <ChevronDown
+                size={15}
+                className={closed[group] ? "" : "is-open"}
+              />
+            </button>
+            {!closed[group] && (
+              <div className="fb-group-body">
+                {rows.map((row, rowIndex) => (
+                  <React.Fragment key={rowIndex}>
+                    <div className="fb-grid">
+                      {row.map((tile) => {
+                        if (tile.key === "original")
+                          return (
+                            <button
+                              className={`fb-choice fb-original ${!active ? "selected" : ""}`}
+                              key="original"
+                              aria-label="当前层使用原图"
+                              title="只移除当前层，保留其他滤镜"
+                              disabled={disabled}
+                              onClick={original}
+                            >
+                              <span className="fb-original-art">
+                                <SquareSlash size={24} />
+                              </span>
+                              <span>原图</span>
+                            </button>
+                          );
+                        if (tile.key === "more")
+                          return (
+                            <button
+                              className="fb-choice fb-more"
+                              key="more"
+                              aria-label={`展开更多 ${group}`}
+                              onClick={() =>
+                                setExpanded((old) => ({
+                                  ...old,
+                                  [group]: true,
+                                }))
+                              }
+                            >
+                              <span className="fb-more-art">
+                                <FilterThumbnail
+                                  photo={photo}
+                                  id={
+                                    entries[6].kind === "style"
+                                      ? `style:${entries[6].id}`
+                                      : entries[6].id
+                                  }
+                                  revision={revision}
+                                />
+                                <b>+{entries.length - visible.length}</b>
+                              </span>
+                              <span>展开更多</span>
+                            </button>
+                          );
+                        const preset = tile as FilterPreset,
+                          selected = activeKey === preset.key;
+                        return (
+                          <div
+                            className={`fb-tile ${selected ? "selected" : ""}`}
+                            key={preset.key}
+                          >
+                            <button
+                              className="fb-choice"
+                              data-preset-key={preset.key}
+                              aria-label={`选择滤镜 ${preset.label}`}
+                              aria-pressed={selected}
+                              disabled={
+                                disabled ||
+                                !preset.ready ||
+                                (!active && layers.length >= 16)
+                              }
+                              title={preset.label}
+                              onClick={() => choose(preset)}
+                            >
+                              <FilterThumbnail
+                                photo={photo}
+                                id={
+                                  preset.kind === "style"
+                                    ? `style:${preset.id}`
+                                    : preset.id
+                                }
+                                revision={revision}
+                              />
+                              <span>{preset.label}</span>
+                            </button>
+                            <button
+                              className={`fb-favorite ${favorites.includes(preset.key) ? "saved" : ""}`}
+                              aria-label={`${favorites.includes(preset.key) ? "取消收藏" : "收藏"}滤镜 ${preset.label}`}
+                              aria-pressed={favorites.includes(preset.key)}
+                              title={
+                                favorites.includes(preset.key)
+                                  ? "取消收藏"
+                                  : "收藏"
+                              }
+                              onClick={() => toggleFavorite(preset.key)}
+                            >
+                              <Heart
+                                size={11}
+                                fill={
+                                  favorites.includes(preset.key)
+                                    ? "currentColor"
+                                    : "none"
+                                }
+                              />
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {row.some((tile) => tile.key === activeKey) && strength()}
+                  </React.Fragment>
+                ))}
+                {expanded[group] && entries.length > 7 && (
+                  <button
+                    className="fb-collapse"
+                    onClick={() =>
+                      setExpanded((old) => ({ ...old, [group]: false }))
+                    }
+                  >
+                    收起更多
+                  </button>
+                )}
+              </div>
+            )}
+          </section>
+        );
+      })}
+      {tab === "filters" && !groups.length && (
+        <p className="fb-empty">没有匹配的滤镜</p>
       )}
     </div>
   );
@@ -707,7 +1057,11 @@ export type EditorWorkspaceProps = {
   onBack: () => void;
   onReview: () => void;
   onComposite: () => void;
+  layerContent?: React.ReactNode;
+  onLeaveLayers?: () => Promise<void>;
   onExport: () => void;
+  theme?: "light" | "dark";
+  onToggleTheme?: () => void;
   onUndo: () => Promise<void>;
   onRedo: () => Promise<void>;
   onKeep: () => void;
@@ -731,7 +1085,11 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
     onBack,
     onReview,
     onComposite,
+    layerContent,
+    onLeaveLayers,
     onExport,
+    theme = "light",
+    onToggleTheme,
     onUndo,
     onRedo,
     onKeep,
@@ -860,6 +1218,14 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
     setNote("裁剪已保存；原始像素始终保留。");
   };
   const chooseTool = async (id: Tool) => {
+    if (layerContent) {
+      try {
+        await onLeaveLayers?.();
+      } catch (error) {
+        setNote(String(error));
+        return;
+      }
+    }
     if (id === "composition" || id === "local" || id === "retouch") {
       try {
         await onFlush?.();
@@ -1614,6 +1980,7 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
       case "filters":
         return (
           <FilterControls
+            key={photo.id}
             photo={photo}
             revision={revision}
             catalog={filters}
@@ -1678,10 +2045,11 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
   };
   return (
     <section
-      className="editor-workspace"
+      className={`editor-workspace ${layerContent ? "editing-layers" : ""}`}
       aria-label="高精度照片编辑器"
       tabIndex={-1}
       onKeyDown={(e) => {
+        if (layerContent) return;
         if (
           (e.target as HTMLElement).closest(
             'input:not([type="range"]),select,textarea,[contenteditable="true"]',
@@ -1746,6 +2114,16 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
         <span className={`ew-save-state ${saving ? "saving" : ""}`}>
           {saving ? "正在保存配方…" : busy ? "正在本机处理…" : "调整已自动保存"}
         </span>
+        {onToggleTheme && (
+          <button
+            className="ew-theme-toggle"
+            aria-label={theme === "dark" ? "切换浅色模式" : "切换深色模式"}
+            title={theme === "dark" ? "切换浅色模式" : "切换深色模式"}
+            onClick={onToggleTheme}
+          >
+            {theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}
+          </button>
+        )}
         <div className="ew-history">
           <button
             aria-label="撤销上次修改"
@@ -1783,7 +2161,7 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
       <div className="ew-options">
         <span>
           <activeTool.icon size={16} />
-          <strong>{activeTool.label}</strong>
+          <strong>{layerContent ? "图层合成" : activeTool.label}</strong>
         </span>
         {tool === "composition" ? (
           <>
@@ -1830,8 +2208,8 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
               key={id}
               aria-label={label}
               title={label + (shortcut ? ` · ${shortcut}` : "")}
-              className={tool === id ? "active" : ""}
-              aria-pressed={tool === id}
+              className={!layerContent && tool === id ? "active" : ""}
+              aria-pressed={!layerContent && tool === id}
               onClick={() => chooseTool(id)}
             >
               <Icon size={20} />
@@ -1843,12 +2221,15 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
           <button
             aria-label="打开图层合成"
             title="图层合成"
+            className={layerContent ? "active" : ""}
+            aria-pressed={!!layerContent}
             onClick={onComposite}
           >
             <Layers size={20} />
             <span>图层</span>
           </button>
         </nav>
+        {layerContent && <div className="ew-layer-content">{layerContent}</div>}
         <main className="ew-canvas-column">
           <div
             className={`ew-canvas ${tool !== "composition" && !brush ? "is-hand" : ""}`}
@@ -2073,14 +2454,18 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
         </main>
         <aside className="ew-inspector" aria-label="编辑参数">
           <div className="ew-inspector-scroll" key={tool}>
-            <Histogram image={image} version={histVersion} />
-            <div className="ew-inspector-heading">
-              <div>
-                <small>DEVELOP</small>
-                <h2>{activeTool.label}</h2>
+            {tool !== "filters" && (
+              <Histogram image={image} version={histVersion} />
+            )}
+            {tool !== "filters" && (
+              <div className="ew-inspector-heading">
+                <div>
+                  <small>DEVELOP</small>
+                  <h2>{activeTool.label}</h2>
+                </div>
+                <activeTool.icon size={20} />
               </div>
-              <activeTool.icon size={20} />
-            </div>
+            )}
             <div className="ew-panel-controls">
               {tool === "adjust" && (
                 <div

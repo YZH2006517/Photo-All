@@ -71,6 +71,7 @@ export function Albums({
   review,
   removeAlbum,
   restoreAlbum,
+  purgeAlbum,
   trash = false,
   variantMode = "all",
   onVariantMode,
@@ -83,6 +84,7 @@ export function Albums({
   review: () => void;
   removeAlbum: (album: Album) => void;
   restoreAlbum: (album: Album) => void;
+  purgeAlbum: (album: Album) => Promise<void>;
   trash?: boolean;
   variantMode?: VariantMode;
   onVariantMode?: (mode: VariantMode) => void;
@@ -96,6 +98,18 @@ export function Albums({
     [name, setName] = useState(""),
     [error, setError] = useState(""),
     [saving, setSaving] = useState(false);
+  const [purging, setPurging] = useState<Album | null>(null);
+  useEffect(() => {
+    if (!purging) return;
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !saving) {
+        event.preventDefault();
+        setPurging(null);
+      }
+    };
+    window.addEventListener("keydown", escape);
+    return () => window.removeEventListener("keydown", escape);
+  }, [purging, saving]);
   const [menu, setMenu] = useState<{
     album: Album;
     x: number;
@@ -162,15 +176,10 @@ export function Albums({
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, y: -8 }}
     >
-      <div className="page-heading">
+      <div className="page-heading albums-heading">
         <div>
-          <div className="eyebrow">A PLACE FOR EVERY STORY</div>
           <h1>{trash ? "回收站" : "图集"}</h1>
-          <p>
-            {trash
-              ? "删除的图集保留 30 天，可随时恢复；到期清除图集记录，磁盘原片保留。"
-              : "把同一段故事放在一起，再慢慢找到它的颜色。"}
-          </p>
+          {trash && <p>保留 30 天 · 只清除软件记录，保留本地原片</p>}
         </div>
         <div className="album-home-actions">
           <button
@@ -179,17 +188,13 @@ export function Albums({
             disabled={busy || trash || !library.photos.length}
             onClick={review}
           >
-            <Film size={24} />
+            <Film size={18} />
             <span>
               电子观片台
-              <small>{visiblePhotoCount} 张显示照片 · 胶卷与光影</small>
+              <small>{visiblePhotoCount} 张照片</small>
             </span>
             <ArrowUpRight size={16} />
           </button>
-          <span className="album-home-total">
-            {String(albums.length).padStart(2, "0")}
-            <small>COLLECTIONS</small>
-          </span>
         </div>
       </div>
       <div className="album-home-toolbar">
@@ -210,10 +215,6 @@ export function Albums({
             <option value="jpeg">JPEG 优先</option>
           </select>
         )}
-        <span>
-          <FolderPlus size={14} />{" "}
-          {trash ? "30 天内可恢复" : "新建图集后，导入一个文件夹开始整理"}
-        </span>
       </div>
       <div className="album-grid">
         {!trash && (
@@ -231,7 +232,6 @@ export function Albums({
               <i />
             </div>
             <strong>新建图集</strong>
-            <small>一组照片，一个新的故事</small>
           </button>
         )}
         {trash && !albums.length && (
@@ -339,6 +339,20 @@ export function Albums({
               >
                 {trash ? <RotateCcw size={16} /> : <Trash2 size={16} />}
               </button>
+              {trash && (
+                <button
+                  className="album-purge-button"
+                  aria-label={`彻底删除图集 ${album.name}`}
+                  disabled={busy}
+                  onClick={() => {
+                    setError("");
+                    setPurging(album);
+                  }}
+                >
+                  <Trash2 size={14} />
+                  彻底删除
+                </button>
+              )}
             </div>
           );
         })}
@@ -373,12 +387,73 @@ export function Albums({
               {trash ? <RotateCcw size={15} /> : <Trash2 size={15} />}
               {trash ? "恢复图集" : "移到回收站"}
             </button>
+            {trash && (
+              <button
+                role="menuitem"
+                disabled={busy}
+                onClick={() => {
+                  setPurging(menu.album);
+                  setError("");
+                  setMenu(null);
+                }}
+              >
+                <Trash2 size={15} />
+                彻底删除图集
+              </button>
+            )}
             <small>
               {trash ? "还原图集及照片成员" : "30 天内可恢复 · 保留原片"}
             </small>
           </div>,
           document.body,
         )}
+      {purging && (
+        <div className="modal-backdrop">
+          <section
+            className="album-create-modal purge-confirm"
+            role="alertdialog"
+            aria-modal="true"
+            aria-label="彻底删除图集确认"
+          >
+            <Trash2 size={24} />
+            <h2>彻底移除“{purging.name}”？</h2>
+            <p>
+              仅删除软件内的图集及关联记录，
+              <strong>不会删除电脑本地的照片文件</strong>，其他图集不受影响。
+            </p>
+            <p>移除后无法从回收站恢复。</p>
+            {error && <p role="alert">{error}</p>}
+            <div className="purge-actions">
+              <button
+                className="button secondary"
+                autoFocus
+                disabled={saving}
+                onClick={() => setPurging(null)}
+              >
+                取消
+              </button>
+              <button
+                className="button danger"
+                disabled={saving}
+                onClick={async () => {
+                  setSaving(true);
+                  setError("");
+                  try {
+                    await purgeAlbum(purging);
+                    setPurging(null);
+                  } catch (e) {
+                    setError(e instanceof Error ? e.message : String(e));
+                  } finally {
+                    setSaving(false);
+                  }
+                }}
+              >
+                {saving ? "正在移除…" : "彻底删除图集"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
       {creating && (
         <div className="modal-backdrop">
           <form
@@ -400,26 +475,23 @@ export function Albums({
             <span className="modal-album-icon">
               <Images size={30} strokeWidth={1.2} />
             </span>
-            <div className="eyebrow">A NEW COLLECTION</div>
-            <h2>给这组故事，一个名字。</h2>
-            <p>创建后可以导入整个文件夹，保留原片位置。</p>
+            <h2>新建图集</h2>
             <label className="field-label">
-              图集名称
+              图集名称（可选）
               <input
                 aria-label="图集名称"
                 autoFocus
                 maxLength={80}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                placeholder="例如：秋日散步"
-                required
+                placeholder="留空使用“未命名图集”"
               />
             </label>
             {error && <p role="alert">{error}</p>}
             <button
               className="button primary"
               type="submit"
-              disabled={!name.trim() || saving}
+              disabled={saving}
             >
               {saving ? "正在创建…" : "创建图集"}
               <ArrowUpRight size={16} />

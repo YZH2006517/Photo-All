@@ -3,6 +3,26 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 export type Recipe = Record<string, string | number>;
+export type FilterLayer = {uid:string;kind:'style'|'lut';id:string;strength:number;enabled:boolean};
+export function filterLayers(recipe:Recipe):FilterLayer[] {
+  if(recipe.filter_stack){try{return JSON.parse(String(recipe.filter_stack));}catch{return [];}}
+  const layers:FilterLayer[]=[];
+  if(recipe.style&&recipe.style!=='natural')layers.push({uid:'legacy-style',kind:'style',id:String(recipe.style),strength:1,enabled:true});
+  if(recipe.filter_id&&recipe.filter_id!=='none')layers.push({uid:'legacy-lut',kind:'lut',id:String(recipe.filter_id),strength:Number(recipe.filter_strength??1),enabled:true});
+  return layers;
+}
+export const newFilterLayer=(kind:FilterLayer['kind'],id:string):FilterLayer=>({uid:crypto.randomUUID(),kind,id,strength:1,enabled:true});
+export const filtersPatch=(layers:FilterLayer[]):Recipe=>({style:'natural',filter_id:'none',filter_strength:1,filter_stack:JSON.stringify(layers)});
+export function selectFilterPreset(layers:FilterLayer[],uid:string|null,kind:FilterLayer['kind'],id:string,insertAt=layers.length){
+  const index=layers.findIndex(layer=>layer.uid===uid);
+  if(index>=0){
+    if(layers[index].kind===kind&&layers[index].id===id)return {layers,uid};
+    return {layers:layers.map((layer,i)=>i===index?{...layer,kind,id,strength:1,enabled:true}:layer),uid};
+  }
+  if(layers.length>=16)return {layers,uid:null};
+  const layer=newFilterLayer(kind,id),next=[...layers];next.splice(Math.max(0,Math.min(next.length,insertAt)),0,layer);
+  return {layers:next,uid:layer.uid};
+}
 export type Photo = {
   id: number;
   name: string;
@@ -348,9 +368,9 @@ export class DecodedPreviewPool {
     return (
       candidates
         .filter((e) => e.capacity >= capacity(size))
-        .sort((a, b) => a.capacity - b.capacity)[0] ||
+        .sort((a, b) => (a.capacity - b.capacity) || a.asset.url.localeCompare(b.asset.url))[0] ||
       (fallback
-        ? candidates.sort((a, b) => b.capacity - a.capacity)[0]
+        ? candidates.sort((a, b) => (b.capacity - a.capacity) || a.asset.url.localeCompare(b.asset.url))[0]
         : undefined)
     );
   }
@@ -618,9 +638,25 @@ export function photoBlob(
     signal,
   );
 }
+export const liveRecipeKey = (recipe: Recipe) => JSON.stringify(Object.keys(recipe).sort().map(key => [key, recipe[key]]));
+export const liveBaseKey = (photo: Photo, uncropped = false) => JSON.stringify([
+  photo.id, photo.digest, geometrySignature(uncropped ? {...photo.recipe,crop_x:0,crop_y:0,crop_w:1,crop_h:1} : photo.recipe),
+  ...['raw_exposure','raw_wb','raw_temperature','raw_tint','raw_highlights','raw_denoise','raw_sharpen'].map(key => photo.recipe[key]),
+]);
+export function liveBaseBlob(photo: Photo, uncropped: boolean, signal: AbortSignal) {
+  return previews.read(`live-base/${liveBaseKey(photo,uncropped)}`, async (requestSignal) => {
+    const { port, token } = await connect();
+    const response = await fetch(`http://127.0.0.1:${port}/api/live-base/${photo.id}?uncropped=${uncropped ? 1 : 0}`, {
+      headers: { Authorization: `Bearer ${token}` }, signal:requestSignal,
+    });
+    if (!response.ok) throw new Error((await response.json()).error || '实时预览准备失败');
+    return response.blob();
+  }, signal);
+}
 export function filterPreviewKey(photo: Photo, id: string, size = 240) {
   const recipe: Recipe = {
     ...(photo.committed_recipe ?? photo.recipe),
+    filter_stack:'',
     style: id.startsWith("style:") ? id.slice(6) : "natural",
     filter_id: id.startsWith("style:") ? "none" : id,
     filter_strength: 1,

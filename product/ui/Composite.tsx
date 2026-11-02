@@ -279,11 +279,11 @@ export function Composite({
       <div className="editor-top">
         <button
           className="back-button"
-          aria-label="返回图集照片"
+          aria-label="返回照片调节"
           onClick={back}
         >
           <ArrowLeft size={17} />
-          返回照片
+          返回调节
         </button>
         <div className="editor-title">
           <h2>多图层合成</h2>

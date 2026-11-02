@@ -17,7 +17,10 @@ import {
   decodedPreviews,
   DecodedPreview,
   geometrySignature,
+  Recipe,
+  liveRecipeKey,
 } from "./model";
+import { LivePreview } from "./LivePreview";
 
 // Decode enough source pixels for the physical screen area; stop at the source
 // rather than manufacturing detail when the requested footprint exceeds 4096.
@@ -41,7 +44,7 @@ export const Picture = memo(function Picture({
   size?: number;
   revision?: number;
   original?: boolean;
-  onLoaded?: (image: HTMLImageElement) => void;
+  onLoaded?: (image: HTMLImageElement, recipe?: Recipe) => void;
   className?: string;
   eager?: boolean;
   quality?: "preview" | "source";
@@ -89,6 +92,7 @@ export const Picture = memo(function Picture({
       photoId: number;
       asset: DecodedPreview;
       geometry: string;
+      recipe: Recipe;
     } | null>(null),
     [loaded, setLoaded] = useState<{ url: string; geometry: string } | null>(
       null,
@@ -126,6 +130,30 @@ export const Picture = memo(function Picture({
       : undefined;
   const url = shown?.url || "";
   const shownGeometry = cached ? requestedGeometry : display?.geometry || "";
+  const acknowledged = useRef<{ url: string; geometry: string } | null>(null);
+  const acknowledge = (image: HTMLImageElement) => {
+    if (
+      frame.current?.querySelector("img") !== image ||
+      (image.currentSrc || image.src) !== url ||
+      !image.complete ||
+      !image.naturalWidth
+    )
+      return;
+    if (
+      acknowledged.current?.url === url &&
+      acknowledged.current.geometry === shownGeometry
+    )
+      return;
+    acknowledged.current = { url, geometry: shownGeometry };
+    setLoaded({ url, geometry: shownGeometry });
+    onLoaded?.(image, cached ? requestedPhoto.recipe : display?.recipe);
+  };
+  // A decoded cache hit can be complete as soon as React attaches the element.
+  // Acknowledge it even when the native load event preceded our handler.
+  useLayoutEffect(() => {
+    const image = frame.current?.querySelector("img");
+    if (image) acknowledge(image);
+  }, [url, shownGeometry]);
   const geometryReady =
     !!url && loaded?.url === url && loaded.geometry === requestedGeometry;
   const loading =
@@ -210,7 +238,12 @@ export const Picture = memo(function Picture({
           decodedPreviews.retain(asset);
           held.current.add(asset);
         }
-        setDisplay({ photoId: photo.id, asset, geometry: requestedGeometry });
+        setDisplay({
+          photoId: photo.id,
+          asset,
+          geometry: requestedGeometry,
+          recipe: { ...requestedPhoto.recipe },
+        });
       })
       .catch((reason) => {
         if (!controller.signal.aborted) {
@@ -240,14 +273,7 @@ export const Picture = memo(function Picture({
           onLoad={(e) => {
             // A replaced <img> can still dispatch an old load event. Only the
             // currently selected, decoded URL may acknowledge screen geometry.
-            if (
-              frame.current?.querySelector("img") !== e.currentTarget ||
-              e.currentTarget.currentSrc !== url ||
-              !e.currentTarget.naturalWidth
-            )
-              return;
-            setLoaded({ url, geometry: shownGeometry });
-            onLoaded?.(e.currentTarget);
+            acknowledge(e.currentTarget);
           }}
         />
       )}
@@ -290,6 +316,9 @@ export function Comparison({
   const [bounds, setBounds] = useState({ width: 0, height: 0 }),
     [position, setPosition] = useState(0.5),
     [originalReady, setOriginalReady] = useState(false);
+  const [exact, setExact] = useState(() =>
+    liveRecipeKey(photo.committed_recipe ?? photo.recipe),
+  );
   const markOriginalReady = useCallback(() => setOriginalReady(true), []);
   const acknowledgedPhoto = {
     ...photo,
@@ -353,12 +382,18 @@ export function Comparison({
           revision={revision}
           size={1600}
           eager
-          onLoaded={onLoaded}
+          onLoaded={(image, recipe) => {
+            setExact(
+              liveRecipeKey(recipe ?? photo.committed_recipe ?? photo.recipe),
+            );
+            onLoaded(image);
+          }}
           className="comparison-edited"
           quality="source"
           uncropped={uncropped}
           sourceScale={scale}
         />
+        <LivePreview photo={photo} exact={exact} uncropped={uncropped} />
         {active && (
           <>
             <div

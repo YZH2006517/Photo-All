@@ -20,6 +20,8 @@ import subprocess
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 
 from PIL import Image, ImageCms, ImageEnhance, ImageFilter, ImageOps, ImageStat
 import film
@@ -37,6 +39,7 @@ RAW_DEFAULTS = {'raw_exposure': 0, 'raw_wb': 'camera', 'raw_temperature': 6500,
 DEFAULT_RECIPE.update(RAW_DEFAULTS)
 DEFAULT_RECIPE.update(film_stock='none', film_strength=1, film_grain=0, film_halation=0)
 DEFAULT_RECIPE.update(filter_id='none', filter_strength=1)
+DEFAULT_RECIPE.update(filter_stack='')  # Empty string preserves legacy recipes; [] explicitly clears filters.
 IDENTITY_CURVE = '[[0,0],[1,1]]'
 EDITOR_RANGES = {
     'straighten': (-45, 45), 'crop_x': (0, 1), 'crop_y': (0, 1),
@@ -300,6 +303,8 @@ def open_image(path, raw_recipe=None, preview_size=None, preserve_alpha=False):
             source.draft('RGB', preview_size)
         image = ImageOps.exif_transpose(source)
         image.load()
+        if preview_size:
+            image.thumbnail(preview_size, Image.Resampling.LANCZOS)
         transparent = image.mode in ('RGBA', 'LA') or (image.mode == 'P' and 'transparency' in image.info)
         alpha = image.convert('RGBA').getchannel('A') if transparent else None
         if image.mode == 'P':
@@ -336,6 +341,23 @@ def validate_recipe(recipe):
         raise ValueError('未知开放滤镜')
     if result['raw_wb'] not in {'camera', 'auto', 'custom'}:
         raise ValueError('未知 RAW 白平衡模式')
+    if result['filter_stack'] != '':
+        layers = _recipe_json(result['filter_stack'], 'filter_stack', 16)
+        clean, identities = [], set()
+        for index, layer in enumerate(layers):
+            if not isinstance(layer, dict): raise ValueError('滤镜层格式无效')
+            kind, identity = layer.get('kind'), layer.get('id')
+            if kind not in {'style','lut'} or not isinstance(identity,str): raise ValueError('滤镜层类型无效')
+            if (kind == 'style' and identity not in STYLES) or (kind == 'lut' and not open_filters.known(identity)):
+                raise ValueError('未知滤镜层')
+            uid = layer.get('uid', f'layer-{index}')
+            if not isinstance(uid,str) or not 1 <= len(uid) <= 80 or uid in identities: raise ValueError('滤镜层标识无效或重复')
+            identities.add(uid)
+            enabled = layer.get('enabled',True)
+            if type(enabled) is not bool: raise ValueError('滤镜层开关无效')
+            clean.append({'uid':uid,'kind':kind,'id':identity,'strength':_bounded_number(layer.get('strength',1),0,1,'滤镜强度'),'enabled':enabled})
+        result['filter_stack'] = json.dumps(clean,separators=(',',':'))
+        result.update(style='natural',filter_id='none',filter_strength=1)
     for name, low, high in [('exposure', -2, 2), ('contrast', .5, 1.5),
                             ('saturation', 0, 2), ('temperature', -1, 1),
                             ('raw_exposure', -5, 5), ('raw_temperature', 2000, 25000),
@@ -403,6 +425,17 @@ def _bounded_number(value, low, high, name):
     return value
 
 
+def filter_layers(recipe):
+    """Ordered filter layers. Legacy files retain their original render until edited."""
+    if recipe.get('filter_stack'): return json.loads(recipe['filter_stack'])
+    layers = []
+    if recipe.get('style','natural') != 'natural':
+        layers.append({'uid':'legacy-style','kind':'style','id':recipe['style'],'strength':1,'enabled':True})
+    if recipe.get('filter_id','none') != 'none':
+        layers.append({'uid':'legacy-lut','kind':'lut','id':recipe['filter_id'],'strength':recipe.get('filter_strength',1),'enabled':True})
+    return layers
+
+
 def _recipe_json(value, name, maximum):
     if not isinstance(value, str) or len(value) > 100000:
         raise ValueError(f'参数 {name} 必须是 JSON 字符串')
@@ -419,6 +452,15 @@ def crop_bounds(width, height, recipe):
     right = min(width, max(left+1, round((recipe['crop_x']+recipe['crop_w'])*width)))
     bottom = min(height, max(top+1, round((recipe['crop_y']+recipe['crop_h'])*height)))
     return left, top, right, bottom
+
+
+def straighten_scale(width, height, degrees):
+    """Cover the original canvas after rotation; recipe/source remain untouched."""
+    if not degrees: return 1.0
+    angle = math.radians(degrees)
+    c, s = abs(math.cos(angle)), abs(math.sin(angle))
+    # One source pixel of inset keeps bicubic taps off the transparent boundary.
+    return max(c+s*height/width, c+s*width/height) * (1+2/max(1, min(width, height)))
 
 
 def render_dimensions(photo):
@@ -440,8 +482,9 @@ def geometry_to_source(x, y, width, height, recipe):
     left, top, right, bottom = crop_bounds(turned_w, turned_h, recipe)
     px, py = left+x*(right-left)-turned_w/2, top+y*(bottom-top)-turned_h/2
     angle = math.radians(recipe['straighten'])
-    u = (math.cos(angle)*px-math.sin(angle)*py+turned_w/2)/turned_w
-    v = (math.sin(angle)*px+math.cos(angle)*py+turned_h/2)/turned_h
+    scale = straighten_scale(turned_w, turned_h, recipe['straighten'])
+    u = ((math.cos(angle)*px-math.sin(angle)*py)/scale+turned_w/2)/turned_w
+    v = ((math.sin(angle)*px+math.cos(angle)*py)/scale+turned_h/2)/turned_h
     if recipe['flip_x']: u = 1-u
     if recipe['flip_y']: v = 1-v
     for _ in range(recipe['quarter_turns']): u, v = v, 1-u
@@ -459,6 +502,100 @@ def render_pixels(path,recipe,max_size=None,preserve_alpha=False):
 
 
 
+def analysis_image(path, cancel=None):
+    """Small analysis/display proxy plus native dimensions, never an export input.
+
+    TIFF-based RAW containers expose an embedded JPEG and sensor/EXIF metadata.
+    Read those ranges only; unsupported containers fall back to native development.
+    """
+    path = Path(path)
+    if cancel: cancel.check()
+    if path.suffix.lower() in RAW:
+        try:
+            from pixels import tifffile
+            candidates, dimensions, exif_dimensions = [], [], []
+            orientation, captured = 1, None
+            with tifffile.TiffFile(path) as container:
+                pending, visited = list(container.pages), set()
+                while pending and len(visited) < 64:
+                    if cancel: cancel.check()
+                    page = pending.pop(0)
+                    if page.offset in visited: continue
+                    visited.add(page.offset)
+                    tags = page.tags
+                    value = lambda code, default=None: tags[code].value if code in tags else default
+                    if 274 in tags: orientation = int(value(274))
+                    detail = value(34665, {})
+                    if isinstance(detail, dict):
+                        ew, eh = detail.get('PixelXDimension'), detail.get('PixelYDimension')
+                        if ew and eh: exif_dimensions.append((int(ew), int(eh)))
+                        captured = detail.get('DateTimeOriginal') or captured
+                    crop = value(50720)
+                    if crop and len(crop) == 2:
+                        exif_dimensions.append(tuple(int(v) for v in crop))
+                    w, h = int(value(256, 0)), int(value(257, 0))
+                    if w > 0 and h > 0: dimensions.append((w, h))
+                    offset, length = value(513), value(514)
+                    if offset and length:
+                        candidates.append((int(offset[0] if isinstance(offset, tuple) else offset),
+                                           int(length[0] if isinstance(length, tuple) else length)))
+                    offsets, lengths = value(273, ()), value(279, ())
+                    if int(value(259, 1)) in {6, 7} and int(value(262, 2)) != 32803 and len(offsets) == len(lengths) == 1:
+                        candidates.append((int(offsets[0]), int(lengths[0])))
+                    children = page.pages
+                    if children: pending.extend(list(children))
+            native = max(exif_dimensions or dimensions, key=lambda wh: wh[0]*wh[1])
+            if min(native) < 512: raise ValueError('RAW native size unavailable')
+            result, best_area = None, 0
+            with path.open('rb') as stream:
+                for offset, length in candidates:
+                    if cancel: cancel.check()
+                    if not 0 < length <= 32*1024*1024 or offset+length > path.stat().st_size: continue
+                    stream.seek(offset)
+                    data = stream.read(length)
+                    if not data.startswith(b'\xff\xd8'): continue
+                    try: source = Image.open(BytesIO(data))
+                    except (OSError, ValueError): continue
+                    with source:
+                        area = source.width*source.height
+                        if area <= best_area: continue
+                        if not exif_dimensions and source.width >= native[0]*.9 and source.height >= native[1]*.9:
+                            # A full-size camera JPEG excludes optically masked
+                            # sensor margins that the RAW IFD can include.
+                            native = source.size
+                        own_orientation = source.getexif().get(274)
+                        source.draft('RGB', (640, 640))
+                        proxy = ImageOps.exif_transpose(source)
+                        if own_orientation is None:
+                            method = {2: Image.Transpose.FLIP_LEFT_RIGHT, 3: Image.Transpose.ROTATE_180,
+                                      4: Image.Transpose.FLIP_TOP_BOTTOM, 5: Image.Transpose.TRANSPOSE,
+                                      6: Image.Transpose.ROTATE_270, 7: Image.Transpose.TRANSVERSE,
+                                      8: Image.Transpose.ROTATE_90}.get(orientation)
+                            if method is not None: proxy = proxy.transpose(method)
+                        proxy.thumbnail((640, 640), Image.Resampling.LANCZOS)
+                        result, best_area = proxy.convert('RGB'), area
+            if result is None: raise ValueError('RAW embedded JPEG unavailable')
+            if orientation in {5, 6, 7, 8}: native = native[::-1]
+            return result, native, captured
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError):
+            # No metadata guess may reduce the professional source resolution.
+            with cancellation_scope(cancel): image = open_image(path)
+            native = image.size
+            image.thumbnail((640, 640), Image.Resampling.LANCZOS)
+            return image, native, None
+    if path.suffix.lower() in {'.heic', '.heif'}:
+        image = open_image(path)
+        native = image.size
+        image.thumbnail((640, 640), Image.Resampling.LANCZOS)
+        return image, native, None
+    with Image.open(path) as source:
+        orientation = source.getexif().get(274, 1)
+        native = (source.height, source.width) if orientation in {5, 6, 7, 8} else source.size
+    with cancellation_scope(cancel): image = open_image(path, preview_size=(640, 640))
+    image.thumbnail((640, 640), Image.Resampling.LANCZOS)
+    return image, native, None
+
+
 def analyze(path, cancel=None):
     path = Path(path)
     if cancel: cancel.check()
@@ -469,10 +606,8 @@ def analyze(path, cancel=None):
             chunk = stream.read(1024 * 1024)
             if not chunk: break
             digest.update(chunk)
-    with cancellation_scope(cancel):
-        image = open_image(path)
+    image, (width, height), raw_captured = analysis_image(path, cancel)
     if cancel: cancel.check()
-    width, height = image.size
     gray = image.convert('L')
     gray.thumbnail((256, 256))
     histogram = gray.histogram()
@@ -487,6 +622,11 @@ def analyze(path, cancel=None):
                    for y in range(8) for x in range(8))
     captured = path.stat().st_mtime
     time_source = 'file'
+    if raw_captured:
+        try:
+            captured = datetime.strptime(str(raw_captured), '%Y:%m:%d %H:%M:%S').timestamp()
+            time_source = 'exif'
+        except (ValueError, TypeError): pass
     try:
         with Image.open(path) as source:
             exif = source.getexif()
@@ -595,6 +735,19 @@ class Catalog:
             self.db.execute('UPDATE albums SET trashed_at=?,purge_at=? WHERE id=?', (now, now + 30 * 86400, identity))
         return True
 
+    def purge_album(self, identity):
+        """Forget one trashed album and memberships; never delete source files."""
+        if type(identity) is not int: raise ValueError('图集 ID 无效')
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            row = self.db.execute('SELECT trashed_at FROM albums WHERE id=?', (identity,)).fetchone()
+            if row is None: raise ValueError('图集已销毁或不存在')
+            if row['trashed_at'] is None: raise ValueError('只能彻底删除回收站中的图集')
+            self.db.execute('INSERT OR IGNORE INTO purged_albums(id) VALUES (?)', (identity,))
+            self.db.execute('DELETE FROM album_photos WHERE album_id=?', (identity,))
+            self.db.execute('DELETE FROM albums WHERE id=?', (identity,))
+        return True
+
     def restore_album(self, identity):
         self.purge_expired_albums()
         if type(identity) is not int: raise ValueError('图集 ID 无效')
@@ -605,13 +758,21 @@ class Catalog:
             self.db.execute('UPDATE albums SET trashed_at=NULL,purge_at=NULL WHERE id=?', (identity,))
         return True
 
-    def create_album(self, name):
-        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80:
-            raise ValueError('图集名称需为 1–80 个字符')
+    def create_album(self, name=''):
+        if name is None: name = ''
+        if not isinstance(name, str) or len(name.strip()) > 80:
+            raise ValueError('图集名称最多为 80 个字符')
+        name = name.strip()
         with self.db:
             # SQLite otherwise reuses the last deleted integer primary key,
             # allowing an old membership undo to target an unrelated new album.
             self.db.execute('BEGIN IMMEDIATE')
+            if not name:
+                names = {row[0] for row in self.db.execute('SELECT name FROM albums')}
+                name, number = '未命名图集', 2
+                while name in names:
+                    name = f'未命名图集 {number}'
+                    number += 1
             identity = self.db.execute('SELECT COALESCE(MAX(id),0)+1 FROM (SELECT id FROM albums UNION ALL SELECT id FROM purged_albums)').fetchone()[0]
             cursor = self.db.execute('INSERT INTO albums(id,name,created) VALUES (?,?,?)', (identity, name.strip(), time.time()))
         return next(a for a in self.albums() if a['id'] == cursor.lastrowid)
@@ -646,22 +807,33 @@ class Catalog:
         imported, errors, seen = set(), [], set()
         total = len(paths) if isinstance(paths, (list, tuple)) else 0
         done = 0
+        iterator = iter(paths)
+        workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix='photo-import')
+        pending = deque()
+        exhausted = False
         if progress: progress(0, total)
         try:
-            iterator = iter(paths)
-            while True:
+            while pending or not exhausted:
+                # Bound the queue and decoded memory; SQLite never crosses threads.
+                while len(pending) < 2 and not exhausted:
+                    if cancel: cancel.check()
+                    try: candidate = next(iterator)
+                    except StopIteration:
+                        exhausted = True
+                        break
+                    path = str(Path(candidate).resolve())
+                    if path in seen: continue
+                    seen.add(path)
+                    existing = self.db.execute('SELECT id FROM photos WHERE path=?', (path,)).fetchone()
+                    future = None if existing else workers.submit(analyze, path, cancel)
+                    pending.append((path, existing, future))
+                if not pending: break
                 if cancel: cancel.check()
-                try: candidate = next(iterator)
-                except StopIteration: break
-                if cancel: cancel.check()
-                path = str(Path(candidate).resolve())
-                if path in seen: continue
-                seen.add(path)
+                path, existing, future = pending.popleft()
                 if album_id is None:
                     legacy = self.db.execute("SELECT id FROM albums WHERE name='未归档照片' AND trashed_at IS NULL LIMIT 1").fetchone()
                     album_id = legacy['id'] if legacy else self.create_album('未归档照片')['id']
                 try:
-                    existing = self.db.execute('SELECT id FROM photos WHERE path=?', (path,)).fetchone()
                     if existing:
                         with self.db:
                             self.db.execute('BEGIN IMMEDIATE')
@@ -670,7 +842,7 @@ class Catalog:
                             self.db.execute('INSERT OR IGNORE INTO album_photos VALUES (?,?)', (album_id, existing['id']))
                             self.db.execute('UPDATE photos SET hidden=0 WHERE id=?',(existing['id'],))
                     else:
-                        info = analyze(path, cancel=cancel)
+                        info = future.result()
                         columns = ','.join(info)
                         with self.db:
                             self.db.execute('BEGIN IMMEDIATE')
@@ -689,6 +861,9 @@ class Catalog:
             # Per-photo transactions already committed remain available after cancel.
             pass
         finally:
+            for _, _, future in pending:
+                if future: future.cancel()
+            workers.shutdown(wait=True, cancel_futures=True)
             if hasattr(iterator, 'close'): iterator.close()
         if progress: progress(done, total if total and cancel and cancel.event.is_set() else done)
         return [p for p in self.photos() if p['path'] in imported], errors
@@ -710,7 +885,7 @@ class Catalog:
                                 (group, duplicate, photo['id']))
                 last = photo['captured']
 
-    def edit(self, ids, recipe=None, decision=None, recipe_patch=None):
+    def edit(self, ids, recipe=None, decision=None, recipe_patch=None, filter_append=None):
         ids = set(ids)
         if decision is not None and decision not in {'pending', 'keep', 'reject'}:
             raise ValueError('未知选片状态')
@@ -718,10 +893,13 @@ class Catalog:
             recipe = validate_recipe(recipe)
         if recipe_patch is not None and (not isinstance(recipe_patch, dict) or not set(recipe_patch) <= set(DEFAULT_RECIPE)):
             raise ValueError('批量配方参数无效')
+        if filter_append is not None and (recipe is not None or recipe_patch is not None): raise ValueError('滤镜追加与配方修改不能同时提交')
         with self.db:
             self.db.execute('BEGIN IMMEDIATE')
             targets = [p for p in self.photos() if p['id'] in ids]
             recipes = {p['id']: validate_recipe({**p['recipe'], **recipe_patch}) for p in targets} if recipe_patch is not None else {}
+            if filter_append is not None:
+                recipes = {p['id']:validate_recipe({**p['recipe'],'filter_stack':json.dumps(filter_layers(p['recipe'])+[filter_append])}) for p in targets}
             targets = [p for p in targets if recipes.get(p['id'], recipe if recipe is not None else p['recipe']) != p['recipe']
                        or (decision is not None and decision != p['decision'])]
             if not targets:
@@ -883,6 +1061,9 @@ def export_photo(photo, folder, template='plain', size=2400, format='jpeg', canc
             'revision':open_filters.REVISION,**{key:open_filters.manifest()['items'][identity][key]
             for key in ('label','source','license','sha256')},'mode':'33^3 encoded-sRGB float32 LUT'}
             if format!='original' and identity!='none' else None)
+        metadata['filter_stack'] = [dict(layer, **({key:open_filters.manifest()['items'][layer['id']][key]
+            for key in ('label','source','license','sha256')} if layer['kind']=='lut' else {'label':STYLES[layer['id']]}))
+            for layer in filter_layers(photo['recipe'])] if format!='original' else []
         with sidecar.open('x',encoding='utf-8') as stream:
             sidecar_created=True
             json.dump(metadata,stream,ensure_ascii=False,indent=2)

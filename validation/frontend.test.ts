@@ -1,5 +1,48 @@
 import { describe, expect, it } from 'vitest';
 import * as model from '../product/ui/model';
+
+it('replaces the selected filter slot and appends only to an explicit new slot',()=>{
+  const a=model.newFilterLayer('style','warm'),b=model.newFilterLayer('style','mono');
+  const replacement=model.selectFilterPreset([a,b],a.uid,'style','cool');
+  expect(replacement.layers).toHaveLength(2);expect(replacement.layers[0].uid).toBe(a.uid);
+  expect(replacement.layers[0].id).toBe('cool');expect(replacement.layers[1]).toBe(b);
+  const same=model.selectFilterPreset([{...a,strength:.4}],a.uid,'style','warm');
+  expect(same.layers[0].strength).toBe(.4);
+  const added=model.selectFilterPreset([a,b],null,'style','film');
+  expect(added.layers).toHaveLength(3);expect(added.layers[2].id).toBe('film');
+  expect(model.selectFilterPreset([a,b],null,'style','cool',1).layers.map(layer=>layer.id)).toEqual(['warm','cool','mono']);
+});
+
+it('preserves legacy filters and distinct instances in an ordered stack',()=>{
+  const legacy=model.filterLayers({style:'warm',filter_id:'example',filter_strength:.3});
+  expect(legacy.map(layer=>layer.kind)).toEqual(['style','lut']);expect(legacy[1].strength).toBe(.3);
+  const a=model.newFilterLayer('style','mono'),b=model.newFilterLayer('style','mono');
+  expect(a.uid).not.toBe(b.uid);
+  const patch=model.filtersPatch([a,b]);expect(model.filterLayers(patch)).toEqual([a,b]);
+  expect(model.filterLayers(model.filtersPatch([]))).toEqual([]);
+  const photo={id:1,digest:'photo',recipe:patch} as model.Photo;
+  const key=model.filterPreviewKey(photo,'example');
+  expect(model.filterPreviewKey({...photo,recipe:model.filtersPatch([b])},'example')).toBe(key);
+});
+
+it('live preview reuses its base during grading and invalidates RAW or geometry changes',()=>{
+  const photo={id:1,digest:'source',recipe:{exposure:0,crop_x:0,crop_y:0,crop_w:1,crop_h:1,raw_exposure:0}} as model.Photo;
+  const key=model.liveBaseKey(photo);
+  expect(model.liveBaseKey({...photo,recipe:{...photo.recipe,exposure:1,saturation:1.5,shadows:.5}})).toBe(key);
+  expect(model.liveBaseKey({...photo,recipe:{...photo.recipe,raw_exposure:1}})).not.toBe(key);
+  expect(model.liveBaseKey({...photo,recipe:{...photo.recipe,quarter_turns:1}})).not.toBe(key);
+  expect(model.liveRecipeKey({gamma:1,exposure:1})).toBe(model.liveRecipeKey({exposure:1,gamma:1}));
+});
+
+it('keeps native cache selection stable across equal-capacity decoded images',async()=>{
+  let serial=0;
+  const pool=new model.DecodedPreviewPool(8*1024*1024,async()=>({url:`native-${++serial}`,width:612,height:408}),()=>{});
+  await Promise.all([
+    pool.read('native-family',512,async()=>new Blob(),undefined,{width:612,height:408}),
+    pool.read('native-family',2048,async()=>new Blob(),undefined,{width:612,height:408}),
+  ]);
+  expect(new Set(Array.from({length:8},()=>pool.peek('native-family',1600)?.url)).size).toBe(1);
+});
 describe('lighttable motion geometry',()=>{
   const frames=[{id:1,x:40,y:40,width:300,height:260},{id:2,x:340,y:40,width:300,height:260},{id:3,x:640,y:40,width:300,height:260}];
   it('sizes a docked photo to the actual footer thumbnail, including an offscreen source',()=>{

@@ -116,6 +116,7 @@ export function FilmTable({
   active,
   light,
   onLight,
+  offColor = "#dfd5b5",
   roll = false,
   decorated = true,
   intro = true,
@@ -124,6 +125,7 @@ export function FilmTable({
   reveal = 0,
   incomingId = null,
   onDeskChange,
+  onCollectChange,
 }: {
   photos: Photo[];
   currentId: number;
@@ -135,6 +137,7 @@ export function FilmTable({
   active: boolean;
   light: boolean;
   onLight: () => void;
+  offColor?: string;
   roll?: boolean;
   decorated?: boolean;
   intro?: boolean;
@@ -143,6 +146,7 @@ export function FilmTable({
   reveal?: number;
   incomingId?: number | null;
   onDeskChange?: (ids: number[]) => void;
+  onCollectChange?: (state: { dragging: boolean; hover: boolean }) => void;
 }) {
   const key = useMemo(
     () =>
@@ -167,12 +171,28 @@ export function FilmTable({
     initial?.scales || {},
   );
   const [lensSize, setLensSize] = useState(150);
+  const mouse = useRef<Point | null>(null);
+  useEffect(() => {
+    const track = (event: PointerEvent) => {
+      if (event.pointerType === "mouse")
+        mouse.current = { x: event.clientX, y: event.clientY };
+    };
+    window.addEventListener("pointermove", track, { passive: true });
+    return () => window.removeEventListener("pointermove", track);
+  }, []);
   const [placed, setPlaced] = useState<number[] | null>(
     initial?.placed ?? null,
   );
   const [returning, setReturning] = useState<number[]>([]);
   const [draggedId, setDraggedId] = useState<number | null>(null);
   const [zoneHover, setZoneHover] = useState(false);
+  useEffect(() => {
+    onCollectChange?.({ dragging: draggedId !== null, hover: zoneHover });
+  }, [draggedId, zoneHover, onCollectChange]);
+  useEffect(
+    () => () => onCollectChange?.({ dragging: false, hover: false }),
+    [onCollectChange],
+  );
   const returnFlights = useRef(new Map<number, Animation>());
   const deskChange = useRef(onDeskChange);
   deskChange.current = onDeskChange;
@@ -323,19 +343,15 @@ export function FilmTable({
   const visibleFrames = frames.filter(
     (frame) => roll || placedSet === null || placedSet.has(frame.id),
   );
-  const zoneWidth = Math.min(720, Math.max(280, size.width * 0.55));
-  const zoneHeight = 44;
-  const zoneLeft = (size.width - zoneWidth) / 2;
-  const zoneBottom = Math.min(
-    size.height - 4,
-    footer ? origin + footer.offsetTop + 2 : size.height - 170,
-  );
   const overStowZone = (x: number, y: number) => {
-    const rect = viewport.current?.getBoundingClientRect();
+    const rect = footer?.getBoundingClientRect();
     if (!rect) return false;
-    const u = (x - rect.left - size.width / 2) / (zoneWidth / 2),
-      v = (zoneBottom - (y - rect.top)) / zoneHeight;
-    return Math.abs(u) <= 1 && v >= 0 && v <= 1 && u * u + v * v <= 1;
+    return (
+      x >= rect.left &&
+      x <= rect.right &&
+      y >= rect.top &&
+      y <= rect.bottom
+    );
   };
   const dockBounds = () => {
     const table = viewport.current!,
@@ -843,11 +859,11 @@ export function FilmTable({
   };
   const showLoupe = () => {
     stopMotion();
-    const frame = frames.find((f) => f.id === currentId);
-    if (!loupe && frame)
+    const rect = viewport.current?.getBoundingClientRect();
+    if (!loupe && mouse.current && rect)
       setCenter({
-        x: (frame.x + frame.width / 2) * view.scale + view.x,
-        y: (frame.y + frame.height / 2) * view.scale + view.y,
+        x: mouse.current.x - rect.left,
+        y: mouse.current.y - rect.top,
       });
     setLoupe((v) => !v);
   };
@@ -972,6 +988,7 @@ export function FilmTable({
                 e.stopPropagation();
                 onSelect(photo.id);
                 if (loupe) return;
+                if (!hand && !roll) setDraggedId(photo.id);
                 e.currentTarget.setPointerCapture(e.pointerId);
                 drag.current = {
                   id: hand || roll ? undefined : photo.id,
@@ -1157,9 +1174,10 @@ export function FilmTable({
       style={
         {
           "--ft-transmission": light ? brightness / 100 : 0.12,
+          "--ft-off-color": offColor,
           backgroundColor: light
             ? `rgb(${Math.min(255, Math.round(182 + brightness * 0.52))},${Math.min(255, Math.round(185 + brightness * 0.52))},${Math.min(255, Math.round(182 + brightness * 0.52))})`
-            : undefined,
+            : offColor,
         } as React.CSSProperties
       }
       onPointerDown={(e) => {
@@ -1530,27 +1548,12 @@ export function FilmTable({
           <button onClick={() => setLimit((n) => n + 96)}>再摆 96 张</button>
         )}
       </div>
-      {!roll && (
-        <div
-          className={`ft-stow-zone ${draggedId !== null ? "is-visible" : ""} ${zoneHover ? "is-targeted" : ""}`}
-          style={{
-            left: zoneLeft,
-            top: zoneBottom - zoneHeight,
-            width: zoneWidth,
-            height: zoneHeight,
-          }}
-          aria-hidden={draggedId === null}
-        >
-          <Archive size={16} />
-          <span>收纳</span>
-        </div>
-      )}
       <div className="ft-instruction">
         {loupe
           ? "移动鼠标查看细节 · V / Esc 收起放大镜"
           : roll
             ? "一卷光影 · 拖动或滚轮左右滑动 · Ctrl+滚轮缩放 · V 放大镜"
-            : `${light ? "灯箱已开启" : "按 L 打开背光"} · 从底部拖入照片 · 拖到准备区上方收纳 · 滚轮缩放 · V 放大镜`}
+            : `${light ? "灯箱已开启" : "按 L 打开背光"} · 从底部拖入照片 · 拖回底部准备区收纳 · 滚轮缩放 · V 放大镜`}
       </div>
     </div>
   );

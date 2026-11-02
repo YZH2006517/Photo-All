@@ -8,6 +8,8 @@ import React, {
 } from "react";
 import { createRoot } from "react-dom/client";
 import { AnimatePresence, motion, MotionConfig } from "motion/react";
+import { isTauri } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Aperture,
   ArrowDownToLine,
@@ -30,6 +32,7 @@ import {
   SlidersHorizontal,
   Sparkles,
   Sun,
+  Moon,
   Undo2,
   Redo2,
   X,
@@ -43,6 +46,8 @@ import {
   Trash2,
   PanelLeftOpen,
   PanelLeftClose,
+  Minus,
+  Square,
 } from "lucide-react";
 import {
   api,
@@ -70,6 +75,8 @@ import {
   VariantMode,
   applyVariantPreference,
   expandVariantScope,
+  newFilterLayer,
+  filtersPatch,
 } from "./model";
 import { Albums, Classification } from "./Albums";
 import { Composite } from "./Composite";
@@ -78,6 +85,7 @@ import { EditorWorkspace } from "./Editor";
 import { Lighttable } from "./Lighttable";
 import "./style.css";
 
+const brandIcon = new URL("./brand.svg", import.meta.url).href;
 const spring = { type: "spring" as const, stiffness: 330, damping: 32 };
 const EMPTY: Library = {
   photos: [],
@@ -100,7 +108,98 @@ const EMPTY: Library = {
   templates: {},
 };
 
+function WindowBar({ report }: { report: (message: string) => void }) {
+  const native = isTauri();
+  const [maximized, setMaximized] = useState(false);
+  useEffect(() => {
+    if (!native) return;
+    let disposed = false;
+    const window = getCurrentWindow();
+    const refresh = async () => {
+      const [max, full] = await Promise.all([
+        window.isMaximized(),
+        window.isFullscreen(),
+      ]);
+      if (disposed) return;
+      setMaximized(max);
+      document.documentElement.dataset.windowFullscreen = String(full);
+    };
+    const stop = window.onResized(() => void refresh().catch(() => {}));
+    void refresh().catch(() => {});
+    return () => {
+      disposed = true;
+      void stop.then((unlisten) => unlisten());
+    };
+  }, [native]);
+  const run = (
+    action: "minimize" | "toggleMaximize" | "close" | "startDragging",
+  ) => {
+    if (native)
+      void getCurrentWindow()
+        [action]()
+        .catch((reason) => report(String(reason)));
+  };
+  return (
+    <header className="window-bar" aria-label="窗口标题栏">
+      <div
+        className="window-drag"
+        onMouseDown={(event) => {
+          if (event.button === 0 && event.detail === 1) run("startDragging");
+        }}
+        onDoubleClick={() => run("toggleMaximize")}
+      >
+        <img src={brandIcon} alt="" draggable={false} />
+        <span>
+          Photo All <b>Studio</b>
+        </span>
+      </div>
+      <div className="window-controls">
+        <button
+          aria-label="最小化窗口"
+          title="最小化"
+          disabled={!native}
+          onClick={() => run("minimize")}
+        >
+          <Minus size={14} />
+        </button>
+        <button
+          aria-label={maximized ? "还原窗口" : "最大化窗口"}
+          title={maximized ? "还原" : "最大化"}
+          disabled={!native}
+          onClick={() => run("toggleMaximize")}
+        >
+          {maximized ? <Copy size={12} /> : <Square size={12} />}
+        </button>
+        <button
+          className="window-close"
+          aria-label="关闭窗口"
+          title="关闭"
+          disabled={!native}
+          onClick={() => run("close")}
+        >
+          <X size={16} />
+        </button>
+      </div>
+    </header>
+  );
+}
+
 function Studio() {
+  const [theme, setTheme] = useState<"light" | "dark">(() => {
+    try {
+      return localStorage.getItem("photoall-theme") === "dark"
+        ? "dark"
+        : "light";
+    } catch {
+      return "light";
+    }
+  });
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try {
+      localStorage.setItem("photoall-theme", theme);
+    } catch {}
+  }, [theme]);
   const [library, setLibrary] = useState<Library>(EMPTY),
     libraryRef = useRef(EMPTY);
   const [connected, setConnected] = useState(false),
@@ -662,6 +761,11 @@ function Studio() {
       await reload();
       notify(`已恢复图集“${album.name}”`);
     });
+  const purgeAlbum = async (album: Album) => {
+    await api(`/albums/${album.id}/purge`, {});
+    await reload();
+    notify(`已彻底移除图集“${album.name}”的记录，电脑本地原片保留。`);
+  };
   const showTrash = () =>
     act(async () => {
       await flush();
@@ -672,8 +776,18 @@ function Studio() {
     });
   const beginComposite = (existing?: CompositeDocument) =>
     act(async () => {
+      if (mode === "composite") return;
       await flush();
-      const candidates = photos.filter((p) => selected.includes(p.id));
+      const candidates =
+        mode === "editor" && current
+          ? [current]
+          : photos.filter((p) => selected.includes(p.id));
+      const retained =
+        mode === "editor" && current
+          ? libraryRef.current.composites.find((doc) =>
+              doc.layers.some((layer) => layer.photo_id === current.id),
+            )
+          : undefined;
       if (!existing && !candidates.length) {
         notify("请先选择需要合成的照片");
         return;
@@ -690,24 +804,26 @@ function Studio() {
               Math.min(3200, Math.round((width * first.height) / first.width)),
             )
           : 1600;
+      if (first) setCurrentId(first.id);
       setComposite(
-        existing || {
-          name: (activeAlbum?.name || "照片") + " · 合成",
-          album_id: albumId ?? undefined,
-          width,
-          height,
-          layers: candidates.map((p) => ({
-            photo_id: p.id,
-            visible: true,
-            opacity: 1,
-            blend: "normal",
-            x: 0,
-            y: 0,
-            scale: 1,
-            rotation: 0,
-            recipe: { ...p.recipe },
-          })),
-        },
+        existing ||
+          retained || {
+            name: (activeAlbum?.name || "照片") + " · 合成",
+            album_id: albumId ?? undefined,
+            width,
+            height,
+            layers: candidates.map((p) => ({
+              photo_id: p.id,
+              visible: true,
+              opacity: 1,
+              blend: "normal",
+              x: 0,
+              y: 0,
+              scale: 1,
+              rotation: 0,
+              recipe: { ...p.recipe },
+            })),
+          },
       );
       setMode("composite");
     });
@@ -726,18 +842,23 @@ function Studio() {
         : null;
       await api("/edit", {
         ids,
-        recipe_patch: filterId
-          ? { style: "natural", filter_id: filterId, filter_strength: 1 }
-          : filmId
-            ? {
-                style: "natural",
+        ...(filmId
+          ? {
+              recipe_patch: {
                 film_stock: filmId,
                 film_strength: 1,
                 film_grain: 0,
                 film_halation: 0,
-                filter_id: "none",
-              }
-            : { style: batchStyle, film_stock: "none", filter_id: "none" },
+              },
+            }
+          : batchStyle === "natural"
+            ? { recipe_patch: filtersPatch([]) }
+            : {
+                filter_append: newFilterLayer(
+                  filterId ? "lut" : "style",
+                  filterId || batchStyle,
+                ),
+              }),
       });
       await reload();
       setRevisions((r) => ({
@@ -834,11 +955,42 @@ function Studio() {
     return () => window.removeEventListener("keydown", key);
   });
 
+  const layerContent =
+    mode === "composite" && composite ? (
+      <Composite
+        key={composite.id || "new-composite"}
+        initial={composite}
+        photos={
+          composite.album_id
+            ? library.photos.filter((p) =>
+                p.album_ids.includes(composite.album_id!),
+              )
+            : albumPhotos
+        }
+        saveRef={compositeSave}
+        onSaved={(doc) =>
+          install({
+            ...libraryRef.current,
+            composites: [
+              doc,
+              ...libraryRef.current.composites.filter((c) => c.id !== doc.id),
+            ],
+          })
+        }
+        onBack={() => setMode("editor")}
+        onExport={async (document, folder) =>
+          startJob("/composite-export", { document, folder })
+        }
+        notify={notify}
+      />
+    ) : null;
+
   return (
     <MotionConfig
       reducedMotion="user"
       transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
     >
+      <WindowBar report={setError} />
       {reviewPicker && (
         <div className="modal-backdrop" onClick={() => setReviewPicker(false)}>
           <section
@@ -971,7 +1123,7 @@ function Studio() {
         />
       )}
       <div
-        className={`app-shell ${drawerOpen ? "drawer-open" : "drawer-closed"}`}
+        className={`app-shell ${mode === "editor" || mode === "composite" ? "is-editing" : ""} ${drawerOpen ? "drawer-open" : "drawer-closed"}`}
         inert={mode === "lighttable" || reviewPicker}
         aria-hidden={mode === "lighttable" || reviewPicker ? true : undefined}
       >
@@ -1050,26 +1202,18 @@ function Studio() {
             }}
           >
             <span className="brand-icon">
-              <Aperture size={24} strokeWidth={1.6} />
+              <img src={brandIcon} alt="" draggable={false} />
             </span>
             <span>
-              Photo All<small>YOUR MOMENTS, REFINED.</small>
+              Photo All<small>本地照片工作台</small>
             </span>
           </a>
-          <button className="workspace-switch" onClick={showAlbums}>
-            <span className="workspace-avatar">P</span>
-            <span>
-              我的工作空间<small>本地照片库</small>
-            </span>
-            <ChevronDown size={14} />
-          </button>
-          <div className="nav-label">照片库</div>
           <button
             title="图集"
             className={`nav-item ${mode === "albums" ? "active" : ""}`}
             onClick={showAlbums}
           >
-            <Images size={18} />
+            <Grid2X2 size={18} />
             <span>图集</span>
             <b>{library.albums.length}</b>
           </button>
@@ -1138,21 +1282,28 @@ function Studio() {
               </p>
             )}
           </div>
-          <div className="local-note">
-            <ShieldCheck size={18} />
-            <div>
-              美好，留在你的设备里<small>本地处理 · 原图保持只读</small>
-            </div>
-          </div>
+          <button
+            className="theme-toggle"
+            aria-label={theme === "dark" ? "切换浅色模式" : "切换深色模式"}
+            title={theme === "dark" ? "切换浅色模式" : "切换深色模式"}
+            onClick={() =>
+              setTheme((value) => (value === "dark" ? "light" : "dark"))
+            }
+          >
+            {theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}
+            <span>{theme === "dark" ? "浅色模式" : "深色模式"}</span>
+          </button>
           <div className="sidebar-bottom">
-            <span className="online-dot" /> 本地引擎
-            {library.capabilities.raw ? "已就绪" : "待连接"}
-            <span className="version">0.10.5</span>
+            <span className="online-dot" />
+            <span>本地引擎{connected ? "已连接" : "连接中"}</span>
+            <span className="version">0.10.6</span>
           </div>
         </aside>
 
-        <main className={`main ${mode === "editor" ? "editor-mode" : ""}`}>
-          {mode !== "editor" && (
+        <main
+          className={`main ${mode === "editor" || mode === "composite" ? "editor-mode" : ""}`}
+        >
+          {mode !== "editor" && mode !== "composite" && (
             <header className="topbar">
               <div className="breadcrumb">
                 工作空间 <ChevronRight size={12} />
@@ -1162,11 +1313,7 @@ function Studio() {
                 {mode !== "albums" && mode !== "trash" && (
                   <>
                     <ChevronRight size={12} />
-                    <strong>
-                      {mode === "composite"
-                        ? "多图层合成"
-                        : activeAlbum?.name || "全部照片"}
-                    </strong>
+                    <strong>{activeAlbum?.name || "全部照片"}</strong>
                   </>
                 )}
               </div>
@@ -1187,7 +1334,6 @@ function Studio() {
                   disabled={
                     !connected ||
                     !!busy ||
-                    mode === "composite" ||
                     (!library.history.undo && !pending.current.size && !saving)
                   }
                 >
@@ -1202,7 +1348,6 @@ function Studio() {
                   disabled={
                     !connected ||
                     !!busy ||
-                    mode === "composite" ||
                     !library.history.redo ||
                     !!pending.current.size ||
                     saving
@@ -1221,8 +1366,7 @@ function Studio() {
                       !!busy ||
                       albumId === null ||
                       mode === "albums" ||
-                      mode === "trash" ||
-                      mode === "composite"
+                      mode === "trash"
                     }
                   >
                     <Plus size={16} />
@@ -1255,8 +1399,7 @@ function Studio() {
                     !exportScope.length ||
                     !!busy ||
                     mode === "albums" ||
-                    mode === "trash" ||
-                    mode === "composite"
+                    mode === "trash"
                   }
                   onClick={() => setExportOpen(true)}
                 >
@@ -1285,6 +1428,7 @@ function Studio() {
                 onVariantMode={changeVariantMode}
                 removeAlbum={trashAlbum}
                 restoreAlbum={restoreAlbum}
+                purgeAlbum={purgeAlbum}
                 library={library}
                 open={openAlbum}
                 create={createAlbum}
@@ -1292,37 +1436,7 @@ function Studio() {
                 busy={!connected || busy}
                 review={openLighttable}
               />
-            ) : mode === "lighttable" ? null : mode === "composite" &&
-              composite ? (
-              <Composite
-                key={composite.id || "new-composite"}
-                initial={composite}
-                photos={
-                  composite.album_id
-                    ? library.photos.filter((p) =>
-                        p.album_ids.includes(composite.album_id!),
-                      )
-                    : albumPhotos
-                }
-                saveRef={compositeSave}
-                onSaved={(doc) =>
-                  install({
-                    ...libraryRef.current,
-                    composites: [
-                      doc,
-                      ...libraryRef.current.composites.filter(
-                        (c) => c.id !== doc.id,
-                      ),
-                    ],
-                  })
-                }
-                onBack={() => setMode("library")}
-                onExport={async (document, folder) =>
-                  startJob("/composite-export", { document, folder })
-                }
-                notify={notify}
-              />
-            ) : mode === "library" ? (
+            ) : mode === "lighttable" ? null : mode === "library" ? (
               <motion.section
                 className="library-view"
                 key={`library-${albumId ?? "all"}`}
@@ -1331,32 +1445,23 @@ function Studio() {
                 exit={{ opacity: 0, y: -8 }}
                 transition={{ duration: 0.22 }}
               >
-                <div className="page-heading">
-                  <div>
-                    <div className="eyebrow">
-                      A LITTLE LESS CHAOS. A LITTLE MORE BEAUTY.
-                    </div>
-                    <h1>
-                      {activeAlbum
-                        ? activeAlbum.name
-                        : filter === "keep"
-                          ? "值得留下的瞬间"
-                          : filter === "duplicates"
-                            ? "相似中的唯一"
-                            : group === "all"
-                              ? "每一刻，都值得好好收藏。"
-                              : dateLabel(
-                                  photos[0]?.captured || Date.now() / 1000,
-                                ) + " · 拍摄故事"}
-                    </h1>
-                    <p>
-                      {photos.length
-                        ? `${photos.length} 张照片，${new Set(photos.map((p) => p.group_id)).size} 组故事。把选择、风格与出片，放在同一个地方。`
-                        : "从一组照片开始，让灵感自然发生。"}
-                    </p>
-                  </div>
-                  <span className="heading-symbol">
-                    <Aperture size={44} strokeWidth={0.7} />
+                <div className="page-heading library-heading">
+                  <h1>
+                    {activeAlbum
+                      ? activeAlbum.name
+                      : filter === "keep"
+                        ? "精选作品"
+                        : filter === "duplicates"
+                          ? "重复照片"
+                          : group === "all"
+                            ? "全部照片"
+                            : dateLabel(
+                                photos[0]?.captured || Date.now() / 1000,
+                              )}
+                  </h1>
+                  <span>
+                    {photos.length} 张照片 ·{" "}
+                    {new Set(photos.map((p) => p.group_id)).size} 组
                   </span>
                 </div>
                 <Classification
@@ -1660,6 +1765,11 @@ function Studio() {
                 <EditorWorkspace
                   key={current.id}
                   photo={current}
+                  layerContent={layerContent}
+                  onLeaveLayers={async () => {
+                    await compositeSave.current?.();
+                    setMode("editor");
+                  }}
                   photos={photos}
                   revisions={revisions}
                   busy={!!busy}
@@ -1673,12 +1783,17 @@ function Studio() {
                   onBack={() =>
                     act(async () => {
                       await flush();
+                      await compositeSave.current?.();
                       setMode("library");
                     })
                   }
                   onReview={openLighttable}
                   onComposite={() => beginComposite()}
                   onExport={() => setExportOpen(true)}
+                  theme={theme}
+                  onToggleTheme={() =>
+                    setTheme((value) => (value === "dark" ? "light" : "dark"))
+                  }
                   onUndo={undo}
                   onRedo={redo}
                   onKeep={() =>

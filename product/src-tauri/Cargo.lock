@@ -2513,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "photo-all"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "rfd",
  "serde",

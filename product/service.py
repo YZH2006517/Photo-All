@@ -174,7 +174,14 @@ class StudioServer(ThreadingHTTPServer):
                 value = cached()
                 if value is not None:
                     return remember(value)
-                image = engine.render_image(photo['path'], recipe, (size, size) if size else None)
+                if (not lossless and 0 < size <= 640 and recipe == engine.DEFAULT_RECIPE
+                        and Path(photo['path']).suffix.lower() in engine.RAW):
+                    # Embedded JPEG is a browsing proxy only. Editing/source requests
+                    # always use the unchanged float32 professional RAW pipeline.
+                    image, _, _ = engine.analysis_image(photo['path'])
+                    image.thumbnail((size, size))
+                else:
+                    image = engine.render_image(photo['path'], recipe, (size, size) if size else None)
                 output = BytesIO()
                 if lossless:image.save(output,format='PNG',compress_level=3,icc_profile=engine.SRGB)
                 else:image.save(output, format='JPEG', quality=88, icc_profile=engine.SRGB)
@@ -286,6 +293,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.allowed():
             return
         route = urlsplit(self.path)
+        query = parse_qs(route.query)
         try:
             body = {}
             if self.command == 'POST':
@@ -297,6 +305,28 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('请求必须为对象')
             if route.path == '/api/library' and self.command == 'GET':
                 return self.reply(self.library())
+            if route.path == '/api/live-look' and self.command == 'GET':
+                import numpy as np
+                import pixels
+                recipe = engine.validate_recipe({key: query.get(key, [default])[0]
+                    for key, default in [('style', 'natural'), ('film_stock', 'none'), ('filter_id', 'none')]})
+                tables = {}
+                if recipe['style'] in film.CREATIVE:
+                    tables['style'] = np.asarray(film.creative_lut(recipe['style']).table, np.float32).reshape(17,17,17,3)
+                if recipe['film_stock'] != 'none':
+                    stock = recipe['film_stock']
+                    tables['film'] = pixels._stock_table(stock, (film.LUTS/(stock+'.npy')).stat().st_mtime_ns)
+                if recipe['filter_id'] != 'none': tables['filter'] = open_filters.load_table(recipe['filter_id'])
+                result={key:{'edge':table.shape[0],'data':table.reshape(-1).tolist()} for key,table in tables.items()}
+                stack=engine.validate_recipe({'filter_stack':query.get('stack',['[]'])[0]})
+                assets={}
+                for layer in engine.filter_layers(stack):
+                    key=layer['kind']+':'+layer['id']
+                    if key in assets:continue
+                    table=pixels.filter_table(layer['kind'],layer['id'])
+                    if table is not None: assets[key]={'edge':33,'data':table.reshape(-1).tolist()}
+                result['stack']=assets
+                return self.reply(result)
             if re.fullmatch(r'/api/jobs/[^/]+/cancel', route.path) and self.command == 'POST':
                 job = self.server.cancel_job(route.path.split('/')[-2])
                 return self.reply(job or {'error': '任务不存在'}, 200 if job else 404)
@@ -304,7 +334,7 @@ class Handler(BaseHTTPRequestHandler):
                 with self.server.lock:
                     job = copy.deepcopy(self.server.jobs.get(route.path.rsplit('/', 1)[1], {}))
                 return self.reply(job or {'error': '任务不存在'}, 200 if job else 404)
-            if (route.path.startswith('/api/image/') or route.path.startswith('/api/filter-preview/')) and self.command == 'GET':
+            if (route.path.startswith('/api/image/') or route.path.startswith('/api/filter-preview/') or route.path.startswith('/api/live-base/')) and self.command == 'GET':
                 identity = int(route.path.rsplit('/', 1)[1])
                 with closing(sqlite3.connect((self.server.data_dir / 'library.sqlite').as_uri() + '?mode=ro', uri=True)) as database:
                     database.row_factory = sqlite3.Row
@@ -314,9 +344,16 @@ class Handler(BaseHTTPRequestHandler):
                 if not photo:
                     return self.reply({'error': '照片不存在'}, 404)
                 query = parse_qs(route.query)
+                if route.path.startswith('/api/live-base/'):
+                    recipe = engine.validate_recipe(photo['recipe'])
+                    keep = (*engine.RAW_DEFAULTS, 'quarter_turns', 'flip_x', 'flip_y', 'straighten',
+                            'crop_x', 'crop_y', 'crop_w', 'crop_h')
+                    neutral = {**engine.DEFAULT_RECIPE, **{key: recipe[key] for key in keep}}
+                    return self.reply(self.server.preview({**photo, 'recipe': neutral}, 1024, False, 'source',
+                        query.get('uncropped') == ['1']), content_type='image/png')
                 if route.path.startswith('/api/filter-preview/'):
                     identity=query.get('filter_id',['none'])[0]
-                    recipe={**photo['recipe'],'filter_id':'none','filter_strength':1}
+                    recipe={**photo['recipe'],'filter_id':'none','filter_strength':1,'filter_stack':''}
                     if identity.startswith('style:'):
                         style=identity[6:]
                         if style not in engine.STYLES:raise ValueError('未知风格')
@@ -338,11 +375,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self.reply(catalog.create_album(body.get('name')))
                 finally:
                     catalog.close()
-            if re.fullmatch(r'/api/albums/\d+/(trash|restore)', route.path) and self.command == 'POST':
+            if re.fullmatch(r'/api/albums/\d+/(trash|restore|purge)', route.path) and self.command == 'POST':
                 catalog = engine.Catalog(self.server.data_dir / 'library.sqlite')
                 try:
                     identity = int(route.path.split('/')[-2])
-                    changed = catalog.trash_album(identity) if route.path.endswith('/trash') else catalog.restore_album(identity)
+                    action = route.path.rsplit('/', 1)[1]
+                    changed = {'trash': catalog.trash_album, 'restore': catalog.restore_album,
+                               'purge': catalog.purge_album}[action](identity)
                     return self.reply({'changed': changed})
                 finally:
                     catalog.close()
@@ -443,10 +482,10 @@ class Handler(BaseHTTPRequestHandler):
                         ids = body.get('ids', [])
                         if not isinstance(ids, list) or not all(type(i) is int for i in ids):
                             raise ValueError('照片 ID 列表无效')
-                        if not ('recipe' in body or 'decision' in body or 'recipe_patch' in body):
+                        if not ('recipe' in body or 'decision' in body or 'recipe_patch' in body or 'filter_append' in body):
                             raise ValueError('未提供修改内容')
-                        changed = catalog.edit(ids, recipe=body.get('recipe'), decision=body.get('decision'), recipe_patch=body.get('recipe_patch'))
-                        if len(ids) == 1 and ('recipe' in body or 'recipe_patch' in body):
+                        changed = catalog.edit(ids, recipe=body.get('recipe'), decision=body.get('decision'), recipe_patch=body.get('recipe_patch'),filter_append=body.get('filter_append'))
+                        if len(ids) == 1 and ('recipe' in body or 'recipe_patch' in body or 'filter_append' in body):
                             recipes = {str(p['id']): p['recipe'] for p in catalog.photos() if p['id'] == ids[0]}
                     history = catalog.history_state()
                 finally:

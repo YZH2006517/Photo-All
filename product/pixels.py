@@ -261,6 +261,43 @@ def _blur_plane(plane, radius):
     return plane
 
 
+@lru_cache(maxsize=24)
+def filter_table(kind, identity):
+    """Shared 33-cube for the native ordered stack and the interactive atlas."""
+    if kind == 'lut':
+        import open_filters
+        return open_filters.load_table(identity)
+    import film
+    if identity not in film.CREATIVE: return None
+    original = np.asarray(film.creative_lut(identity).table,np.float32).reshape(17,17,17,3)
+    axis=np.linspace(0,1,33,dtype=np.float32)
+    b,g,r=np.meshgrid(axis,axis,axis,indexing='ij')
+    neutral=np.stack([r,g,b],axis=-1)
+    return apply_lut(neutral.reshape(33*33,33,3),original).reshape(33,33,33,3)
+
+
+def apply_filter_stack(rgb, layers):
+    """Apply in list order, retaining float samples and each layer's opacity."""
+    for layer in layers:
+        strength=layer['strength']
+        if not layer['enabled'] or not strength: continue
+        kind, identity=layer['kind'],layer['id']
+        table=filter_table(kind,identity)
+        if table is not None: graded=apply_lut(rgb,table)
+        else:
+            graded=rgb.copy()
+            temperature={'warm':.18,'cool':-.15,'film':.08}.get(identity,0)
+            if temperature: graded*=np.array([1+temperature*.18,1,1-temperature*.18],np.float32)
+            np.clip(graded,0,1,out=graded)
+            if identity in {'film','mono'}:
+                gray=(graded@np.array([.299,.587,.114],np.float32))[...,None]
+                graded=gray if identity=='mono' else (gray+(graded-gray)*np.float32(.82))*np.float32(.9)+np.float32(14/255)
+                if identity=='mono': graded=np.broadcast_to(graded,rgb.shape).copy()
+            np.clip(graded,0,1,out=graded)
+        rgb=graded if strength==1 else rgb+(graded-rgb)*np.float32(strength)
+    return rgb
+
+
 def _hsl_adjust(rgb, operations):
     """Smooth circular HSL colour-band corrections on one bounded pixel tile."""
     original_rgb = rgb.copy()
@@ -465,7 +502,8 @@ def _geometry(array, recipe):
     if recipe['straighten']:
         height, width = array.shape[:2]
         angle = math.radians(recipe['straighten'])
-        c, s = math.cos(angle), math.sin(angle)
+        scale = engine.straighten_scale(width, height, recipe['straighten'])
+        c, s = math.cos(angle)/scale, math.sin(angle)/scale
         cx, cy = width/2, height/2
         matrix = (c, -s, cx-c*cx+s*cy, s, c, cy-s*cx-c*cy)
         transformed = np.empty((height, width, 4), np.float32)
@@ -564,6 +602,8 @@ def render(path, recipe, max_size=None, preserve_alpha=False):
             for start in range(0, rgb.shape[0], 64):
                 graded[start:start+64] = rgb[start:start+64]+(graded[start:start+64]-rgb[start:start+64])*np.float32(recipe['filter_strength'])
         rgb = graded
+    if recipe['filter_stack']:
+        rgb=apply_filter_stack(rgb,engine.filter_layers(recipe))
     np.clip(rgb, 0, 1, out=rgb)
     _editor_tone(rgb, recipe)
     _editor_details(rgb, recipe)

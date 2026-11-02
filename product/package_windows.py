@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import tomllib
 import urllib.request
 from urllib.parse import unquote
@@ -430,15 +431,15 @@ def build():
     version = json.loads((ROOT / 'package.json').read_text(encoding='utf-8'))['version']
     output = ROOT / 'dist'
     output.mkdir(exist_ok=True)
-    portable = output / f'Photo-All-Studio_{version}_windows-x64'
-    assert portable.resolve().parent == output.resolve()
-    if portable.exists():
-        shutil.rmtree(portable)
-    portable.mkdir(exist_ok=True)
-    copy(target / 'release/photo-all.exe', portable / 'Photo All Studio.exe')
-    copy(STAGE, portable / 'runtime')
-    copy(ROOT / 'WINDOWS_DISTRIBUTION.md', portable / 'README.txt')
-    shutil.make_archive(str(portable), 'zip', root_dir=portable)
+    # Build independently of any portable folder the user currently has open.
+    # Never delete or overwrite a running installation to assemble its update.
+    with tempfile.TemporaryDirectory(prefix='portable-', dir=ROOT / 'build') as temporary:
+        portable = Path(temporary).resolve()
+        assert portable.parent == (ROOT / 'build').resolve()
+        copy(target / 'release/photo-all.exe', portable / 'Photo All Studio.exe')
+        copy(STAGE, portable / 'runtime')
+        copy(ROOT / 'WINDOWS_DISTRIBUTION.md', portable / 'README.txt')
+        shutil.make_archive(str(output / f'Photo-All-Studio_{version}_windows-x64'), 'zip', root_dir=portable)
     for installer in (target / 'release/bundle/nsis').glob('*-setup.exe'):
         copy(installer, output / installer.name)
     files = [p for p in output.iterdir() if p.is_file() and p.suffix in {'.zip', '.exe'}]
