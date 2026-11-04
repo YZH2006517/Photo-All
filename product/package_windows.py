@@ -283,6 +283,16 @@ def prepare_builder():
     print('Builder dependencies ready. Run package_windows.py all to generate sources, stage, and build.', flush=True)
 
 
+def read_source_recipe(source):
+    import imagecodecs
+
+    with tarfile.open(fileobj=BytesIO(imagecodecs.zstd_decode(source.read_bytes())), mode='r:') as archive:
+        for member in archive:
+            if member.isfile() and member.name.endswith('/PKGBUILD'):
+                return archive.extractfile(member).read()
+    raise RuntimeError('Source package has no PKGBUILD: ' + source.name)
+
+
 def corresponding_sources():
     """Retrieve matching MSYS2 binary provenance and complete source packages."""
     base = 'https://repo.msys2.org/mingw/'
@@ -308,8 +318,8 @@ def corresponding_sources():
     output.mkdir(parents=True, exist_ok=True)
     icons = [p for p in (raw / 'share/icons/Adwaita').rglob('*') if p.is_file()]
     jobs.append(('adwaita-icon-theme', icons))
-    # Read binary package contents without writing files or following archive
-    # paths onto the host filesystem. Large source archives use streaming bsdtar.
+    # Use the pinned Zstandard decoder for both package types, independently of
+    # the version of tar installed on the Windows runner.
     sys.path[:0] = [str(ROOT / 'engines/precision-packages'), str(ROOT / 'engines/builder-site-packages')]
     import imagecodecs
 
@@ -353,11 +363,7 @@ def corresponding_sources():
             if f'href="{source_name}"' not in source_index:
                 raise RuntimeError(f'Exact source archive absent: {source_name}')
             source = fetch(base + 'sources/' + source_name, output / source_name)
-            source_listing = subprocess.run(['tar', '-tf', str(source)], capture_output=True, text=True, check=True).stdout.splitlines()
-            recipe = next((item for item in source_listing if item.endswith('/PKGBUILD')), None)
-            if recipe is None:
-                raise RuntimeError('Source package has no PKGBUILD: ' + source_name)
-            recipe_bytes = subprocess.run(['tar', '-xOf', str(source), recipe], capture_output=True, check=True).stdout
+            recipe_bytes = read_source_recipe(source)
             recorded_recipe_hash = re.search(r'^pkgbuild_sha256sum = (.+)$', buildinfo, re.M)
             if recorded_recipe_hash and hashlib.sha256(recipe_bytes).hexdigest() != recorded_recipe_hash[1]:
                 raise RuntimeError('Source recipe does not match binary build: ' + source_name)
