@@ -656,9 +656,10 @@ def stage():
             copy(item, packages / item.name)
     # The upstream external-editor companion uses Tk. Ship its CPython 3.12
     # extension and Tcl data alongside the embedded interpreter as an add-on.
+    # Tcl in some CPython builds links to a separate zlib1.dll.
     base = Path(sys.base_prefix)
     copy(base / 'Lib/tkinter', python / 'Lib/tkinter')
-    for pattern in ['_tkinter.pyd', 'tcl*.dll', 'tk*.dll']:
+    for pattern in ['_tkinter.pyd', 'tcl*.dll', 'tk*.dll', 'zlib1.dll']:
         for item in (base / 'DLLs').glob(pattern):
             copy(item, python / item.name)
     copy(base / 'tcl', python / 'tcl')
