@@ -49,9 +49,26 @@ async function until(fn) { const end=Date.now()+30000; while(Date.now()<end) {if
  page.on('response', async response=>{if(response.url().endsWith('/api/import')&&response.request().method()==='POST')imports.push(await response.json());});
  await page.goto(`http://127.0.0.1:1420/#port=${connection.port}&token=${connection.token}`);
  await page.getByRole('button',{name:'打开图集 可终止导入',exact:true}).click();
- await page.evaluate(({folder,connection})=>{window.isTauri=true;window.__TAURI_INTERNALS__={invoke:async cmd=>{if(cmd==='pick_folder')return folder;if(cmd==='connection')return connection;throw Error('Unexpected native command '+cmd);}};},{folder:path.join(output,'inbox'),connection});
- const start=async()=>{await page.getByRole('button',{name:'导入照片',exact:true}).click();await page.getByRole('button',{name:'导入文件夹',exact:true}).click();};
- await start();await until(()=>imports.length===1);
+ await page.evaluate(({folder,connection})=>{
+  window.isTauri=true;
+  window.__TAURI_INTERNALS__={
+   metadata:{currentWindow:{label:'main'}},
+   transformCallback:()=>1,
+   invoke:async cmd=>{
+    if(cmd.startsWith('plugin:window|is_'))return false;
+    if(cmd.startsWith('plugin:event|'))return 1;
+    if(cmd==='pick_folder')return folder;
+    if(cmd==='connection')return connection;
+    throw Error('Unexpected native command '+cmd);
+   }
+  };
+ },{folder:path.join(output,'inbox'),connection});
+ const start=async()=>{
+  await page.getByRole('button',{name:'导入照片',exact:true}).click();
+  await page.locator('.import-wrap .dropdown').getByRole('button',{name:'导入文件夹',exact:true}).click();
+ };
+ await page.locator('.empty-library').getByRole('button',{name:'导入文件夹',exact:true}).click();
+ await until(()=>imports.length===1);
  await until(async()=>{const job=await call('/jobs/'+imports[0].id);if(job.status==='error')throw Error(job.error);return job.done===1;});
  await page.getByRole('button',{name:'终止导入',exact:true}).waitFor();
  await page.screenshot({path:path.join(output,'01-import-running.png')});

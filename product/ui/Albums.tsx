@@ -69,6 +69,7 @@ export function Albums({
   Picture,
   busy,
   review,
+  darkroom,
   removeAlbum,
   restoreAlbum,
   purgeAlbum,
@@ -82,6 +83,7 @@ export function Albums({
   Picture: React.ComponentType<PictureProps>;
   busy: boolean;
   review: () => void;
+  darkroom?: () => void;
   removeAlbum: (album: Album) => void;
   restoreAlbum: (album: Album) => void;
   purgeAlbum: (album: Album) => Promise<void>;
@@ -182,6 +184,18 @@ export function Albums({
           {trash && <p>保留 30 天 · 只清除软件记录，保留本地原片</p>}
         </div>
         <div className="album-home-actions">
+          {!trash && darkroom && (
+            <button
+              className="album-darkroom-entry"
+              aria-label="首页胶片暗房"
+              disabled={busy}
+              onClick={darkroom}
+            >
+              <Film size={18} />
+              <span>胶片暗房</span>
+              <ArrowUpRight size={15} />
+            </button>
+          )}
           <button
             className="album-lighttable-entry"
             aria-label="首页电子观片台"
@@ -357,13 +371,15 @@ export function Albums({
           );
         })}
       </div>
-      <div className="album-home-note">
-        <Palette size={18} />
-        <span>
-          用颜色寻找共鸣
-          <small>日期、主色、冷暖、亮度与内容，可以一起筛选。</small>
-        </span>
-      </div>
+      {!trash && (
+        <div className="album-home-note">
+          <Palette size={18} />
+          <span>
+            用颜色寻找共鸣
+            <small>日期、主色、冷暖、亮度与内容，可以一起筛选。</small>
+          </span>
+        </div>
+      )}
       {menu &&
         createPortal(
           <div
@@ -488,11 +504,7 @@ export function Albums({
               />
             </label>
             {error && <p role="alert">{error}</p>}
-            <button
-              className="button primary"
-              type="submit"
-              disabled={saving}
-            >
+            <button className="button primary" type="submit" disabled={saving}>
               {saving ? "正在创建…" : "创建图集"}
               <ArrowUpRight size={16} />
             </button>

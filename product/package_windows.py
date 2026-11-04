@@ -9,12 +9,14 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from difflib import unified_diff
 import fnmatch
 import hashlib
 import importlib.metadata
 from io import BytesIO
 import json
 import os
+import platform
 import re
 from pathlib import Path
 import shutil
@@ -22,6 +24,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import tomllib
 import urllib.request
 from urllib.parse import unquote
@@ -33,9 +36,64 @@ STAGE = ROOT / 'build/runtime'
 DOWNLOADS = WORKSPACE / 'validation/downloads'
 PYTHON_URL = 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip'
 PYTHON_SHA256 = '4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3'
-RUNTIME_FILES = ['service.py', 'engine.py', 'pixels.py', 'workflow.py', 'film.py',
+RAW_RELEASE = 'RawTherapee_5.13_win64_x86_64_release'
+RAW_URL = f'https://github.com/RawTherapee/RawTherapee/releases/download/5.13/{RAW_RELEASE}.zip'
+RAW_SHA256 = 'ba29d23f3f12097c925bdab6d80e831a84ed3a88a81ce94606e4dcc796fa87ee'
+RAW_SOURCE_URL = 'https://github.com/RawTherapee/RawTherapee/archive/refs/tags/5.13.tar.gz'
+RAW_SOURCE_SHA256 = '09c7a1e1ad39cf1fe178a3a8e392fb0426e81c540106937801e54549e3567ea4'
+BASE_WHEELS = {'numpy': '2.3.5', 'pillow': '12.3.0', 'packaging': '26.3'}
+PRECISION_WHEELS = {'imagecodecs': '2026.10.10', 'pypng': '0.20220715.0', 'tifffile': '2026.10.15'}
+RECOGNITION_WHEELS = {'onnxruntime': '1.23.2', 'tokenizers': '0.22.1'}
+RUNTIME_FILES = ['service.py', 'engine.py', 'pixels.py', 'workflow.py', 'film.py', 'film_spectral.py', 'film_negative.py', 'borders.py',
                  'open_filters.py', 'open-filters-manifest.json',
                  'app.py', 'companion.cmd', 'LICENSE', 'README.md']
+SPECTRAL_PYTHON_VERSION = '3.13.13'
+SPECTRAL_PYTHON_PATHS = '.\nLib\nDLLs\nLib/site-packages\n..\\..\n'
+SPECTRAL_REVISION = '3bb2c2d2801ff68b92019cf1dbcbb133d60832bc'
+SPECTRAL_SOURCE_URL = f'https://codeload.github.com/andreavolpato/spektrafilm/legacy.tar.gz/{SPECTRAL_REVISION}'
+SPECTRAL_SOURCE_SHA256 = '0cc38b1c497047da14b153d4d5ba0cdf0a83da04cb1c1b1d113a971f624a04f9'
+SPECTRAL_WHEELS = {
+    'numpy': '2.5.4', 'scipy': '1.18.1', 'colour-science': '0.4.7', 'scikit-image': '0.26.0',
+    'matplotlib': '3.11.2', 'opt-einsum': '3.4.0', 'numba': '0.68.1', 'llvmlite': '0.50.0',
+    'pillow': '12.3.0', 'imageio': '2.38.1', 'tifffile': '2026.10.15', 'networkx': '3.7',
+    'lazy-loader': '0.6', 'packaging': '26.3', 'contourpy': '1.4.0', 'cycler': '0.12.1',
+    'fonttools': '4.68.0', 'kiwisolver': '1.5.1', 'pyparsing': '3.3.3',
+    'python-dateutil': '3.0.0', 'six': '1.17.0', 'tzdata': '2026.6',
+}
+SPECTRAL_PACKAGES = set(SPECTRAL_WHEELS) | {'spektrafilm'}
+# LUT baking uses the unmodified upstream CLI dependency closure. These are
+# builder tools only and are excluded from the staged spectral worker.
+LUT_BAKER_WHEELS = {'openimageio': '3.1.19.0', 'pyfftw': '0.15.1', 'rawpy': '0.26.1',
+                    'exiv2': '0.18.1', 'lensfunpy': '1.18.0', 'markdown': '3.11.2',
+                    'setuptools': '80.9.0', 'wheel': '0.45.1'}
+SPECTRAL_PATCH_NAME = 'spektrafilm-photo-all.patch'
+SPECTRAL_PATCHES = {
+    'utils/__init__.py': ('d5afe630ecca3efaca71f549537375433fea141d108a16dc68617b8a18f256f4', [
+        ('from spektrafilm.utils.raw_file_processor import load_and_process_raw_file',
+         'def __getattr__(name):\n'
+         "    if name == 'load_and_process_raw_file':\n"
+         '        from spektrafilm.utils.raw_file_processor import load_and_process_raw_file\n'
+         '        return load_and_process_raw_file\n'
+         '    raise AttributeError(name)'),
+    ]),
+    'utils/io.py': ('3d15ffa56cc27f3c34a0967570afb406ce08e33b237300c603e6715ae7825ef0', [
+        ('import exiv2\n', ''),
+        ('import OpenImageIO as oiio\n', ''),
+        ('    try:\n        image = exiv2.ImageFactory.open(filename)',
+         '    import exiv2\n\n    try:\n        image = exiv2.ImageFactory.open(filename)'),
+        ('    image_input = oiio.ImageInput.open(filename)',
+         '    import exiv2\n    import OpenImageIO as oiio\n\n    image_input = oiio.ImageInput.open(filename)'),
+        ('def load_image_oiio(filename):\n', 'def load_image_oiio(filename):\n    import OpenImageIO as oiio\n\n'),
+        ('    # Extract image dimensions and number of channels',
+         '    import OpenImageIO as oiio\n\n    # Extract image dimensions and number of channels'),
+    ]),
+    'utils/fft_gaussian_filter.py': ('ac3e96ad0923c30bfe71129e208f51d61059288a0ba55b9f2b15e1a249001ecc', [
+        ('import pyfftw.interfaces.numpy_fft as fft  # use pyFFTW FFT routines', 'from scipy import fft'),
+        ('    Uses pyFFTW for FFT operations.', '    Uses SciPy for FFT operations.'),
+        (", planner_effort='FFTW_MEASURE'", ''),
+        ('(pyFFTW)', '(SciPy FFT)'),
+    ]),
+}
 
 # Exact binary ownership is confirmed by SHA-256, never inferred from the name
 # alone. Full source packages retain upstream tarballs, patches and PKGBUILD.
@@ -81,14 +139,148 @@ RAW_PACKAGES = {
 }
 
 
-def fetch(url, path):
+def fetch(url, path, expected=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.is_file():
-        temporary = path.with_suffix(path.suffix + '.partial')
-        urllib.request.urlretrieve(url, temporary)
-        temporary.replace(path)
-    return path
+    if path.is_file():
+        if expected and sha256(path) != expected:
+            raise RuntimeError('SHA-256 mismatch: ' + str(path))
+        return path
+    temporary = path.with_suffix(path.suffix + '.partial')
+    for attempt in range(3):
+        try:
+            request = urllib.request.Request(url, headers={'User-Agent': 'Photo-All-Windows-builder/1.0'})
+            with urllib.request.urlopen(request, timeout=120) as response, temporary.open('wb') as stream:
+                shutil.copyfileobj(response, stream, length=1024 * 1024)
+            if expected and sha256(temporary) != expected:
+                raise RuntimeError('SHA-256 mismatch: ' + url)
+            temporary.replace(path)
+            return path
+        except OSError:
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def spectral_source_archive():
+    return fetch(SPECTRAL_SOURCE_URL, DOWNLOADS / f'spektrafilm-{SPECTRAL_REVISION}.tar.gz',
+                 SPECTRAL_SOURCE_SHA256)
+
+
+def visual_cpp_runtime():
+    override = os.environ.get('VCToolsRedistDir')
+    if override:
+        base = Path(override)
+        for candidate in (base / 'x64/Microsoft.VC143.CRT', base):
+            if (candidate / 'msvcp140.dll').is_file():
+                return candidate
+        raise RuntimeError('VCToolsRedistDir does not contain the x64 Visual C++ runtime')
+
+    program_files = Path(os.environ.get('ProgramFiles(x86)', 'C:/Program Files (x86)'))
+    vswhere = program_files / 'Microsoft Visual Studio/Installer/vswhere.exe'
+    if vswhere.is_file():
+        result = subprocess.run([str(vswhere), '-products', '*', '-utf8', '-property', 'installationPath'],
+                                capture_output=True, encoding='utf-8', check=True)
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+            redist = Path(line.strip()) / 'VC/Redist/MSVC'
+            candidates = sorted(redist.glob('*/x64/Microsoft.VC143.CRT'),
+                                key=lambda path: tuple(int(part) for part in path.parents[1].name.split('.')),
+                                reverse=True)
+            for candidate in candidates:
+                if (candidate / 'msvcp140.dll').is_file():
+                    return candidate
+    raise RuntimeError('Install the x64 Visual C++ redistributable component or set VCToolsRedistDir')
+
+
+def package_versions(directory):
+    return {dist.metadata['Name'].lower().replace('_', '-'): dist.version
+            for dist in importlib.metadata.distributions(path=[str(directory)])}
+
+
+def install_wheels(destination, pins):
+    if package_versions(destination) == pins:
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.resolve().parent != (ROOT / 'engines').resolve():
+        raise RuntimeError('Invalid builder package directory: ' + str(destination))
+    with tempfile.TemporaryDirectory(prefix='wheels-', dir=destination.parent) as directory:
+        target = Path(directory) / 'packages'
+        requirements = [f'{name}=={version}' for name, version in pins.items()]
+        subprocess.run([sys.executable, '-m', 'pip', 'install', '--only-binary=:all:', '--no-deps',
+                        '--target', str(target), *requirements], check=True)
+        if package_versions(target) != pins:
+            raise RuntimeError('Builder wheel versions did not match the requested pins')
+        if destination.exists():
+            shutil.rmtree(destination)
+        target.replace(destination)
+
+
+def prepare_builder():
+    """Prepare public, pinned inputs on a clean Windows x64 runner."""
+    if sys.platform != 'win32' or sys.version_info[:2] != (3, 12) or platform.machine().upper() != 'AMD64':
+        raise RuntimeError('Run prepare with 64-bit Windows CPython 3.12')
+    uv = shutil.which('uv')
+    if not uv:
+        raise RuntimeError('Install uv and make it available on PATH before running prepare')
+    visual_cpp_runtime()
+    verify_border_assets(ROOT)
+
+    engines = ROOT / 'engines'
+    builder_site = engines / 'builder-site-packages'
+    install_wheels(builder_site, BASE_WHEELS)
+    install_wheels(engines / 'precision-packages', PRECISION_WHEELS)
+    install_wheels(engines / 'recognition-runtime', RECOGNITION_WHEELS)
+
+    fetch(PYTHON_URL, DOWNLOADS / PYTHON_URL.rsplit('/', 1)[1], PYTHON_SHA256)
+    archive = fetch(RAW_URL, DOWNLOADS / f'{RAW_RELEASE}.zip', RAW_SHA256)
+    raw = engines / 'RawTherapee-5.13'
+    if not (raw / RAW_RELEASE / 'rawtherapee-cli.exe').is_file():
+        with zipfile.ZipFile(archive) as source:
+            source.extractall(raw)
+    fetch(RAW_SOURCE_URL, DOWNLOADS / 'RawTherapee-5.13-source.tar.gz', RAW_SOURCE_SHA256)
+
+    from setup_recognition import ASSETS, REVISION
+    model = engines / 'clip-vit-base-patch32'
+    for name, digest in ASSETS.items():
+        fetch(f'https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/{REVISION}/{name}',
+              model / name, digest)
+    fetch('https://raw.githubusercontent.com/openai/CLIP/main/LICENSE', model / 'LICENSE',
+          '987e63b32f6c89ff5160e429458a872ff048e6860b590a3912e938f9da8f14db')
+    (model / 'revision.txt').write_text(REVISION, encoding='utf-8')
+
+    source_archive = spectral_source_archive()
+    source_parent = engines / 'spektrafilm-source'
+    source = source_parent / f'andreavolpato-spektrafilm-{SPECTRAL_REVISION[:7]}'
+    if not (source / 'pyproject.toml').is_file():
+        with tarfile.open(source_archive) as bundle:
+            bundle.extractall(source_parent, filter='data')
+    environment = {**os.environ, 'UV_CACHE_DIR': str(engines / 'uv-cache'),
+                   'UV_PYTHON_INSTALL_DIR': str(engines / 'python')}
+    venv = engines / 'film-runtime'
+    python = venv / 'Scripts/python.exe'
+    if not python.is_file():
+        subprocess.run([uv, 'venv', str(venv), '--python', SPECTRAL_PYTHON_VERSION,
+                        '--managed-python'], env=environment, check=True)
+    packages = venv / 'Lib/site-packages'
+    spectral_pins = SPECTRAL_WHEELS | LUT_BAKER_WHEELS
+    installed = package_versions(packages)
+    missing = [f'{name}=={version}' for name, version in spectral_pins.items() if installed.get(name) != version]
+    if missing:
+        subprocess.run([uv, 'pip', 'install', '--python', str(python), '--no-deps',
+                        '--only-binary', ':all:', *missing], env=environment, check=True)
+    if installed.get('spektrafilm') != '0.3.4':
+        subprocess.run([uv, 'pip', 'install', '--python', str(python), '--no-deps',
+                        '--no-build-isolation', str(source)], env=environment, check=True)
+    subprocess.run([str(python), str(ROOT / 'film.py'), '--bake'],
+                   env={**environment, 'MPLBACKEND': 'Agg', 'OPENBLAS_NUM_THREADS': '2'}, check=True)
+    subprocess.run([sys.executable, str(ROOT / 'film.py'), '--setup-filters'],
+                   env={**os.environ, 'PYTHONPATH': str(builder_site)}, check=True)
+    verify_open_filters(ROOT)
+    print('Builder dependencies ready. Run package_windows.py all to generate sources, stage, and build.', flush=True)
 
 
 def corresponding_sources():
@@ -100,7 +292,7 @@ def corresponding_sources():
                re.findall(r'<a href="([^"]+)".*?</a\s*>\s+(\d{2}-\w{3}-\d{4} \d{2}:\d{2})', binary_index, re.S)
                if name.endswith('.pkg.tar.zst')]
     cutoff = datetime(2026, 7, 25, 23, 59)
-    raw = ROOT / 'engines/RawTherapee-5.13/RawTherapee_5.13_win64_x86_64_release'
+    raw = ROOT / 'engines/RawTherapee-5.13' / RAW_RELEASE
     libraries = [p for p in raw.rglob('*') if p.is_file() and p.suffix.lower() in {'.dll', '.exe'}
                  and p.name not in {'rawtherapee.exe', 'rawtherapee-cli.exe'}]
     assigned = set()
@@ -118,7 +310,7 @@ def corresponding_sources():
     jobs.append(('adwaita-icon-theme', icons))
     # Read binary package contents without writing files or following archive
     # paths onto the host filesystem. Large source archives use streaming bsdtar.
-    sys.path.insert(0, str(ROOT / 'engines/precision-packages'))
+    sys.path[:0] = [str(ROOT / 'engines/precision-packages'), str(ROOT / 'engines/builder-site-packages')]
     import imagecodecs
 
     def prepare(job):
@@ -214,9 +406,9 @@ def corresponding_sources():
         'rawtherapee_commit': '1924179107995b01b73cdc7f4fe91e44fc8227a7',
         'dlls_verified': len(libraries), 'packages': results}, indent=2), encoding='utf-8')
     (output / 'manifest.partial.json').unlink(missing_ok=True)
-    copy(fetch('https://github.com/RawTherapee/RawTherapee/archive/refs/tags/5.13.tar.gz',
-               DOWNLOADS / 'RawTherapee-5.13-source.tar.gz'), output / 'RawTherapee-5.13-source.tar.gz')
-    copy(DOWNLOADS / 'spektrafilm-3bb2c2d2801ff68b92019cf1dbcbb133d60832bc.tar.gz', output / 'spektrafilm-source.tar.gz')
+    copy(fetch(RAW_SOURCE_URL, DOWNLOADS / 'RawTherapee-5.13-source.tar.gz', RAW_SOURCE_SHA256),
+         output / 'RawTherapee-5.13-source.tar.gz')
+    copy(spectral_source_archive(), output / 'spektrafilm-source.tar.gz')
     (output / 'README.txt').write_text('Corresponding third-party source for the unmodified RawTherapee 5.13 Windows x64 distribution.\n'
         'manifest.json maps every redistributed DLL/helper EXE to a byte-for-byte verified MSYS2 binary package, '
         'its complete source package and PKGBUILD hash. provenance contains package license metadata and build environment.\n'
@@ -259,6 +451,22 @@ def verify_open_filters(base):
         asset = assets / (identity + '.npy')
         if not asset.is_file() or sha256(asset) != entry['sha256']:
             raise RuntimeError('Open-filter asset is missing or has changed: ' + identity)
+    return data
+
+
+def verify_border_assets(base):
+    """Require pinned originals and their MIT notices in every distribution."""
+    assets = Path(base) / 'engines/film-borders'
+    data = json.loads((assets / 'SOURCES.json').read_text(encoding='utf-8'))
+    if len(data.get('sources', [])) != 2:
+        raise RuntimeError('Film-border source manifest is incomplete')
+    for source in data['sources']:
+        asset = assets / source['asset']
+        if not asset.is_file() or sha256(asset) != source['sha256']:
+            raise RuntimeError('Film-border original is missing or changed: ' + source['asset'])
+    for name in ['LICENSE-romnn-MIT.txt', 'LICENSE-NegativeConverter-MIT.txt']:
+        if not (assets / name).is_file():
+            raise RuntimeError('Film-border MIT notice is missing: ' + name)
     return data
 
 
@@ -330,14 +538,91 @@ def copy(source, destination):
         shutil.copy2(source, destination)
 
 
+def patch_spectral_sources(destination, packages):
+    """Apply and record the headless adaptations against pinned upstream bytes."""
+    patch = []
+    files = {}
+    for relative, (expected, replacements) in SPECTRAL_PATCHES.items():
+        source_name = 'spektrafilm/' + relative
+        path = packages / source_name
+        original = path.read_bytes()
+        if hashlib.sha256(original).hexdigest() != expected:
+            raise RuntimeError('Unexpected upstream Spektrafilm source: ' + source_name)
+        before = after = original.decode('utf-8')
+        for old, new in replacements:
+            if old not in after:
+                raise RuntimeError('Unmatched Spektrafilm adaptation: ' + source_name)
+            after = after.replace(old, new)
+        result = after.encode('utf-8')
+        path.write_bytes(result)
+        files[source_name] = {'upstream_sha256': expected, 'staged_sha256': sha256(path)}
+        for line in unified_diff(before.splitlines(keepends=True), after.splitlines(keepends=True),
+                                 fromfile=f'a/src/{source_name}', tofile=f'b/src/{source_name}'):
+            patch.append(line if line.endswith('\n') else line + '\n\\ No newline at end of file\n')
+    patch_path = destination / SPECTRAL_PATCH_NAME
+    patch_path.write_bytes(''.join(patch).encode('utf-8'))
+    return {'upstream_revision': SPECTRAL_REVISION, 'file': patch_path.name,
+            'sha256': sha256(patch_path), 'files': files}
+
+
+def stage_spectral_runtime(destination, crt):
+    """Stage the optional, isolated CPython and headless Spektrafilm runtime."""
+    engines = ROOT / 'engines'
+    source = engines / 'film-runtime/Lib/site-packages'
+    if not source.is_dir():
+        return None
+    base = engines / 'python' / f'cpython-{SPECTRAL_PYTHON_VERSION}-windows-x86_64-none'
+    if not (base / 'python.exe').is_file():
+        raise RuntimeError(f'Local CPython {SPECTRAL_PYTHON_VERSION} x64 is required for the spectral runtime')
+    distributions = {dist.metadata['Name'].lower().replace('_', '-'): dist
+                     for dist in importlib.metadata.distributions(path=[str(source)])}
+    missing = SPECTRAL_PACKAGES - distributions.keys()
+    if missing:
+        raise RuntimeError('Spectral runtime packages are missing: ' + ', '.join(sorted(missing)))
+    if distributions['spektrafilm'].version != '0.3.4':
+        raise RuntimeError('The spectral runtime requires Spektrafilm 0.3.4')
+
+    destination = Path(destination)
+    for name in ['python.exe', 'python3.dll', 'python313.dll', 'LICENSE.txt']:
+        copy(base / name, destination / name)
+    for library in sorted(Path(crt).glob('*.dll')):
+        copy(library, destination / library.name)
+    for library in sorted(base.glob('vcruntime*.dll')):
+        if not (destination / library.name).is_file():
+            copy(library, destination / library.name)
+    for item in (base / 'DLLs').iterdir():
+        if item.name.startswith('_test') or item.name in {'_ctypes_test.pyd', '_tkinter.pyd', 'tcl86t.dll', 'tk86t.dll'}:
+            continue
+        copy(item, destination / 'DLLs' / item.name)
+    for item in (base / 'Lib').iterdir():
+        if item.name in {'__pycache__', 'ensurepip', 'idlelib', 'site-packages', 'test', 'tkinter', 'turtledemo', 'venv'}:
+            continue
+        copy(item, destination / 'Lib' / item.name)
+    # Isolate the worker while allowing it to import Photo All modules from runtime/.
+    (destination / 'python313._pth').write_text(SPECTRAL_PYTHON_PATHS, encoding='utf-8')
+
+    packages = destination / 'Lib/site-packages'
+    for name in sorted(SPECTRAL_PACKAGES):
+        dist = distributions[name]
+        if not dist.files:
+            raise RuntimeError('Spectral runtime package has no file inventory: ' + name)
+        for item in dist.files:
+            relative = Path(str(item))
+            if (relative.is_absolute() or relative.drive
+                    or {'..', '__pycache__', 'tests', 'test'}.intersection(relative.parts)
+                    or relative.suffix in {'.pyc', '.nbc', '.nbi', '.whl'}
+                    or relative.parts[0] in {'spektrafilm_gui', 'spektrafilm_lut_creator'}
+                    or relative.name in {'direct_url.json', 'uv_cache.json', 'uv_build.json'}):
+                continue
+            copy(source / relative, packages / relative)
+    return {'python': SPECTRAL_PYTHON_VERSION, 'source_patch': patch_spectral_sources(destination, packages),
+            'packages': {name: distributions[name].version for name in sorted(SPECTRAL_PACKAGES)}}
+
+
 def stage():
     verify_open_filters(ROOT)
-    DOWNLOADS.mkdir(parents=True, exist_ok=True)
-    archive = DOWNLOADS / PYTHON_URL.rsplit('/', 1)[1]
-    if not archive.is_file():
-        urllib.request.urlretrieve(PYTHON_URL, archive)
-    if sha256(archive) != PYTHON_SHA256:
-        raise RuntimeError('Official Python runtime checksum mismatch')
+    verify_border_assets(ROOT)
+    archive = fetch(PYTHON_URL, DOWNLOADS / PYTHON_URL.rsplit('/', 1)[1], PYTHON_SHA256)
     # Never delete a computed directory outside the known staging parent.
     assert STAGE.resolve().parent == (ROOT / 'build').resolve()
     if STAGE.exists():
@@ -348,7 +633,8 @@ def stage():
         source.extractall(python)
     (python / 'python312._pth').write_text('python312.zip\n.\nLib\nLib/site-packages\n..\n', encoding='utf-8')
     packages = python / 'Lib/site-packages'
-    site = Path(importlib.metadata.distribution('numpy').locate_file(''))
+    prepared_site = ROOT / 'engines/builder-site-packages'
+    site = prepared_site if package_versions(prepared_site) == BASE_WHEELS else Path(importlib.metadata.distribution('numpy').locate_file(''))
     for pattern in ['numpy', 'numpy.libs', 'numpy-*.dist-info', 'PIL', 'pillow-*.dist-info',
                     'pillow.libs', 'packaging', 'packaging-*.dist-info']:
         for source in site.glob(pattern):
@@ -372,22 +658,25 @@ def stage():
     copy(base / 'tcl', python / 'tcl')
     copy(base / 'LICENSE.txt', STAGE / 'licenses/CPython-builder-addons.txt')
     # app-local VC runtime avoids requiring a machine-wide VC redistributable.
-    redist = Path(os.environ.get('VCToolsRedistDir', 'C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Redist/MSVC/14.44.35112'))
-    crt = redist / 'x64/Microsoft.VC143.CRT'
+    crt = visual_cpp_runtime()
     for item in crt.glob('*.dll'):
         copy(item, python / item.name)
     if not (python / 'msvcp140.dll').is_file():
         raise RuntimeError('Microsoft.VC143.CRT redistributable DLL directory is required (VCToolsRedistDir)')
     for name in RUNTIME_FILES:
         copy(ROOT / name, STAGE / name)
-    for name in ['RawTherapee-5.13', 'clip-vit-base-patch32', 'film-luts', 'open-filters']:
+    for name in ['RawTherapee-5.13', 'clip-vit-base-patch32', 'film-luts', 'open-filters', 'film-borders']:
         copy(ROOT / 'engines' / name, STAGE / 'engines' / name)
+    spectral = stage_spectral_runtime(STAGE / 'engines/spectral-python', crt)
     verify_open_filters(STAGE)
+    verify_border_assets(STAGE)
     copy(ROOT / 'WINDOWS_DISTRIBUTION.md', STAGE / 'THIRD_PARTY_NOTICES.md')
     if (ROOT / 'build/third-party-sources/LICENSES.txt').is_file():
         copy(ROOT / 'build/third-party-sources/LICENSES.txt', STAGE / 'licenses/RawTherapee-dependencies.txt')
     dependency_notices()
-    spektra = next((ROOT / 'engines/spektrafilm-source').iterdir())
+    spektra = next((p.parent for p in (ROOT / 'engines/spektrafilm-source').glob('*/pyproject.toml')), None)
+    if spektra is None:
+        raise RuntimeError('Spektrafilm source is missing; run prepare first')
     for item in spektra.glob('*LICENSE*'):
         copy(item, STAGE / 'licenses/spektrafilm' / item.name)
     # Keep package metadata/license trees: a binary distribution without its
@@ -396,12 +685,14 @@ def stage():
                 'packages': {d.metadata['Name']: d.version for d in importlib.metadata.distributions(path=[str(packages)])},
                 'files': {str(p.relative_to(STAGE)).replace('\\', '/'): sha256(p)
                           for p in sorted(STAGE.rglob('*')) if p.is_file()}}
+    if spectral:
+        manifest['spectral_python'] = spectral
     (STAGE / 'runtime-manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     size = sum(p.stat().st_size for p in STAGE.rglob('*') if p.is_file())
     print(json.dumps({'runtime': str(STAGE), 'bytes': size, 'packages': manifest['packages']}, indent=2), flush=True)
 
 
-def build():
+def build(output=None):
     target = Path(os.environ.get('CARGO_TARGET_DIR', str(ROOT / 'src-tauri/target')))
     if not target.is_absolute():
         target = (ROOT / target).resolve()
@@ -411,6 +702,11 @@ def build():
         raise RuntimeError('Corresponding source and notices are required; run sources, then stage')
     verify_open_filters(ROOT)
     verify_open_filters(STAGE)
+    verify_border_assets(ROOT)
+    verify_border_assets(STAGE)
+    for name in ['SOURCES.json', 'LICENSE-romnn-MIT.txt', 'LICENSE-NegativeConverter-MIT.txt']:
+        if sha256(ROOT / 'engines/film-borders' / name) != sha256(STAGE / 'engines/film-borders' / name):
+            raise RuntimeError('Staged film-border notices are outdated: ' + name)
     filter_source = ROOT / 'dist/Photo-All-open-filter-sources.zip'
     if not filter_source.is_file():
         raise RuntimeError('Open-filter corresponding source is required; run filter-sources')
@@ -429,8 +725,8 @@ def build():
     subprocess.run([node, str(ROOT / 'node_modules/@tauri-apps/cli/tauri.js'), 'build', '--bundles', 'nsis'],
                    cwd=ROOT, check=True)
     version = json.loads((ROOT / 'package.json').read_text(encoding='utf-8'))['version']
-    output = ROOT / 'dist'
-    output.mkdir(exist_ok=True)
+    output = Path(output).resolve() if output is not None else ROOT / 'dist'
+    output.mkdir(parents=True, exist_ok=True)
     # Build independently of any portable folder the user currently has open.
     # Never delete or overwrite a running installation to assemble its update.
     with tempfile.TemporaryDirectory(prefix='portable-', dir=ROOT / 'build') as temporary:
@@ -440,17 +736,26 @@ def build():
         copy(STAGE, portable / 'runtime')
         copy(ROOT / 'WINDOWS_DISTRIBUTION.md', portable / 'README.txt')
         shutil.make_archive(str(output / f'Photo-All-Studio_{version}_windows-x64'), 'zip', root_dir=portable)
-    for installer in (target / 'release/bundle/nsis').glob('*-setup.exe'):
+    installers = sorted((target / 'release/bundle/nsis').glob(f'*_{version}_*-setup.exe'))
+    if not installers:
+        raise RuntimeError(f'NSIS installer for {version} was not produced')
+    for installer in installers:
         copy(installer, output / installer.name)
-    files = [p for p in output.iterdir() if p.is_file() and p.suffix in {'.zip', '.exe'}]
+    spectral_patch = STAGE / 'engines/spectral-python' / SPECTRAL_PATCH_NAME
+    if spectral_patch.is_file():
+        copy(spectral_patch, output / SPECTRAL_PATCH_NAME)
+    files = [p for p in output.iterdir() if p.is_file() and p.suffix in {'.zip', '.exe', '.patch'}]
     (output / 'SHA256SUMS.txt').write_text(''.join(f'{sha256(p)}  {p.name}\n' for p in sorted(files)), encoding='utf-8')
     print(json.dumps({'artifacts': [{'path': str(p), 'bytes': p.stat().st_size, 'sha256': sha256(p)} for p in files]}, indent=2))
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['stage', 'build', 'all', 'sources', 'filter-sources'])
+    parser.add_argument('action', choices=['prepare', 'stage', 'build', 'all', 'sources', 'filter-sources'])
+    parser.add_argument('--output', type=Path, help='Write build artifacts to this directory instead of dist')
     options = parser.parse_args()
+    if options.action == 'prepare':
+        prepare_builder()
     if options.action in {'sources', 'all'}:
         corresponding_sources()
     if options.action in {'filter-sources', 'all'}:
@@ -458,4 +763,4 @@ if __name__ == '__main__':
     if options.action in {'stage', 'all'}:
         stage()
     if options.action in {'build', 'all'}:
-        build()
+        build(options.output)

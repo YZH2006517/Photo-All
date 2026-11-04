@@ -118,7 +118,7 @@ def _normalize(array):
     raise ValueError('不支持此像素数据范围；请先转换为 SDR 无符号整数或 0–1 浮点 TIFF')
 
 
-def read(path, preserve_alpha=False):
+def read(path, preserve_alpha=False, *, resize_target=None):
     """Decode to oriented, straight-alpha float32 sRGB RGB/RGBA in [0, 1]."""
     path = Path(path)
     suffix = path.suffix.lower()
@@ -169,6 +169,23 @@ def read(path, preserve_alpha=False):
             icc, orientation = source.info.get('icc_profile'), source.getexif().get(274, 1)
             grayscale = source.mode in {'L', 'LA', '1'}
             has_alpha = source.mode in {'RGBA', 'LA'} or 'transparency' in source.info
+            if source.format == 'JPEG' and resize_target and not icc and not has_alpha:
+                width, height = source.size
+                if orientation in {5, 6, 7, 8}:
+                    width, height = height, width
+                target = resize_target(width, height)
+                if target != (width, height):
+                    rgb = _orient(np.asarray(source if source.mode == 'RGB' else source.convert('RGB')), orientation)
+                    result = np.empty((target[1], target[0], 3), np.float32)
+                    # Use the same oriented float32 Lanczos samples as resize(),
+                    # with only one full-size float channel in memory at a time.
+                    plane = np.empty(rgb.shape[:2], np.float32)
+                    for channel in range(3):
+                        np.copyto(plane, rgb[..., channel])
+                        plane /= np.float32(255)
+                        result[..., channel] = _resize_plane(plane, target)
+                    np.clip(result, 0, 1, out=result)
+                    return result
             array = np.asarray(source.convert('RGBA' if has_alpha else 'RGB'), dtype=np.float32) / np.float32(255)
     if grayscale and array.shape[-1] <= 2:
         channels = [array[..., :1]]*3
@@ -180,11 +197,19 @@ def read(path, preserve_alpha=False):
         rgb = array[..., :3].copy()
         rgb *= array[..., 3:]
         rgb += 1-array[..., 3:]
-        return rgb
+        array = rgb
+    if resize_target:
+        size = resize_target(array.shape[1], array.shape[0])
+        if size != (array.shape[1], array.shape[0]):
+            return resize(array, size)
     return array
 
 
 decode = read
+
+
+def _resize_plane(plane, size):
+    return np.asarray(Image.fromarray(np.ascontiguousarray(plane)).resize(size, Image.Resampling.LANCZOS))
 
 
 def resize(array, size):
@@ -197,8 +222,7 @@ def resize(array, size):
     for channel in range(channels):
         plane = array[..., channel]
         if channels == 4 and channel < 3: plane = plane * array[..., 3]
-        result[..., channel] = np.asarray(Image.fromarray(np.ascontiguousarray(plane)).resize(
-            (width, height), Image.Resampling.LANCZOS))
+        result[..., channel] = _resize_plane(plane, (width, height))
     if channels == 4:
         np.divide(result[..., :3], result[..., 3:], out=result[..., :3], where=result[..., 3:] > 1e-8)
         result[..., :3][np.repeat(result[..., 3:] <= 1e-8, 3, axis=-1)] = 0
@@ -526,7 +550,13 @@ def render(path, recipe, max_size=None, preserve_alpha=False):
     """Decode/develop then grade in float32; never writes the original file."""
     import engine
     import film
+    import film_spectral
     recipe = engine.validate_recipe(recipe)
+    advanced = json.loads(recipe['film_advanced'] or '{}')
+    negative_input = advanced.get('process') == 'negative'
+    scale = film_spectral.enlargement(recipe) if negative_input or recipe['film_strength'] else 1
+    if scale > 1 and max_size:
+        max_size = tuple(max(1, value//scale) for value in max_size)
     if Path(path).suffix.lower() in engine.RAW:
         # A cropped view needs enough native samples inside the crop. Asking
         # the decoder for the final display size before cropping would blur it.
@@ -534,13 +564,17 @@ def render(path, recipe, max_size=None, preserve_alpha=False):
         decode_size=tuple(int(np.ceil(value/minimum_crop)) for value in max_size) if max_size else None
         path = engine.develop_raw(path, recipe, preview_size=decode_size, output_16bit=True)
     # Geometry must filter the original transparency before the final flatten.
-    array = read(path, preserve_alpha=True)
-    if max_size:
-        output_width,output_height=engine.render_dimensions({'width':array.shape[1],'height':array.shape[0],'recipe':recipe})
+    def target(width, height):
+        output_width,output_height=engine.render_dimensions({'width':width,'height':height,'recipe':recipe})
         factor = min(1, max_size[0]/output_width, max_size[1]/output_height)
-        if factor < 1: array = resize(array, (max(1, round(array.shape[1]*factor)), max(1, round(array.shape[0]*factor))))
+        if scale > 1:
+            factor = min(factor, math.sqrt(.99*film_spectral.MAX_ENLARGED_PIXELS/(width*height))/scale)
+        return max(1, round(width*factor)), max(1, round(height*factor))
+    array = read(path, preserve_alpha=True, resize_target=target if max_size else None)
     alpha = array[..., 3:].copy() if array.shape[-1] == 4 else None
     rgb = np.ascontiguousarray(array[..., :3])
+    if negative_input:
+        rgb = film_spectral.render(rgb, recipe, film.STOCKS)
     style = recipe['style']
     exposure, contrast, saturation = recipe['exposure'], recipe['contrast'], recipe['saturation']
     temperature = recipe['temperature'] + {'warm': .18, 'cool': -.15, 'film': .08}.get(style, 0)
@@ -573,7 +607,15 @@ def render(path, recipe, max_size=None, preserve_alpha=False):
         creative = film.creative_lut(style)
         rgb = apply_lut(rgb, np.asarray(creative.table, np.float32).reshape(17, 17, 17, 3))
     stock, strength = recipe['film_stock'], recipe['film_strength']
-    if stock != 'none' and strength:
+    if advanced and not negative_input and strength:
+        graded = film_spectral.render(rgb, recipe, film.STOCKS)
+        if strength != 1:
+            if scale > 1:
+                rgb = resize(rgb, (graded.shape[1], graded.shape[0]))
+            for start in range(0, rgb.shape[0], 64):
+                graded[start:start+64] = rgb[start:start+64]+(graded[start:start+64]-rgb[start:start+64])*np.float32(strength)
+        rgb = graded
+    elif not advanced and stock != 'none' and strength:
         if not film.stock_ready(stock): raise ValueError('胶片资源未就绪，请运行 python film.py --setup')
         table = _stock_table(stock, (film.LUTS/(stock+'.npy')).stat().st_mtime_ns)
         graded = apply_lut(rgb, table)
@@ -609,6 +651,8 @@ def render(path, recipe, max_size=None, preserve_alpha=False):
     _editor_details(rgb, recipe)
     _local_adjustments(rgb, json.loads(recipe['local_adjustments']))
     _retouch(rgb, json.loads(recipe['retouch']))
+    if alpha is not None and alpha.shape[:2] != rgb.shape[:2]:
+        alpha = resize(alpha, (rgb.shape[1], rgb.shape[0]))
     result = _geometry(np.concatenate([rgb, alpha], axis=-1) if alpha is not None else rgb, recipe)
     if result.shape[-1] == 4 and not preserve_alpha:
         return result[..., :3]*result[..., 3:]+1-result[..., 3:]

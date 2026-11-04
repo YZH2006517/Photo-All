@@ -209,6 +209,7 @@ export function FilmTable({
   const world = useRef<HTMLDivElement>(null);
   const flights = useRef<Animation[]>([]),
     playback = useRef<Animation | null>(null);
+  const spreadingIds = useRef<Set<number> | null>(null);
   const entered = useRef(false),
     motionCallbacks = useRef({ onIntroComplete, onMotionChange });
   const lastSelection = useRef({ currentId, reveal, active });
@@ -238,8 +239,8 @@ export function FilmTable({
       sy: number;
     };
   } | null>(null);
-  const desk = useRef({ positions, view, brightness, scales, placed });
-  desk.current = { positions, view, brightness, scales, placed };
+  const desk = useRef({ positions, view, brightness, scales, placed, motion });
+  desk.current = { positions, view, brightness, scales, placed, motion };
   // Snapshot the composited position before cancel, so pausing never jumps.
   const pausePlayback = (paused = true) => {
     const animation = playback.current;
@@ -268,7 +269,10 @@ export function FilmTable({
   const stopMotion = () => {
     pausePlayback();
     cancelFlight();
-    if (motion !== "idle" && motion !== "stowed") setMotion("idle");
+    if (motion === "stowing") {
+      setPlaced([]);
+      setMotion("stowed");
+    } else if (motion !== "idle" && motion !== "stowed") setMotion("idle");
   };
   const autoLayout = useRef(
     initial?.auto ?? !Object.keys(initial?.frames || {}).length,
@@ -342,6 +346,16 @@ export function FilmTable({
   );
   const visibleFrames = frames.filter(
     (frame) => roll || placedSet === null || placedSet.has(frame.id),
+  );
+  const flying = motion === "entering" || motion === "stowing";
+  const canStow = !roll && !flying && visibleFrames.length > 0;
+  const canSpread = roll || (
+    !flying && base.length > 0 && (
+      visibleFrames.length < frames.length ||
+      !autoLayout.current ||
+      Object.keys(positions).length > 0 ||
+      Object.keys(scales).length > 0
+    )
   );
   const overStowZone = (x: number, y: number) => {
     const rect = footer?.getBoundingClientRect();
@@ -491,7 +505,7 @@ export function FilmTable({
       view: desk.current.view,
       brightness: desk.current.brightness,
       scales: desk.current.scales,
-      placed: desk.current.placed ?? undefined,
+      placed: desk.current.motion === "stowing" ? [] : desk.current.placed ?? undefined,
     });
   const fit = (arranged: FilmTableFrame[] = visibleFrames) => {
     if (!arranged.length) return;
@@ -530,6 +544,10 @@ export function FilmTable({
     });
   };
   const spread = () => {
+    if (!canSpread) return;
+    const shelved = new Set(
+      frames.filter((frame) => placedSet && !placedSet.has(frame.id)).map((frame) => frame.id),
+    );
     pausePlayback();
     cancelFlight();
     cancelReturns();
@@ -539,16 +557,18 @@ export function FilmTable({
     setPositions({});
     setScales({});
     fit(base);
-    setMotion(roll ? "idle" : "entering");
+    spreadingIds.current = shelved;
+    setMotion(!roll && shelved.size ? "entering" : "idle");
   };
-  // Opening waits for visible source pixels, with a bounded fallback for slow disks.
+  // Start the intro as soon as a visible frame has pixels, including a cached thumbnail.
   useEffect(() => {
     if (!active || roll || motion !== "waiting" || entered.current) return;
-    const start = performance.now();
-    const ready = () => {
-      if (!fitted.current) return;
+    const node = world.current;
+    const entranceDelay = reducedMotion() ? 0 : 260;
+    let entranceReady = !entranceDelay;
+    const ready = (allowEmpty = false) => {
+      if (entered.current || !fitted.current || !entranceReady) return;
       // Let the existing modal entrance finish before launching individual frames.
-      if (!reducedMotion() && performance.now() - start < 260) return;
       const nodes = [
         ...(world.current?.querySelectorAll<HTMLElement>(
           '.lt-contact-frame:not([data-shelved="true"])',
@@ -563,24 +583,32 @@ export function FilmTable({
           r.top < size.height
         );
       });
-      if (
-        performance.now() - start < 4000 &&
-        (!visible.length ||
-          visible.some((n) => n.querySelector(".picture.loading")))
-      )
-        return;
+      if (!allowEmpty && !visible.some((frame) => {
+        const image = frame.querySelector<HTMLImageElement>(".picture img");
+        return image?.complete && image.naturalWidth > 0;
+      })) return;
       entered.current = true;
+      spreadingIds.current = null;
       motionCallbacks.current.onIntroComplete?.();
       setMotion("entering");
     };
-    const timer = setInterval(ready, 80);
-    ready();
-    return () => clearInterval(timer);
+    const onImage = () => ready();
+    node?.addEventListener("load", onImage, true);
+    const entrance = setTimeout(() => {
+      entranceReady = true;
+      ready();
+    }, entranceDelay);
+    const deadline = setTimeout(() => ready(true), 4000);
+    return () => {
+      node?.removeEventListener("load", onImage, true);
+      clearTimeout(entrance);
+      clearTimeout(deadline);
+    };
   }, [active, roll, motion, size.width, size.height]);
   useEffect(() => {
     motionCallbacks.current.onMotionChange?.(
       active &&
-        (motion !== "idle" || draggedId !== null || returning.length > 0),
+        (motion === "waiting" || flying || draggedId !== null || returning.length > 0),
     );
     return () => motionCallbacks.current.onMotionChange?.(false);
   }, [motion, active, draggedId, returning.length]);
@@ -637,7 +665,9 @@ export function FilmTable({
       ...(world.current?.querySelectorAll<HTMLElement>(
         '.lt-contact-frame:not([data-shelved="true"])',
       ) || []),
-    ];
+    ].filter((node) =>
+      stow || spreadingIds.current === null || spreadingIds.current.has(Number(node.dataset.photoId)),
+    );
     const screen = table.getBoundingClientRect();
     const dock = dockBounds();
     const animations = nodes.map((node, index) => {
@@ -981,7 +1011,7 @@ export function FilmTable({
           lens
             ? undefined
             : (e) => {
-                if (e.button !== 0) return;
+                if (e.button !== 0 || motion === "stowing") return;
                 stopMotion();
                 e.preventDefault();
                 e.currentTarget.focus({ preventScroll: true });
@@ -1043,6 +1073,7 @@ export function FilmTable({
             revision={revisions[photo.id]}
             eager={lens}
             quality="source"
+            reusePreview
           />
           {decorated && <div className="ft-gloss" />}
         </div>
@@ -1076,7 +1107,7 @@ export function FilmTable({
               aria-label={`调整照片尺寸 ${photo.name} ${corner}`}
               title="拖动缩放这张照片"
               onPointerDown={(e) => {
-                if (e.button !== 0) return;
+                if (e.button !== 0 || motion === "stowing") return;
                 stopMotion();
                 e.preventDefault();
                 e.stopPropagation();
@@ -1183,6 +1214,7 @@ export function FilmTable({
       onPointerDown={(e) => {
         if (
           e.button !== 0 ||
+          motion === "stowing" ||
           (e.target as HTMLElement).closest(".ft-toolbar,.ft-film")
         )
           return;
@@ -1432,7 +1464,7 @@ export function FilmTable({
         >
           <Hand size={15} />
         </button>
-        <button aria-label="一键平铺胶片" onClick={spread}>
+        <button aria-label="一键平铺胶片" onClick={spread} disabled={!canSpread}>
           <Grid2X2 size={14} />
           一键平铺
         </button>
@@ -1440,12 +1472,9 @@ export function FilmTable({
           <button
             aria-label="一键收纳胶片"
             aria-pressed={motion === "stowed"}
-            disabled={
-              !visibleFrames.length ||
-              motion === "stowed" ||
-              motion === "stowing"
-            }
+            disabled={!canStow}
             onClick={() => {
+              if (!canStow) return;
               pausePlayback();
               cancelFlight();
               cancelReturns();

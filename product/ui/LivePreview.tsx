@@ -11,6 +11,7 @@ import {
   liveRecipeKey,
   filterLayers,
   FilterLayer,
+  currentPreviewGraphics,
 } from "./model";
 
 type Table = { edge: number; data: number[] };
@@ -407,11 +408,19 @@ export function LivePreview({
   photo,
   exact,
   uncropped = false,
+  sourceSize = currentPreviewGraphics().liveSize,
+  onFrame,
 }: {
   photo: Photo;
   exact: string;
   uncropped?: boolean;
+  sourceSize?: number;
+  onFrame?: (canvas: HTMLCanvasElement) => void;
 }) {
+  const frameGate = useRef({ exact, live: liveRecipeKey(photo.recipe) });
+  frameGate.current = { exact, live: liveRecipeKey(photo.recipe) };
+  const frameCallback = useRef(onFrame);
+  frameCallback.current = onFrame;
   const canvas = useRef<HTMLCanvasElement>(null),
     gpu = useRef<ReturnType<typeof renderer> | null>(null);
   const source = useRef<{
@@ -466,7 +475,7 @@ export function LivePreview({
     const controller = new AbortController();
     let url = "";
     if (gpu.current)
-      liveBaseBlob(committed, uncropped, controller.signal)
+      liveBaseBlob(committed, uncropped, controller.signal, sourceSize)
         .then(async (blob) => {
           if (controller.signal.aborted) return;
           url = URL.createObjectURL(blob);
@@ -491,6 +500,11 @@ export function LivePreview({
             ),
           };
           gpu.current?.draw(latest.current, source.current.recipe);
+          if (
+            canvas.current &&
+            frameGate.current.exact !== frameGate.current.live
+          )
+            frameCallback.current?.(canvas.current);
           setReady(true);
           setBaseVersion((v) => v + 1);
         })
@@ -499,7 +513,7 @@ export function LivePreview({
       controller.abort();
       if (url) URL.revokeObjectURL(url);
     };
-  }, [baseKey]);
+  }, [baseKey, sourceSize]);
   useEffect(() => {
     const controller = new AbortController();
     setLooksReady(false);
@@ -542,6 +556,8 @@ export function LivePreview({
     if (!ready || !looksReady || !source.current) return;
     const frame = requestAnimationFrame(() => {
       gpu.current?.draw(latest.current, source.current!.recipe);
+      if (canvas.current && frameGate.current.exact !== frameGate.current.live)
+        frameCallback.current?.(canvas.current);
     });
     return () => cancelAnimationFrame(frame);
   }, [live, ready, looksReady, baseKey, baseVersion]);

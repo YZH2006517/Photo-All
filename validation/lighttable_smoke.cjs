@@ -19,10 +19,23 @@ async function until(fn,ms=30000){const end=Date.now()+ms;while(Date.now()<end){
  if(!await picker.getByRole('button',{name:'开始观片',exact:true}).isDisabled())throw Error('Home entry did not require a collection choice');
  await picker.getByRole('checkbox',{name:'胶片电子观片台',exact:true}).check();await picker.getByRole('button',{name:'开始观片',exact:true}).click();
  await page.getByRole('dialog',{name:'电子观片台'}).waitFor();await until(()=>page.getByRole('dialog',{name:'电子观片台'}).getAttribute('data-ready').then(value=>value==='true'));await page.keyboard.press('Escape');await page.getByRole('heading',{name:'图集',exact:true}).waitFor();
+ await page.reload();
  await page.getByRole('button',{name:'打开图集 胶片电子观片台'}).click();
+ const libraryImage=page.locator('.photo-card img').first();await libraryImage.waitFor();
+ const libraryUrl=await libraryImage.getAttribute('src');
+ let releaseSource;
+ const sourceGate=new Promise(resolve=>{releaseSource=resolve;});
+ const pauseSource=async route=>{
+  if(new URL(route.request().url()).searchParams.get('quality')==='source')await sourceGate;
+  await route.continue();
+ };
+ await page.route('**/api/image/**',pauseSource);
  await page.getByRole('button',{name:'电子观片台',exact:true}).click({timeout:5000});const dialog=page.getByRole('dialog',{name:'电子观片台'});await dialog.waitFor();await until(()=>dialog.getAttribute('data-ready').then(value=>value==='true'));
  if(!await page.locator('.app-shell').evaluate(el=>el.inert))throw Error('Underlying workspace is interactive');
  const tabletop=page.locator('.film-table');await tabletop.waitFor({timeout:3000});
+ try{
+  await page.locator(`.ft-world .lt-contact-frame img[src="${libraryUrl}"]`).waitFor({timeout:4000});
+ }finally{releaseSource();}
  await until(()=>tabletop.getAttribute('data-motion').then(value=>value==='entering'));
  const entryFlight=await page.locator('.ft-world .lt-contact-frame').first().evaluate(el=>el.getAnimations()[0]?.effect.getKeyframes()[0]);
  if(!entryFlight||!entryFlight.transform.includes('scale(')||entryFlight.transform.includes('scale(1,1)'))throw Error('Entry has no actual dock-to-table flight');
@@ -33,18 +46,22 @@ async function until(fn,ms=30000){const end=Date.now()+ms;while(Date.now()<end){
  if(await page.locator('.lt-decisions').count())throw Error('Legacy P/X/U button group remains visible');
  await page.getByRole('button',{name:'观片收藏',exact:true}).waitFor({timeout:2500});
  const wakeControls=async()=>{await page.mouse.move(700,5);};
- // Flight animations retain image nodes and cached source pixels; the strip restores even the selected photo.
- await wakeControls();await until(()=>page.locator('.lt-contact-frame .picture.loading').count().then(n=>n===0));
+ await wakeControls();
+ const spreadButton=page.getByRole('button',{name:'一键平铺胶片'});
+ if(!await spreadButton.isDisabled())throw Error('An already tiled table can replay the spread animation');
+ // The film table upgrades to source pixels and keeps them through both transitions.
+ await wakeControls();await until(()=>page.locator('.lt-contact-frame .picture[data-geometry-ready="true"]').count().then(n=>n===6));
  const retained=await page.locator('.ft-world .lt-contact-frame').first().elementHandle(),warmLoads=sourceLoads;
  await page.getByRole('button',{name:'一键收纳胶片'}).click();
  const stowFlight=await page.locator('.ft-world .lt-contact-frame').first().evaluate(el=>el.getAnimations()[0]?.effect.getKeyframes().at(-1));
  if(!stowFlight || stowFlight.transform.includes('translate(0px,0px)'))throw Error('Stow only fades instead of flying to the footer');
  await until(()=>tabletop.getAttribute('data-motion').then(v=>v==='stowed'));
+ if(!await page.getByRole('button',{name:'一键收纳胶片'}).isDisabled())throw Error('An empty table can replay the stow animation');
  if(await page.locator('.ft-world').evaluate(el=>getComputedStyle(el).opacity)!=='0')throw Error('Stowed photos remain visible');
  if(await page.getByText('照片已收纳到底部导览',{exact:true}).count() || await page.getByRole('button',{name:'重新平铺',exact:true}).count())throw Error('Stowed table must have no empty-state icon, text or restore button');
  if(await page.locator('.ft-table-caption').isVisible() || await page.locator('.ft-instruction').isVisible())throw Error('Stowed table still shows text annotations');
  await page.screenshot({path:path.join(output,'05-stowed.png')});
- await page.locator('.lt-strip>button.active').click();await until(()=>tabletop.getAttribute('data-motion').then(v=>v==='idle'));
+ await spreadButton.click();await until(()=>tabletop.getAttribute('data-motion').then(v=>v==='idle'));
  if(!await retained.evaluate(el=>el.isConnected))throw Error('Stow/spread remounted source images');
  if(sourceLoads!==warmLoads)throw Error('Stow/spread refetched source pixels');
  await page.emulateMedia({reducedMotion:'reduce'});await wakeControls();await page.getByRole('button',{name:'一键收纳胶片'}).click();await until(()=>tabletop.getAttribute('data-motion').then(v=>v==='stowed'));

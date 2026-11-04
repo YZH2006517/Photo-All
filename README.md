@@ -49,6 +49,12 @@
 - 独立 Windows 发行构建与第三方分发材料见 [`product/WINDOWS_DISTRIBUTION.md`](product/WINDOWS_DISTRIBUTION.md)。
 - `cd product` 后运行 `npm install`、`npm test`、`npm run desktop`；Python 与原生工具依赖见说明。
 
+### Windows 构建与代码签名
+
+Windows 构建工作流在 GitHub 托管的 Windows x64 环境运行。打开 [Actions](https://github.com/YZH2006517/Photo-All/actions)，选择 **Build Photo All Studio for Windows**，再点 **Run workflow**。构建通过后，运行页面的 **Artifacts** 中会提供安装包、便携包、校验值和对应源码。工作流也会在推送 `v*` 标签时运行。
+
+照片导入、编辑和识图均在本机处理。代码签名计划采用 SignPath Foundation，启用日期及签名审批人将在正式签名启用时公布。可在 Windows 文件属性的「数字签名」页查看下载文件的实际签名状态。
+
 ## 开源许可
 
 自有代码为 [GPL-3.0-or-later](product/LICENSE)。RawTherapee、Spektrafilm、模型及其他依赖保留各自许可证；Spektrafilm profiles/LUT 按随附 CC BY-SA 4.0 条款分发。第三方声明与对应源码材料随发行版提供。软件许可不会要求用户的照片开源。

@@ -69,8 +69,10 @@ def stock_ready(stock):
 
 
 def catalog():
+    import film_spectral
     return {'engine': 'spektrafilm 0.3.4', 'mode': 'sRGB 33³ LUT', 'revision': REVISION,
             'attribution': ATTRIBUTION, 'source': SOURCE,
+            'spectral': film_spectral.catalog(STOCKS),
             'stocks': {key: {'label': value[0], 'family': value[1], 'paper': value[2], 'ready': stock_ready(key)}
                        for key, value in STOCKS.items()}}
 

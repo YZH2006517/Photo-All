@@ -2521,6 +2521,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "uuid",
+ "windows",
 ]
 
 [[package]]

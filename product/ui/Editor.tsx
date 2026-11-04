@@ -33,6 +33,10 @@ import {
   SquareSlash,
   Sun,
   Moon,
+  Frame,
+  Spline,
+  Focus,
+  Sparkles,
 } from "lucide-react";
 import {
   Photo,
@@ -50,6 +54,7 @@ import {
 } from "./model";
 import { Comparison, Picture } from "./Preview";
 import { FilmControls, NumericValue } from "./Film";
+import { BorderControls, BorderPreview } from "./Borders";
 
 type Point = { x: number; y: number };
 export type CropRect = Point & { w: number; h: number };
@@ -67,6 +72,7 @@ type Tool =
   | "retouch"
   | "local"
   | "film"
+  | "border"
   | "raw";
 const clamp = (v: number, low = 0, high = 1) =>
   Math.max(low, Math.min(high, v));
@@ -246,6 +252,7 @@ export const editorTools: {
   },
   { id: "filters", label: "滤镜", shortcut: "K", icon: Palette },
   { id: "film", label: "胶片模拟", shortcut: "G", icon: Film },
+  { id: "border", label: "片边", shortcut: "B", icon: Frame },
   { id: "raw", label: "RAW 显影", shortcut: "R", icon: Aperture },
 ];
 
@@ -256,6 +263,28 @@ export function editorToolShortcut(key: string): Tool | null {
     )?.id ?? null
   );
 }
+
+const adjustmentPanels = [
+  { id: "tone", label: "光线", hint: "曝光 / 明暗", icon: Sun },
+  { id: "color", label: "色彩", hint: "白平衡 / 饱和", icon: Palette },
+  {
+    id: "levels",
+    label: "色阶与伽马",
+    hint: "黑白场 / 中间调",
+    icon: SlidersHorizontal,
+  },
+  { id: "curves", label: "曲线", hint: "RGB / 通道", icon: Spline },
+  { id: "mixer", label: "混色器 HSL", hint: "分色调整", icon: CircleDot },
+  { id: "detail", label: "细节", hint: "锐化 / 降噪", icon: Focus },
+  {
+    id: "effects",
+    label: "效果",
+    hint: "清晰度 / 去雾 / 暗角",
+    icon: Sparkles,
+  },
+] as const;
+
+type AdjustmentId = (typeof adjustmentPanels)[number]["id"];
 
 function Histogram({
   image,
@@ -1105,7 +1134,15 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
   const [bounds, setBounds] = useState({ width: 800, height: 600 }),
     [image, setImage] = useState<HTMLImageElement | null>(null),
     [histVersion, setHistVersion] = useState(0);
-  const [adjustTab, setAdjustTab] = useState("light");
+  const [openAdjustments, setOpenAdjustments] = useState<Set<AdjustmentId>>(
+    () => new Set(["tone"]),
+  );
+  const adjustmentScroll = useRef<HTMLDivElement>(null);
+  const pendingAdjustment = useRef<AdjustmentId | null>(null);
+  const [borderSize, setBorderSize] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
   const [crop, setCrop] = useState<CropRect>(cropFrom(recipe)),
     [aspect, setAspect] = useState("free"),
     [curveChannel, setCurveChannel] = useState("rgb"),
@@ -1143,7 +1180,9 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
   const dimensions =
     tool === "composition"
       ? { width: geometricWidth, height: geometricHeight }
-      : photoDimensions(photo);
+      : tool === "border" && borderSize
+        ? borderSize
+        : photoDimensions(photo);
   const fit = Math.min(
     (bounds.width - 72) / dimensions.width,
     (bounds.height - 72) / dimensions.height,
@@ -1152,6 +1191,14 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
     frameHeight = Math.max(1, dimensions.height * fit);
   const brush = tool === "local" || tool === "retouch";
   const activeIndex = photos.findIndex((p) => p.id === photo.id);
+  useLayoutEffect(() => {
+    const id = pendingAdjustment.current;
+    const scroll = adjustmentScroll.current;
+    if (tool !== "adjust" || !scroll || !id) return;
+    pendingAdjustment.current = null;
+    const header = scroll.querySelector<HTMLElement>(`#ew-adjust-${id}`);
+    if (header) scroll.scrollTop = header.offsetTop;
+  }, [tool, openAdjustments]);
   useLayoutEffect(() => {
     const element = viewport.current!;
     const measure = () =>
@@ -1167,6 +1214,7 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
     setCrop(cropFrom(photo.recipe));
     setAnchor(null);
     setImage(null);
+    setBorderSize(null);
     setStamps([]);
     setNote("");
     stroke.current = null;
@@ -1586,19 +1634,10 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
         ].sort((a, b) => a.band - b.band),
       ),
     });
-  const panel = () => {
-    const section =
-      tool === "adjust"
-        ? {
-            light: "tone",
-            shadows: "shadows",
-            levels: "levels",
-            color: "color",
-            curves: "curves",
-            texture: "detail",
-          }[adjustTab] || "tone"
-        : tool;
+  const panel = (section: Tool | AdjustmentId = tool) => {
     switch (section) {
+      case "border":
+        return <BorderControls photo={photo} onPatch={patch} disabled={busy} />;
       case "composition":
         return (
           <>
@@ -1716,16 +1755,8 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
       case "tone":
         return (
           <>
-            <h3>基础曝光</h3>
             {range("exposure", "亮度曝光", -2, 2)}
             {range("contrast", "对比度", 0.5, 1.5, 0.01, 1)}
-            {reset({ exposure: 0, contrast: 1 })}
-          </>
-        );
-      case "shadows":
-        return (
-          <>
-            <h3>阴影与高光</h3>
             {range("highlights", "高光", -1, 1)}
             {range("shadows", "阴影", -1, 1)}
             {range("whites", "白色色阶", -1, 1)}
@@ -1746,13 +1777,19 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
                 鲜明层次
               </button>
             </div>
-            {reset({ highlights: 0, shadows: 0, whites: 0, blacks: 0 })}
+            {reset({
+              exposure: 0,
+              contrast: 1,
+              highlights: 0,
+              shadows: 0,
+              whites: 0,
+              blacks: 0,
+            })}
           </>
         );
       case "levels":
         return (
           <>
-            <h3>黑白色阶与伽马</h3>
             {range("black_point", "黑场", 0, 0.9)}
             {range("white_point", "白场", 0.1, 1, 0.01, 1)}
             {range("gamma", "中间调伽马", 0.2, 5, 0.01, 1)}
@@ -1822,7 +1859,12 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
             {range("tint", "色调 · 绿 / 洋红", -1, 1)}
             {range("saturation", "饱和度", 0, 2, 0.01, 1)}
             {range("vibrance", "自然饱和度", -1, 1)}
-            <h3>HSL · 分色调整</h3>
+            {reset({ temperature: 0, tint: 0, saturation: 1, vibrance: 0 })}
+          </>
+        );
+      case "mixer":
+        return (
+          <>
             <div className="ew-bands">
               {["红", "橙", "黄", "绿", "青", "蓝", "紫", "洋红"].map(
                 (label, i) => (
@@ -1870,43 +1912,35 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
               -1,
               1,
             )}
-            {reset({
-              temperature: 0,
-              tint: 0,
-              saturation: 1,
-              vibrance: 0,
-              hsl: "[]",
-            })}
+            {reset({ hsl: "[]" })}
           </>
         );
       case "detail":
         return (
           <>
-            <p className="ew-description">
-              建议切换 100% 像素检查锐化与降噪。所有参数由同一浮点引擎处理。
-            </p>
-            <button
-              onClick={() => {
-                setZoom(1 / Math.max(0.01, fit));
-                setPan({ x: 0, y: 0 });
-              }}
-            >
-              查看 100% 像素
-            </button>
-            {range("clarity", "清晰度", -1, 1)}
-            {range("dehaze", "去雾", -1, 1)}
             {range("sharpen", "锐化强度", 0, 2)}
             {range("sharpen_radius", "锐化半径", 0.3, 5, 0.1, 1)}
             {range("denoise", "降噪", 0, 1)}
+            <div className="ew-actions">
+              <button
+                onClick={() => {
+                  setZoom(1 / Math.max(0.01, fit));
+                  setPan({ x: 0, y: 0 });
+                }}
+              >
+                查看 100% 像素
+              </button>
+            </div>
+            {reset({ sharpen: 0, sharpen_radius: 1, denoise: 0 })}
+          </>
+        );
+      case "effects":
+        return (
+          <>
+            {range("clarity", "清晰度", -1, 1)}
+            {range("dehaze", "去雾", -1, 1)}
             {range("vignette", "暗角", -1, 1)}
-            {reset({
-              clarity: 0,
-              dehaze: 0,
-              sharpen: 0,
-              sharpen_radius: 1,
-              denoise: 0,
-              vignette: 0,
-            })}
+            {reset({ clarity: 0, dehaze: 0, vignette: 0 })}
           </>
         );
       case "retouch":
@@ -2079,10 +2113,14 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
         e.preventDefault();
         e.stopPropagation();
         if (shortcutTool) {
-          if (shortcutTool === "adjust")
-            setAdjustTab(
-              key === "u" ? "curves" : key === "s" ? "color" : "light",
+          if (shortcutTool === "adjust") {
+            const id = key === "u" ? "curves" : key === "s" ? "color" : "tone";
+            pendingAdjustment.current = id;
+            setOpenAdjustments(
+              (open) =>
+                new Set(key === "s" ? [...open, id, "mixer"] : [...open, id]),
             );
+          }
           void chooseTool(shortcutTool);
         } else if (key === "f") fitView();
         else if (key === "+" || key === "=")
@@ -2277,17 +2315,21 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
                 transform: `translate(${pan.x}px,${pan.y}px) scale(${zoom})`,
               }}
             >
-              <Comparison
-                photo={photo}
-                revision={revision}
-                active={compare && tool !== "composition"}
-                uncropped={tool === "composition"}
-                scale={zoom}
-                onLoaded={(img) => {
-                  setImage(img);
-                  setHistVersion((v) => v + 1);
-                }}
-              />
+              {tool === "border" ? (
+                <BorderPreview photo={photo} onSize={setBorderSize} />
+              ) : (
+                <Comparison
+                  photo={photo}
+                  revision={revision}
+                  active={compare && tool !== "composition"}
+                  uncropped={tool === "composition"}
+                  scale={zoom}
+                  onLoaded={(img) => {
+                    setImage(img);
+                    setHistVersion((v) => v + 1);
+                  }}
+                />
+              )}
               {(tool === "composition" || brush) && (
                 <div
                   className={`ew-interaction ${tool === "composition" ? "crop-mode" : "brush-mode"}`}
@@ -2452,60 +2494,77 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
             </button>
           </div>
         </main>
-        <aside className="ew-inspector" aria-label="编辑参数">
-          <div className="ew-inspector-scroll" key={tool}>
-            {tool !== "filters" && (
-              <Histogram image={image} version={histVersion} />
-            )}
-            {tool !== "filters" && (
-              <div className="ew-inspector-heading">
-                <div>
-                  <small>DEVELOP</small>
-                  <h2>{activeTool.label}</h2>
-                </div>
-                <activeTool.icon size={20} />
+        <aside
+          className={`ew-inspector${tool === "adjust" ? " ew-adjust-inspector" : ""}`}
+          aria-label="编辑参数"
+        >
+          {tool === "adjust" ? (
+            <>
+              <div className="ew-adjust-dock">
+                <Histogram image={image} version={histVersion} />
+                <h2>
+                  <SlidersHorizontal size={15} aria-hidden="true" />
+                  调节
+                </h2>
               </div>
-            )}
-            <div className="ew-panel-controls">
-              {tool === "adjust" && (
-                <div
-                  className="ew-adjust-tabs"
-                  role="tablist"
-                  aria-label="调节分组"
-                >
-                  {Object.entries({
-                    light: "基础光线",
-                    shadows: "阴影 / 高光",
-                    levels: "色阶 / 伽马",
-                    color: "色彩 / HSL",
-                    curves: "曲线",
-                    texture: "质感",
-                  }).map(([id, label]) => (
-                    <button
-                      key={id}
-                      id={`adjust-tab-${id}`}
-                      role="tab"
-                      aria-selected={adjustTab === id}
-                      aria-controls="adjust-panel"
-                      className={adjustTab === id ? "active" : ""}
-                      onClick={() => setAdjustTab(id)}
-                    >
-                      {label}
-                    </button>
-                  ))}
+              <div
+                className="ew-inspector-scroll ew-adjust-stack"
+                ref={adjustmentScroll}
+              >
+                {adjustmentPanels.map(({ id, label, hint, icon: Icon }) => {
+                  const expanded = openAdjustments.has(id);
+                  return (
+                    <section className="ew-adjust-group" key={id}>
+                      <h3>
+                        <button
+                          type="button"
+                          id={`ew-adjust-${id}`}
+                          aria-expanded={expanded}
+                          aria-controls={`ew-adjust-${id}-controls`}
+                          onClick={() =>
+                            setOpenAdjustments((open) => {
+                              const next = new Set(open);
+                              if (expanded) next.delete(id);
+                              else next.add(id);
+                              return next;
+                            })
+                          }
+                        >
+                          <Icon size={15} aria-hidden="true" />
+                          <span>{label}</span>
+                          <small aria-hidden="true">{hint}</small>
+                          <ChevronDown size={13} aria-hidden="true" />
+                        </button>
+                      </h3>
+                      <div
+                        className="ew-adjust-group-body"
+                        id={`ew-adjust-${id}-controls`}
+                        hidden={!expanded}
+                      >
+                        {expanded && panel(id)}
+                      </div>
+                    </section>
+                  );
+                })}
+              </div>
+            </>
+          ) : (
+            <div className="ew-inspector-scroll" key={tool}>
+              {tool !== "filters" && tool !== "border" && (
+                <Histogram image={image} version={histVersion} />
+              )}
+              {tool !== "filters" && (
+                <div className="ew-inspector-heading">
+                  <div>
+                    <small>DEVELOP</small>
+                    <h2>{activeTool.label}</h2>
+                  </div>
+                  <activeTool.icon size={20} />
                 </div>
               )}
-              <div
-                id="adjust-panel"
-                role={tool === "adjust" ? "tabpanel" : undefined}
-                aria-labelledby={
-                  tool === "adjust" ? `adjust-tab-${adjustTab}` : undefined
-                }
-              >
-                {panel()}
-              </div>
+              <div className="ew-panel-controls">{panel()}</div>
             </div>
-          </div>
+          )}
           <footer className="ew-inspector-footer">
             <button disabled={busy} onClick={onSync}>
               <CheckCheck size={15} />

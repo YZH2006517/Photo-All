@@ -1,6 +1,31 @@
 import { describe, expect, it } from 'vitest';
 import * as model from '../product/ui/model';
 
+it('uses JPEG, 80% LUT and 80/35/15 film defaults for new edits', () => {
+  expect(model.DEFAULT_EXPORT_FORMAT).toBe('jpeg');
+  expect(model.newFilterLayer('lut', 'example').strength).toBe(.8);
+  const layer = {...model.newFilterLayer('lut', 'first'), strength: .4};
+  expect(model.selectFilterPreset([layer], layer.uid, 'lut', 'second').layers[0].strength).toBe(.8);
+  expect(model.filmSelectionPatch('kodak_portra_400')).toEqual({
+    film_stock: 'kodak_portra_400', film_strength: .8, film_grain: .35, film_halation: .15,
+  });
+  expect(model.filmSelectionPatch('kodak_gold_200', {film_stock: 'kodak_portra_400'})).toEqual({film_stock: 'kodak_gold_200'});
+  expect(model.filmSelectionPatch('kodak_gold_200', {film_stock: 'none', film_grain: .2})).toEqual({film_stock: 'kodak_gold_200'});
+  expect(model.filmSelectionPatch('none')).toEqual({film_stock: 'none'});
+});
+
+it('uses conservative graphics settings on shared or unknown adapters and caps large draw buffers', () => {
+  expect(model.previewGraphics(undefined).filmWidth).toBe(480);
+  expect(model.previewGraphics(128).antialias).toBe(false);
+  expect(model.previewGraphics(4096).filmWidth).toBe(640);
+  expect(model.previewGraphics(8192).filmWidth).toBe(768);
+  const low = model.previewGraphics(2048);
+  const ratio = model.previewPixelRatio(low, 3840, 2160, 2, 4096);
+  expect(3840 * 2160 * ratio ** 2).toBeLessThanOrEqual(low.maxPixels + 1);
+  expect(model.previewPixelRatio(low, 800, 600, 1, 4096)).toBe(1);
+  expect(model.previewPixelRatio(low, 16000, 100, 2, 4096) * 16000).toBeLessThanOrEqual(4096);
+});
+
 it('replaces the selected filter slot and appends only to an explicit new slot',()=>{
   const a=model.newFilterLayer('style','warm'),b=model.newFilterLayer('style','mono');
   const replacement=model.selectFilterPreset([a,b],a.uid,'style','cool');
