@@ -5,10 +5,13 @@ import React, {
   useMemo,
   useRef,
   useState,
+  lazy,
+  Suspense,
 } from "react";
 import { createRoot } from "react-dom/client";
 import { AnimatePresence, motion, MotionConfig } from "motion/react";
 import { isTauri } from "@tauri-apps/api/core";
+import { BorderPreview } from "./Borders";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Aperture,
@@ -48,6 +51,7 @@ import {
   PanelLeftClose,
   Minus,
   Square,
+  LampDesk,
 } from "lucide-react";
 import {
   api,
@@ -77,6 +81,8 @@ import {
   expandVariantScope,
   newFilterLayer,
   filtersPatch,
+  DEFAULT_EXPORT_FORMAT,
+  filmSelectionPatch,
 } from "./model";
 import { Albums, Classification } from "./Albums";
 import { Composite } from "./Composite";
@@ -86,6 +92,9 @@ import { Lighttable } from "./Lighttable";
 import "./style.css";
 
 const brandIcon = new URL("./brand.svg", import.meta.url).href;
+const Darkroom = lazy(() =>
+  import("./Darkroom").then((module) => ({ default: module.Darkroom })),
+);
 const spring = { type: "spring" as const, stiffness: 330, damping: 32 };
 const EMPTY: Library = {
   photos: [],
@@ -205,7 +214,13 @@ function Studio() {
   const [connected, setConnected] = useState(false),
     [error, setError] = useState("");
   const [mode, setMode] = useState<
-    "albums" | "trash" | "library" | "editor" | "composite" | "lighttable"
+    | "albums"
+    | "trash"
+    | "library"
+    | "editor"
+    | "composite"
+    | "lighttable"
+    | "darkroom"
   >("albums");
   const [reviewScope, setReviewScope] = useState<{
     ids: number[];
@@ -287,9 +302,9 @@ function Studio() {
   const [jobAction, setJobAction] = useState("");
   const [saving, setSaving] = useState(false);
   const [exportOpen, setExportOpen] = useState(false),
-    [template, setTemplate] = useState("plain"),
+    [template, setTemplate] = useState("recipe"),
     [exportSize, setExportSize] = useState(0),
-    [format, setFormat] = useState("png");
+    [format, setFormat] = useState(DEFAULT_EXPORT_FORMAT);
   const [importMenu, setImportMenu] = useState(false),
     [limit, setLimit] = useState(48);
   const pending = useRef(new Map<number, Recipe>()),
@@ -501,12 +516,27 @@ function Studio() {
   useEffect(() => {
     if (!job || job.status !== "running") return;
     let disposed = false;
+    let polling = false;
     const timer = setInterval(
-      () =>
+      () => {
+        if (polling) return;
+        polling = true;
         api<Job>("/jobs/" + job.id)
           .then(async (result) => {
             if (disposed) return;
-            setJob(result);
+            setJob((current) => {
+              if (!current || current.id !== result.id || result.status !== "running")
+                return result;
+              if (current.status !== "running") return current;
+              const cancelRequested = current.cancel_requested || result.cancel_requested;
+              if (
+                current.done === result.done &&
+                current.total === result.total &&
+                current.cancel_requested === cancelRequested &&
+                current.cancellable === result.cancellable
+              ) return current;
+              return { ...result, cancel_requested: cancelRequested };
+            });
             if (result.status === "done") {
               await reload();
               const details = result.result;
@@ -538,7 +568,9 @@ function Studio() {
               setJob(null);
               notify(error.message);
             }
-          }),
+          })
+          .finally(() => { polling = false; });
+      },
       500,
     );
     return () => {
@@ -666,7 +698,7 @@ function Studio() {
       await api("/remove", { ids, album_id: albumId });
       await reload();
       setSelected((old) => old.filter((id) => !ids.includes(id)));
-      notify(`已移除 ${ids.length} 张照片，可撤销；原文件保留`);
+      notify(albumId === null ? `已将 ${ids.length} 张照片移入回收站` : `已从图集移除 ${ids.length} 张照片`);
     });
   useEffect(() => {
     const outside = (event: PointerEvent) => {
@@ -722,6 +754,13 @@ function Studio() {
       setMode("albums");
       setSelected([]);
       setImportMenu(false);
+    });
+  const openDarkroom = () =>
+    act(async () => {
+      await flush();
+      await compositeSave.current?.();
+      closeDrawer();
+      setMode("darkroom");
     });
   const openAlbum = (album: Album) =>
     act(async () => {
@@ -844,12 +883,7 @@ function Studio() {
         ids,
         ...(filmId
           ? {
-              recipe_patch: {
-                film_stock: filmId,
-                film_strength: 1,
-                film_grain: 0,
-                film_halation: 0,
-              },
+              recipe_patch: { ...filmSelectionPatch(filmId), film_advanced: "" },
             }
           : batchStyle === "natural"
             ? { recipe_patch: filtersPatch([]) }
@@ -922,7 +956,12 @@ function Studio() {
         }
         return;
       }
-      if (mode === "composite" || mode === "lighttable" || mode === "editor")
+      if (
+        mode === "composite" ||
+        mode === "lighttable" ||
+        mode === "editor" ||
+        mode === "darkroom"
+      )
         return;
       if (event.defaultPrevented) return;
       if (
@@ -1069,7 +1108,7 @@ function Studio() {
             onClick={removeContextPhotos}
           >
             <X size={15} />
-            {albumId === null ? "从图库移除" : "从图集中移除"}
+            {albumId === null ? "移到回收站" : "从图集中移除"}
           </button>
           <small>保留磁盘原文件 · 可以撤销</small>
         </div>
@@ -1085,7 +1124,7 @@ function Studio() {
           startCompare={reviewScope.compare}
           revisions={revisions}
           filmNames={Object.fromEntries(
-            Object.entries(library.film.stocks).map(([id, stock]) => [
+            Object.entries({ ...library.film.stocks, ...library.film.spectral?.stocks }).map(([id, stock]) => [
               id,
               stock.label,
             ]),
@@ -1122,10 +1161,37 @@ function Studio() {
           }
         />
       )}
+      {mode === "darkroom" && (
+        <Suspense
+          fallback={
+            <div className="darkroom-loading">
+              <LoaderCircle className="spin" size={22} />
+              <span>正在打开胶片收藏室</span>
+              <button onClick={showAlbums}>返回图集</button>
+            </div>
+          }
+        >
+          <Darkroom
+            library={library}
+            revisions={revisions}
+            onBack={showAlbums}
+            onApply={async (id,patch) => {
+              await flush();
+              await api('/edit',{ids:[id],recipe_patch:patch});
+              await reload();
+              setRevisions(r=>({...r,[id]:(r[id]||0)+1}));
+            }}
+          />
+        </Suspense>
+      )}
       <div
         className={`app-shell ${mode === "editor" || mode === "composite" ? "is-editing" : ""} ${drawerOpen ? "drawer-open" : "drawer-closed"}`}
-        inert={mode === "lighttable" || reviewPicker}
-        aria-hidden={mode === "lighttable" || reviewPicker ? true : undefined}
+        inert={mode === "lighttable" || mode === "darkroom" || reviewPicker}
+        aria-hidden={
+          mode === "lighttable" || mode === "darkroom" || reviewPicker
+            ? true
+            : undefined
+        }
       >
         <button
           className="sidebar-scrim"
@@ -1242,6 +1308,16 @@ function Studio() {
             );
           })}
           <button
+            className="nav-item"
+            title="胶片收藏室"
+            aria-label="打开胶片收藏室"
+            onClick={openDarkroom}
+          >
+            <LampDesk size={18} />
+            <span>胶片收藏室</span>
+            <b>NEW</b>
+          </button>
+          <button
             className={`nav-item ${mode === "trash" ? "active" : ""}`}
             title="回收站"
             aria-label="打开回收站"
@@ -1249,7 +1325,7 @@ function Studio() {
           >
             <Trash2 size={18} />
             <span>回收站</span>
-            <b>{library.trash_albums?.length || 0}</b>
+            <b>{(library.trash_albums?.length ?? 0) + (library.trash_photos?.length ?? 0)}</b>
           </button>
           <div className="nav-label album-label">
             我的图集 <span>{library.albums.length}</span>
@@ -1296,7 +1372,7 @@ function Studio() {
           <div className="sidebar-bottom">
             <span className="online-dot" />
             <span>本地引擎{connected ? "已连接" : "连接中"}</span>
-            <span className="version">0.10.6</span>
+            <span className="version">0.10.7</span>
           </div>
         </aside>
 
@@ -1429,14 +1505,21 @@ function Studio() {
                 removeAlbum={trashAlbum}
                 restoreAlbum={restoreAlbum}
                 purgeAlbum={purgeAlbum}
+                restorePhoto={(photo) => act(async () => {
+                  await api(`/photos/${photo.id}/restore`, {});
+                  await reload();
+                })}
                 library={library}
                 open={openAlbum}
+                openLibrary={() => changeScope("all")}
                 create={createAlbum}
                 Picture={Picture}
                 busy={!connected || busy}
                 review={openLighttable}
+                darkroom={openDarkroom}
               />
-            ) : mode === "lighttable" ? null : mode === "library" ? (
+            ) : mode === "lighttable" || mode === "darkroom" ? null : mode ===
+              "library" ? (
               <motion.section
                 className="library-view"
                 key={`library-${albumId ?? "all"}`}
@@ -2011,12 +2094,15 @@ function Studio() {
                     </div>
                   ) : (
                     <div className={`template-preview template-${template}`}>
-                      {exportScope[0] && (
-                        <Picture
-                          photo={exportScope[0]!}
-                          revision={revisions[exportScope[0]!.id]}
-                        />
-                      )}
+                      {exportScope[0] &&
+                        (template === "recipe" && format !== "original" ? (
+                          <BorderPreview photo={exportScope[0]!} />
+                        ) : (
+                          <Picture
+                            photo={exportScope[0]!}
+                            revision={revisions[exportScope[0]!.id]}
+                          />
+                        ))}
                     </div>
                   )}
                   <p>给这一组故事，一个漂亮的落点。</p>
@@ -2057,9 +2143,13 @@ function Studio() {
                       <label className="field-label">
                         画面模板
                         <select
+                          aria-label="导出画面模板"
                           value={template}
                           onChange={(event) => setTemplate(event.target.value)}
                         >
+                          <option value="recipe">
+                            按照片片边设置 · 编辑器自定义
+                          </option>
                           <option value="plain">原比例 · 简洁原片</option>
                           <option value="frame">方形留白 · 画廊感</option>
                           <option value="portrait">竖版留白 · 故事封面</option>

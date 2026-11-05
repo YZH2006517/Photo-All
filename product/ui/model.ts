@@ -3,7 +3,66 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 export type Recipe = Record<string, string | number>;
+export const DEFAULT_EXPORT_FORMAT = "jpeg";
+const defaultFilm = { film_strength: .8, film_grain: .35, film_halation: .15 };
+export function spectralRecipe(recipe: Recipe): Recipe | null {
+  if (typeof recipe.film_advanced !== "string" || !recipe.film_advanced) return null;
+  try {
+    const value = JSON.parse(recipe.film_advanced);
+    return typeof value?.stock === "string" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export function filmStock(recipe: Recipe): string {
+  return String(spectralRecipe(recipe)?.stock ?? recipe.film_stock ?? "none");
+}
+
+export function filmSelectionPatch(stock: string, recipe: Recipe = {}): Recipe {
+  const untouched =
+    (!recipe.film_stock || recipe.film_stock === "none") &&
+    Number(recipe.film_strength ?? 1) === 1 &&
+    Number(recipe.film_grain ?? 0) === 0 &&
+    Number(recipe.film_halation ?? 0) === 0;
+  return stock !== "none" && untouched
+    ? { film_stock: stock, ...defaultFilm }
+    : { film_stock: stock };
+}
+
+const standardPreviewGraphics = {
+  filmWidth: 480, liveSize: 768, shadowSize: 1024, maxPixels: 2_100_000,
+  maxRatio: 1, antialias: false, transmissionScale: .5,
+};
+export function previewGraphics(vramMiB?: number | null) {
+  if ((vramMiB ?? 0) >= 8192)
+    return {
+      filmWidth: 768, liveSize: 1024, shadowSize: 2048, maxPixels: 6_000_000,
+      maxRatio: 1.5, antialias: true, transmissionScale: .75,
+    };
+  if ((vramMiB ?? 0) >= 4096)
+    return {
+      filmWidth: 640, liveSize: 1024, shadowSize: 1536, maxPixels: 4_000_000,
+      maxRatio: 1.25, antialias: true, transmissionScale: .65,
+    };
+  return standardPreviewGraphics;
+}
+export function previewPixelRatio(
+  settings: ReturnType<typeof previewGraphics>,
+  width: number, height: number, deviceRatio: number, maxSide: number,
+) {
+  return Math.min(
+    deviceRatio,
+    settings.maxRatio,
+    Math.sqrt(settings.maxPixels / (width * height)),
+    maxSide / Math.max(width, height),
+  );
+}
+let detectedGraphics = standardPreviewGraphics;
+export const currentPreviewGraphics = () => detectedGraphics;
+
 export type FilterLayer = {uid:string;kind:'style'|'lut';id:string;strength:number;enabled:boolean};
+const defaultFilterStrength = (kind: FilterLayer["kind"]) => kind === "lut" ? .8 : 1;
 export function filterLayers(recipe:Recipe):FilterLayer[] {
   if(recipe.filter_stack){try{return JSON.parse(String(recipe.filter_stack));}catch{return [];}}
   const layers:FilterLayer[]=[];
@@ -11,13 +70,13 @@ export function filterLayers(recipe:Recipe):FilterLayer[] {
   if(recipe.filter_id&&recipe.filter_id!=='none')layers.push({uid:'legacy-lut',kind:'lut',id:String(recipe.filter_id),strength:Number(recipe.filter_strength??1),enabled:true});
   return layers;
 }
-export const newFilterLayer=(kind:FilterLayer['kind'],id:string):FilterLayer=>({uid:crypto.randomUUID(),kind,id,strength:1,enabled:true});
+export const newFilterLayer=(kind:FilterLayer['kind'],id:string):FilterLayer=>({uid:crypto.randomUUID(),kind,id,strength:defaultFilterStrength(kind),enabled:true});
 export const filtersPatch=(layers:FilterLayer[]):Recipe=>({style:'natural',filter_id:'none',filter_strength:1,filter_stack:JSON.stringify(layers)});
 export function selectFilterPreset(layers:FilterLayer[],uid:string|null,kind:FilterLayer['kind'],id:string,insertAt=layers.length){
   const index=layers.findIndex(layer=>layer.uid===uid);
   if(index>=0){
     if(layers[index].kind===kind&&layers[index].id===id)return {layers,uid};
-    return {layers:layers.map((layer,i)=>i===index?{...layer,kind,id,strength:1,enabled:true}:layer),uid};
+    return {layers:layers.map((layer,i)=>i===index?{...layer,kind,id,strength:defaultFilterStrength(kind),enabled:true}:layer),uid};
   }
   if(layers.length>=16)return {layers,uid:null};
   const layer=newFilterLayer(kind,id),next=[...layers];next.splice(Math.max(0,Math.min(next.length,insertAt)),0,layer);
@@ -99,10 +158,18 @@ export type Facets = {
   style?: string;
   film?: string;
 };
+export type FilmSpectralControl = {
+  key: string;
+  label: string;
+} & (
+  { options: Record<string, string>; default: string }
+  | { min: number; max: number; step: number; default: number; unit: string }
+);
 export type Library = {
   photos: Photo[];
   albums: Album[];
   trash_albums?: Album[];
+  trash_photos?: Photo[];
   composites: CompositeDocument[];
   filters: {
     items: Record<
@@ -126,6 +193,11 @@ export type Library = {
     revision: string;
     attribution: string;
     source: string;
+    spectral?: {
+      ready: boolean;
+      groups: Record<string, FilmSpectralControl[]>;
+      stocks: Record<string, { label: string; family: string; paper: string }>;
+    };
     stocks: Record<
       string,
       { label: string; family: string; paper: string; ready: boolean }
@@ -182,7 +254,7 @@ export function mergeLibraryRecipes(
     ),
   };
 }
-type Connection = { port: number; token: string };
+type Connection = { port: number; token: string; dedicated_vram_mib?: number | null };
 type PreviewTask = {
   key: string;
   controller: AbortController;
@@ -306,7 +378,13 @@ export class PreviewPool {
     }
   }
 }
-const previews = new PreviewPool();
+const previews = new PreviewPool(
+  Math.min(4, Math.max(2, Math.floor((globalThis.navigator?.hardwareConcurrency || 4) / 2))),
+);
+// Source renders and spectral edits can occupy the backend for several seconds.
+// Keep browsing requests independent so they can still fill the filmstrip.
+const developedPreviews = new PreviewPool(2, 32 * 1024 * 1024);
+export const BROWSE_PREVIEW_SIZE = 480;
 
 export type DecodedPreview = {
   url: string;
@@ -322,7 +400,6 @@ type DecodedEntry = {
   bytes: number;
 };
 type DecodedFlight = {
-  family: string;
   size: number;
   controller: AbortController;
   consumers: number;
@@ -351,7 +428,8 @@ async function decodePreview(blob: Blob): Promise<DecodedPreview> {
 // until their Picture releases them; no view keeps all full-size RAWs alive.
 export class DecodedPreviewPool {
   private entries = new Map<string, DecodedEntry>();
-  private flights = new Set<DecodedFlight>();
+  private families = new Map<string, Set<DecodedEntry>>();
+  private flights = new Map<string, Set<DecodedFlight>>();
   private bytes = 0;
   constructor(
     private maxBytes = 192 * 1024 * 1024,
@@ -362,17 +440,21 @@ export class DecodedPreviewPool {
     },
   ) {}
   private find(family: string, size: number, fallback: boolean) {
-    const candidates = [...this.entries.values()].filter(
-      (e) => e.family === family,
-    );
-    return (
-      candidates
-        .filter((e) => e.capacity >= capacity(size))
-        .sort((a, b) => (a.capacity - b.capacity) || a.asset.url.localeCompare(b.asset.url))[0] ||
-      (fallback
-        ? candidates.sort((a, b) => (b.capacity - a.capacity) || a.asset.url.localeCompare(b.asset.url))[0]
-        : undefined)
-    );
+    const candidates = this.families.get(family);
+    if (!candidates) return;
+    const required = capacity(size);
+    let match: DecodedEntry | undefined;
+    let smaller: DecodedEntry | undefined;
+    for (const entry of candidates) {
+      if (entry.capacity >= required) {
+        if (!match || entry.capacity < match.capacity ||
+          (entry.capacity === match.capacity && entry.asset.url.localeCompare(match.asset.url) < 0)) match = entry;
+      } else if (fallback && (!smaller || entry.capacity > smaller.capacity ||
+        (entry.capacity === smaller.capacity && entry.asset.url.localeCompare(smaller.asset.url) < 0))) {
+        smaller = entry;
+      }
+    }
+    return match || smaller;
   }
   peek(
     family: string,
@@ -403,11 +485,14 @@ export class DecodedPreviewPool {
   }
   private remove(entry: DecodedEntry) {
     this.entries.delete(entry.asset.url);
+    const family = this.families.get(entry.family)!;
+    family.delete(entry);
+    if (!family.size) this.families.delete(entry.family);
     this.bytes -= entry.bytes;
     this.dispose(entry.asset);
   }
   private trim(protectedEntry?: DecodedEntry) {
-    for (const entry of [...this.entries.values()]) {
+    for (const entry of this.entries.values()) {
       if (this.bytes <= this.maxBytes) break;
       if (!entry.refs && entry !== protectedEntry) this.remove(entry);
     }
@@ -423,23 +508,21 @@ export class DecodedPreviewPool {
       return Promise.reject(new DOMException("Cancelled", "AbortError"));
     const cached = this.peek(family, size, false);
     if (cached) return Promise.resolve(cached);
-    let flight = [...this.flights]
-      .filter(
-        (f) =>
-          f.family === family &&
-          !f.controller.signal.aborted &&
-          capacity(f.size) >= capacity(size),
-      )
-      .sort((a, b) => capacity(a.size) - capacity(b.size))[0];
+    const inFamily = this.flights.get(family) ?? new Set<DecodedFlight>();
+    let flight: DecodedFlight | undefined;
+    for (const candidate of inFamily) {
+      if (!candidate.controller.signal.aborted && capacity(candidate.size) >= capacity(size) &&
+        (!flight || capacity(candidate.size) < capacity(flight.size))) flight = candidate;
+    }
     if (!flight) {
       const request: DecodedFlight = {
-        family,
         size,
         controller: new AbortController(),
         consumers: 0,
         promise: null!,
       };
-      this.flights.add(request);
+      inFamily.add(request);
+      this.flights.set(family, inFamily);
       request.promise = (async () => {
         try {
           const blob = await load(request.controller.signal);
@@ -453,23 +536,27 @@ export class DecodedPreviewPool {
           const entry = {
             family,
             capacity:
-              nativeDimensions &&
+              size === 0 || (nativeDimensions &&
               asset.width === nativeDimensions.width &&
-              asset.height === nativeDimensions.height
+              asset.height === nativeDimensions.height)
                 ? Infinity
-                : size || Math.max(asset.width, asset.height),
+                : size,
             asset,
             refs: 0,
             bytes: asset.width * asset.height * 4,
           };
           this.entries.set(asset.url, entry);
+          const familyEntries = this.families.get(family) ?? new Set<DecodedEntry>();
+          familyEntries.add(entry);
+          this.families.set(family, familyEntries);
           this.bytes += entry.bytes;
           this.trim(entry);
           setTimeout(() => this.trim(), 0);
           return asset;
         } finally {
           clearTimeout(request.timer);
-          this.flights.delete(request);
+          inFamily.delete(request);
+          if (!inFamily.size) this.flights.delete(family);
         }
       })();
       flight = request;
@@ -484,7 +571,7 @@ export class DecodedPreviewPool {
         settled = true;
         signal?.removeEventListener("abort", abort);
         request.consumers--;
-        if (!request.consumers && this.flights.has(request))
+        if (!request.consumers && inFamily.has(request))
           request.timer = setTimeout(() => {
             if (!request.consumers) request.controller.abort();
           }, 120);
@@ -568,17 +655,21 @@ export function photoPreviewFamily(
   photo: Photo,
   original = false,
   revision = 0,
-  quality: "preview" | "source" = "preview",
+  quality: "preview" | "source" | "camera" = "preview",
   uncropped = false,
 ) {
   const recipe = photo.committed_recipe ?? photo.recipe;
-  return `${photo.id}/${photo.digest}/${quality}/${uncropped ? "uncropped" : "cropped"}/${original ? "original/" + geometrySignature(recipe) : JSON.stringify(recipe) + "/" + revision}`;
+  return `${photo.id}/${photo.digest}/${quality}/${uncropped ? "uncropped" : "cropped"}/${original || quality === "camera" ? "original/" + geometrySignature(recipe) : JSON.stringify(recipe) + "/" + revision}`;
 }
 let session: Promise<Connection> | undefined;
 export function connect(): Promise<Connection> {
   if (!session)
     session = isTauri()
-      ? invoke<Connection>("connection")
+      ? invoke<Connection>("connection").then((connection) => {
+          if (connection.dedicated_vram_mib != null)
+            detectedGraphics = previewGraphics(connection.dedicated_vram_mib);
+          return connection;
+        })
       : Promise.resolve().then(() => {
           const hash = new URLSearchParams(location.hash.slice(1));
           const port = Number(hash.get("port")),
@@ -616,11 +707,14 @@ export function photoBlob(
   original = false,
   signal?: AbortSignal,
   revision = 0,
-  quality: "preview" | "source" = "preview",
+  quality: "preview" | "source" | "camera" = "preview",
   uncropped = false,
 ) {
   const key = `${photoPreviewFamily(photo, original, revision, quality, uncropped)}/${size}`;
-  return previews.read(
+  const recipe = photo.committed_recipe ?? photo.recipe;
+  const pool = quality === "source" || (quality === "preview" && !original && recipe.film_advanced)
+    ? developedPreviews : previews;
+  return pool.read(
     key,
     async (requestSignal) => {
       const { port, token } = await connect();
@@ -643,10 +737,11 @@ export const liveBaseKey = (photo: Photo, uncropped = false) => JSON.stringify([
   photo.id, photo.digest, geometrySignature(uncropped ? {...photo.recipe,crop_x:0,crop_y:0,crop_w:1,crop_h:1} : photo.recipe),
   ...['raw_exposure','raw_wb','raw_temperature','raw_tint','raw_highlights','raw_denoise','raw_sharpen'].map(key => photo.recipe[key]),
 ]);
-export function liveBaseBlob(photo: Photo, uncropped: boolean, signal: AbortSignal) {
-  return previews.read(`live-base/${liveBaseKey(photo,uncropped)}`, async (requestSignal) => {
+export function liveBaseBlob(photo: Photo, uncropped: boolean, signal: AbortSignal, size = 1024) {
+  const pool = size === 0 ? developedPreviews : previews;
+  return pool.read(`live-base/${liveBaseKey(photo,uncropped)}/${size}`, async (requestSignal) => {
     const { port, token } = await connect();
-    const response = await fetch(`http://127.0.0.1:${port}/api/live-base/${photo.id}?uncropped=${uncropped ? 1 : 0}`, {
+    const response = await fetch(`http://127.0.0.1:${port}/api/live-base/${photo.id}?uncropped=${uncropped ? 1 : 0}&size=${size}`, {
       headers: { Authorization: `Bearer ${token}` }, signal:requestSignal,
     });
     if (!response.ok) throw new Error((await response.json()).error || '实时预览准备失败');
@@ -707,6 +802,24 @@ export async function compositeBlob(
   );
   if (!response.ok)
     throw Error((await response.json()).error || "合成预览失败");
+  return response.blob();
+}
+export async function draftBlob(photo: Photo, signal?: AbortSignal, previewSession?: string, size?: number) {
+  const {port,token}=await connect();
+  const response=await fetch(`http://127.0.0.1:${port}/api/draft-preview`,{
+    method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
+    body:JSON.stringify({id:photo.id,recipe:photo.recipe,preview_session:previewSession,size}),signal,
+  });
+  if(!response.ok)throw Error((await response.json()).error||'精细预览失败');
+  return response.blob();
+}
+export async function borderBlob(photo: Photo, signal?: AbortSignal, previewSession?: string) {
+  const { port, token } = await connect();
+  const response = await fetch(`http://127.0.0.1:${port}/api/border-preview`, {
+    method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({id:photo.id,recipe:photo.recipe,preview_session:previewSession}),signal,
+  });
+  if(!response.ok)throw Error((await response.json()).error || "片边预览失败");
   return response.blob();
 }
 export function classifyPhotos(
@@ -776,7 +889,7 @@ export function facetValue(photo: Photo, key: keyof Facets): string {
   if (key === "quality")
     return photo.score >= 75 ? "high" : photo.score >= 45 ? "balanced" : "low";
   if (key === "style") return String(photo.recipe?.style || "natural");
-  if (key === "film") return String(photo.recipe?.film_stock || "none");
+  if (key === "film") return filmStock(photo.recipe ?? {});
   return photo.features?.[key] || "unindexed";
 }
 export function facetCounts(

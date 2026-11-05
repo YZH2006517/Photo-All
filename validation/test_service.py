@@ -322,7 +322,7 @@ class ServiceTests(unittest.TestCase):
         self.addCleanup(catalog.close)
         catalog.import_files([path]);identity=catalog.photos()[0]['id']
         def read(original=False):
-            request=Request(self.base+f'/api/image/{identity}?size=300&original={int(original)}',headers={'Authorization':'Bearer test-secret'})
+            request=Request(self.base+f'/api/image/{identity}?quality=source&size=300&original={int(original)}',headers={'Authorization':'Bearer test-secret'})
             with urlopen(request) as response:return response.read()
         with patch.object(engine,'render_image',wraps=engine.render_image) as render:
             first=read();self.assertEqual(first,read());self.assertEqual(render.call_count,1)
@@ -331,6 +331,27 @@ class ServiceTests(unittest.TestCase):
             read(True);self.assertEqual(render.call_count,2)  # Reuses the neutral source preview.
             Image.new('RGB',(600,400),'blue').save(path)
             self.assertNotEqual(changed,read());self.assertEqual(render.call_count,3)
+
+    def test_editor_preview_and_live_base_keep_native_dimensions(self):
+        import engine
+        from io import BytesIO
+
+        path = self.root / 'native.png'
+        Image.new('RGB', (2680, 1400), 'coral').save(path)
+        catalog = engine.Catalog(self.root / 'data' / 'library.sqlite')
+        self.addCleanup(catalog.close)
+        catalog.import_files([path])
+        identity = catalog.photos()[0]['id']
+        catalog.edit([identity], recipe={'quarter_turns': 1, 'crop_w': .75})
+        for route in (f'image/{identity}?quality=source&size=0', f'live-base/{identity}?size=0'):
+            for uncropped, dimensions in ((0, (1050, 2680)), (1, (1400, 2680))):
+                with self.subTest(route=route, uncropped=uncropped):
+                    request = Request(f'{self.base}/api/{route}&uncropped={uncropped}',
+                                      headers={'Authorization': 'Bearer test-secret'})
+                    with urlopen(request, timeout=30) as response:
+                        self.assertEqual(response.headers['Content-Type'], 'image/png')
+                        with Image.open(BytesIO(response.read())) as preview:
+                            self.assertEqual(preview.size, dimensions)
 
     def test_failed_preview_is_shared_and_new_source_can_retry(self):
         import engine

@@ -62,6 +62,32 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(self.catalog.undo())
         self.assertEqual(list(self.catalog.db.execute('SELECT * FROM album_photos')), [])
 
+    def test_library_excludes_photos_only_in_trashed_albums(self):
+        album = self.catalog.create_album('Archived')['id']
+        other = self.catalog.create_album('Active')['id']
+        exclusive = self.photo('exclusive.png')
+        shared = self.photo('shared-trash.png', 'navy')
+        self.catalog.import_files([exclusive, shared], album_id=album)
+        self.catalog.import_files([shared], album_id=other)
+        self.catalog.trash_album(album)
+        self.assertEqual([p['name'] for p in self.catalog.photos()], [shared.name])
+        self.assertEqual(self.catalog.trash_albums()[0]['count'], 2)
+        self.catalog.restore_album(album)
+        self.assertEqual({p['name'] for p in self.catalog.photos()}, {exclusive.name, shared.name})
+
+    def test_library_deletion_exposes_old_hidden_photos_and_restores_memberships(self):
+        path = self.photo('recover.png')
+        album = self.catalog.create_album('Album')['id']
+        self.catalog.import_files([path], album_id=album)
+        photo = self.catalog.photos()[0]
+        self.catalog.remove_photos([photo['id']])
+        self.assertEqual(self.catalog.photos(), [])
+        self.assertEqual([p['id'] for p in self.catalog.trash_photos()], [photo['id']])
+        self.assertTrue(self.catalog.restore_photo(photo['id']))
+        self.assertEqual(self.catalog.trash_photos(), [])
+        self.assertEqual(self.catalog.photos()[0]['album_ids'], [album])
+        self.assertTrue(path.is_file())
+
     def test_expired_album_identity_cannot_be_reused_by_old_history(self):
         from unittest.mock import patch
         path = self.photo('id-reuse.png')

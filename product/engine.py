@@ -25,21 +25,25 @@ from collections import deque
 
 from PIL import Image, ImageCms, ImageEnhance, ImageFilter, ImageOps, ImageStat
 import film
+import film_spectral
 import open_filters
+import borders
 
 RASTER = {'.jpg', '.jpeg', '.png', '.webp', '.tif', '.tiff', '.bmp'}
 RAW = {'.dng', '.nef', '.arw', '.cr2', '.cr3', '.raf', '.rw2', '.orf', '.pef'}
 SUPPORTED = RASTER | RAW | {'.heic', '.heif'}
 STYLES = {'natural': '自然', 'warm': '暖调日记', 'cool': '清透冷调', 'film': '柔和胶片', 'mono': '经典黑白'}
 STYLES.update({key: value[0] for key, value in film.CREATIVE.items()})
-TEMPLATES = {'plain': '原比例', 'frame': '方形留白', 'portrait': '竖版留白'}
+TEMPLATES = {'recipe': '按照片片边设置', 'plain': '原比例', 'frame': '方形留白', 'portrait': '竖版留白'}
 DEFAULT_RECIPE = {'style': 'natural', 'exposure': 0, 'contrast': 1, 'saturation': 1, 'temperature': 0}
 RAW_DEFAULTS = {'raw_exposure': 0, 'raw_wb': 'camera', 'raw_temperature': 6500,
                 'raw_tint': 1, 'raw_highlights': 0, 'raw_denoise': 0, 'raw_sharpen': 0}
 DEFAULT_RECIPE.update(RAW_DEFAULTS)
 DEFAULT_RECIPE.update(film_stock='none', film_strength=1, film_grain=0, film_halation=0)
+DEFAULT_RECIPE['film_advanced'] = ''
 DEFAULT_RECIPE.update(filter_id='none', filter_strength=1)
 DEFAULT_RECIPE.update(filter_stack='')  # Empty string preserves legacy recipes; [] explicitly clears filters.
+DEFAULT_RECIPE.update(border='')
 IDENTITY_CURVE = '[[0,0],[1,1]]'
 EDITOR_RANGES = {
     'straighten': (-45, 45), 'crop_x': (0, 1), 'crop_y': (0, 1),
@@ -239,6 +243,12 @@ def develop_raw(path, recipe=None, preview_size=None, output_16bit=False):
     RAW_CACHE.mkdir(parents=True, exist_ok=True)
     target = RAW_CACHE / (key + ('.tif' if output_16bit else '.png'))
     cancellation = getattr(EXPORT_CONTEXT, 'cancellation', None)
+    if cancellation: cancellation.check()
+    try:
+        os.utime(target, None)
+        return target
+    except FileNotFoundError:
+        pass
     with raw_lock(cancellation):
         if cancellation: cancellation.check()
         if target.is_file():
@@ -299,44 +309,50 @@ def open_image(path, raw_recipe=None, preview_size=None, preserve_alpha=False):
         from pillow_heif import register_heif_opener
         register_heif_opener()
     with Image.open(path) as source:
-        if preview_size and source.format == 'JPEG':
-            source.draft('RGB', preview_size)
-        image = ImageOps.exif_transpose(source)
-        image.load()
-        if preview_size:
-            image.thumbnail(preview_size, Image.Resampling.LANCZOS)
-        transparent = image.mode in ('RGBA', 'LA') or (image.mode == 'P' and 'transparency' in image.info)
-        alpha = image.convert('RGBA').getchannel('A') if transparent else None
-        if image.mode == 'P':
-            image = image.convert('RGB')
-        icc = source.info.get('icc_profile')
-        if icc:
-            try:
-                image = ImageCms.profileToProfile(image, ImageCms.ImageCmsProfile(BytesIO(icc)),
-                                                  ImageCms.ImageCmsProfile(BytesIO(SRGB)), outputMode='RGB')
-            except (ImageCms.PyCMSError, OSError, ValueError) as exc:
-                raise ValueError('无法转换此图片的 ICC 色彩配置') from exc
-        elif image.mode == 'CMYK':
-            raise ValueError('CMYK 图片缺少 ICC，无法可靠转换到 sRGB')
-        if alpha is not None:
-            if preserve_alpha:
-                image = image.convert('RGBA')
-                image.putalpha(alpha)
-                return image
-            background = Image.new('RGB', image.size, 'white')
-            background.paste(image.convert('RGB'), mask=alpha)
-            image = background
-        return image.convert('RGB')
+        return _display_image(source, preview_size, preserve_alpha)
+
+
+def _display_image(source, preview_size=None, preserve_alpha=False):
+    if preview_size and source.format == 'JPEG':
+        source.draft('RGB', preview_size)
+    image = ImageOps.exif_transpose(source)
+    image.load()
+    if preview_size:
+        image.thumbnail(preview_size, Image.Resampling.LANCZOS)
+    transparent = image.mode in ('RGBA', 'LA') or (image.mode == 'P' and 'transparency' in image.info)
+    alpha = image.convert('RGBA').getchannel('A') if transparent else None
+    if image.mode == 'P':
+        image = image.convert('RGB')
+    icc = source.info.get('icc_profile')
+    if icc:
+        try:
+            image = ImageCms.profileToProfile(image, ImageCms.ImageCmsProfile(BytesIO(icc)),
+                                              ImageCms.ImageCmsProfile(BytesIO(SRGB)), outputMode='RGB')
+        except (ImageCms.PyCMSError, OSError, ValueError) as exc:
+            raise ValueError('无法转换此图片的 ICC 色彩配置') from exc
+    elif image.mode == 'CMYK':
+        raise ValueError('CMYK 图片缺少 ICC，无法可靠转换到 sRGB')
+    if alpha is not None:
+        if preserve_alpha:
+            image = image.convert('RGBA')
+            image.putalpha(alpha)
+            return image
+        background = Image.new('RGB', image.size, 'white')
+        background.paste(image.convert('RGB'), mask=alpha)
+        image = background
+    return image.convert('RGB')
 
 
 def validate_recipe(recipe):
     if not isinstance(recipe, dict):
         raise ValueError('配方格式无效')
     result = {**DEFAULT_RECIPE, **recipe}
+    result['border'] = json.dumps(borders.validate(result['border']),ensure_ascii=False,separators=(',',':')) if result['border'] else ''
     if result['style'] not in STYLES:
         raise ValueError('未知风格')
     if result['film_stock'] != 'none' and result['film_stock'] not in film.STOCKS:
         raise ValueError('未知胶片型号')
+    result['film_advanced'] = film_spectral.validate(result['film_advanced'], film.STOCKS)
     if result['filter_id'] != 'none' and not open_filters.known(result['filter_id']):
         raise ValueError('未知开放滤镜')
     if result['raw_wb'] not in {'camera', 'auto', 'custom'}:
@@ -491,9 +507,9 @@ def geometry_to_source(x, y, width, height, recipe):
     return u, v
 
 
-def render_image(path, recipe, max_size=None, preserve_alpha=False):
+def render_image(path, recipe, max_size=None, preserve_alpha=False, *, preview=False):
     import pixels
-    return pixels.to_image(render_pixels(path,recipe,max_size,preserve_alpha))
+    return pixels.to_image(pixels.render(path, recipe, max_size, preserve_alpha, preview=preview))
 
 
 def render_pixels(path,recipe,max_size=None,preserve_alpha=False):
@@ -502,7 +518,16 @@ def render_pixels(path,recipe,max_size=None,preserve_alpha=False):
 
 
 
-def analysis_image(path, cancel=None):
+def _exif_capture(source):
+    try:
+        exif = source.getexif()
+        detail = exif.get_ifd(34665) if 34665 in exif else {}
+        return detail.get(36867) or exif.get(36867) or exif.get(306)
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def analysis_image(path, cancel=None, *, fallback_raw=True):
     """Small analysis/display proxy plus native dimensions, never an export input.
 
     TIFF-based RAW containers expose an embedded JPEG and sensor/EXIF metadata.
@@ -548,9 +573,10 @@ def analysis_image(path, cancel=None):
             if min(native) < 512: raise ValueError('RAW native size unavailable')
             result, best_area = None, 0
             with path.open('rb') as stream:
-                for offset, length in candidates:
+                file_size = os.fstat(stream.fileno()).st_size
+                for offset, length in dict.fromkeys(candidates):
                     if cancel: cancel.check()
-                    if not 0 < length <= 32*1024*1024 or offset+length > path.stat().st_size: continue
+                    if not 0 < length <= 32*1024*1024 or offset+length > file_size: continue
                     stream.seek(offset)
                     data = stream.read(length)
                     if not data.startswith(b'\xff\xd8'): continue
@@ -578,6 +604,8 @@ def analysis_image(path, cancel=None):
             if orientation in {5, 6, 7, 8}: native = native[::-1]
             return result, native, captured
         except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError):
+            if not fallback_raw:
+                raise ValueError('此 RAW 没有可用的机内预览') from None
             # No metadata guess may reduce the professional source resolution.
             with cancellation_scope(cancel): image = open_image(path)
             native = image.size
@@ -591,9 +619,9 @@ def analysis_image(path, cancel=None):
     with Image.open(path) as source:
         orientation = source.getexif().get(274, 1)
         native = (source.height, source.width) if orientation in {5, 6, 7, 8} else source.size
-    with cancellation_scope(cancel): image = open_image(path, preview_size=(640, 640))
-    image.thumbnail((640, 640), Image.Resampling.LANCZOS)
-    return image, native, None
+        captured = _exif_capture(source)
+        image = _display_image(source, (640, 640))
+    return image, native, captured
 
 
 def analyze(path, cancel=None):
@@ -606,7 +634,7 @@ def analyze(path, cancel=None):
             chunk = stream.read(1024 * 1024)
             if not chunk: break
             digest.update(chunk)
-    image, (width, height), raw_captured = analysis_image(path, cancel)
+    image, (width, height), exif_captured = analysis_image(path, cancel)
     if cancel: cancel.check()
     gray = image.convert('L')
     gray.thumbnail((256, 256))
@@ -614,7 +642,7 @@ def analyze(path, cancel=None):
     total = sum(histogram)
     clipped = (sum(histogram[:5]) + sum(histogram[251:])) / total
     sharpness = ImageStat.Stat(gray.filter(ImageFilter.FIND_EDGES)).mean[0]
-    contrast = ImageStat.Stat(gray).stddev[0]
+    contrast = ImageStat.Stat(histogram).stddev[0]
     score = round(max(0, min(100, 25 + min(sharpness * 2, 35) + min(contrast / 2, 30) - clipped * 40)))
     sample = gray.resize((9, 8))
     pixels = list(sample.get_flattened_data())
@@ -622,21 +650,20 @@ def analyze(path, cancel=None):
                    for y in range(8) for x in range(8))
     captured = path.stat().st_mtime
     time_source = 'file'
-    if raw_captured:
+    if exif_captured:
         try:
-            captured = datetime.strptime(str(raw_captured), '%Y:%m:%d %H:%M:%S').timestamp()
+            captured = datetime.strptime(str(exif_captured), '%Y:%m:%d %H:%M:%S').timestamp()
             time_source = 'exif'
         except (ValueError, TypeError): pass
-    try:
-        with Image.open(path) as source:
-            exif = source.getexif()
-            detail = exif.get_ifd(34665) if 34665 in exif else {}
-            value = detail.get(36867) or exif.get(36867) or exif.get(306)
-            if value:
-                captured = datetime.strptime(str(value), '%Y:%m:%d %H:%M:%S').timestamp()
-                time_source = 'exif'
-    except (OSError, ValueError, TypeError, KeyError):
-        pass
+    if path.suffix.lower() in RAW or path.suffix.lower() in {'.heic', '.heif'}:
+        try:
+            with Image.open(path) as source:
+                value = _exif_capture(source)
+                if value:
+                    captured = datetime.strptime(str(value), '%Y:%m:%d %H:%M:%S').timestamp()
+                    time_source = 'exif'
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
     from workflow import visual_features
     features = visual_features(image)
     if cancel: cancel.check()
@@ -672,6 +699,7 @@ class Catalog:
             CREATE TABLE IF NOT EXISTS albums (id INTEGER PRIMARY KEY, name TEXT NOT NULL, created REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS album_photos (album_id INTEGER NOT NULL, photo_id INTEGER NOT NULL,
                 PRIMARY KEY(album_id,photo_id));
+            CREATE INDEX IF NOT EXISTS album_photos_by_photo ON album_photos(photo_id);
             CREATE TABLE IF NOT EXISTS composites (id INTEGER PRIMARY KEY, document TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS purged_albums (id INTEGER PRIMARY KEY);
         ''')
@@ -689,19 +717,35 @@ class Catalog:
     def close(self):
         self.db.close()
 
-    def photos(self, include_hidden=False):
+    def photos(self, include_hidden=False, *, paths=None, photo_id=None, trash_only=False):
         self.purge_expired_albums()
-        rows = [dict(row) for row in self.db.execute('SELECT * FROM photos '+('' if include_hidden else 'WHERE hidden=0 ')+'ORDER BY captured,id')]
+        query = 'SELECT * FROM photos WHERE 1=1'
+        if trash_only:
+            query += ' AND hidden=1'
+        elif not include_hidden:
+            query += ''' AND hidden=0 AND (
+                NOT EXISTS (SELECT 1 FROM album_photos WHERE photo_id=photos.id)
+                OR EXISTS (SELECT 1 FROM album_photos ap JOIN albums a ON a.id=ap.album_id
+                           WHERE ap.photo_id=photos.id AND a.trashed_at IS NULL))'''
+        params = ()
+        if photo_id is not None:
+            query += ' AND id=?'
+            params += (photo_id,)
+        rows = [dict(row) for row in self.db.execute(query + ' ORDER BY captured,id', params)
+                if paths is None or row['path'] in paths]
         for row in rows:
             row['recipe'] = {**DEFAULT_RECIPE, **json.loads(row['recipe'])}
             row['render_width'], row['render_height'] = render_dimensions(row)
             row['features'] = json.loads(row['features'])
             row['album_ids'] = []
-        membership = {}
-        for item in self.db.execute('SELECT ap.* FROM album_photos ap JOIN albums a ON a.id=ap.album_id WHERE a.trashed_at IS NULL'):
-            membership.setdefault(item['photo_id'], []).append(item['album_id'])
-        for row in rows:
-            row['album_ids'] = membership.get(row['id'], [])
+        membership = {row['id']: row['album_ids'] for row in rows}
+        query = 'SELECT ap.* FROM album_photos ap JOIN albums a ON a.id=ap.album_id WHERE a.trashed_at IS NULL'
+        if photo_id is not None:
+            query += ' AND ap.photo_id=?'
+        for item in self.db.execute(query, () if photo_id is None else (photo_id,)):
+            albums = membership.get(item['photo_id'])
+            if albums is not None:
+                albums.append(item['album_id'])
         return rows
 
     def albums(self, trashed=False):
@@ -713,6 +757,18 @@ class Catalog:
 
     def trash_albums(self):
         return self.albums(trashed=True)
+
+    def trash_photos(self):
+        return self.photos(trash_only=True)
+
+    def restore_photo(self, identity):
+        with self.db:
+            changed = self.db.execute('UPDATE photos SET hidden=0 WHERE id=? AND hidden=1', (identity,)).rowcount
+            if changed:
+                snapshot = {'operation': 'membership_delta', 'photos': [{'id': identity, 'hidden': 1}]}
+                self.db.execute('INSERT INTO history(snapshot) VALUES (?)', (json.dumps(snapshot),))
+                self.db.execute('DELETE FROM redo_history')
+        return bool(changed)
 
     def purge_expired_albums(self):
         # Own transaction only outside another catalog mutation.
@@ -866,23 +922,27 @@ class Catalog:
             workers.shutdown(wait=True, cancel_futures=True)
             if hasattr(iterator, 'close'): iterator.close()
         if progress: progress(done, total if total and cancel and cancel.event.is_set() else done)
-        return [p for p in self.photos() if p['path'] in imported], errors
+        photos = self.photos(paths=imported) if imported else []
+        return photos, errors
 
     def require_active_album(self, identity):
         if not self.db.execute('SELECT 1 FROM albums WHERE id=? AND trashed_at IS NULL', (identity,)).fetchone():
             raise ValueError('图集已删除或不存在，请先还原或新建图集')
 
     def regroup(self, cancel=None):
+        self.purge_expired_albums()
         seen, last, group = {}, None, None
         with self.db:
-            for photo in self.photos():
+            for photo in self.db.execute(
+                    'SELECT id,captured,digest,group_id,duplicate_of FROM photos WHERE hidden=0 ORDER BY captured,id'):
                 if cancel: cancel.check()
                 if last is None or photo['captured'] - last > 45 * 60:
                     group = str(photo['id'])
                 duplicate = seen.get(photo['digest'])
                 seen.setdefault(photo['digest'], photo['id'])
-                self.db.execute('UPDATE photos SET group_id=?,duplicate_of=? WHERE id=?',
-                                (group, duplicate, photo['id']))
+                if (group, duplicate) != (photo['group_id'], photo['duplicate_of']):
+                    self.db.execute('UPDATE photos SET group_id=?,duplicate_of=? WHERE id=?',
+                                    (group, duplicate, photo['id']))
                 last = photo['captured']
 
     def edit(self, ids, recipe=None, decision=None, recipe_patch=None, filter_append=None):
@@ -996,7 +1056,7 @@ class Catalog:
                 return True
             ids = {p['id'] for p in snapshot}
             current = [{'id': p['id'], 'recipe': p['recipe'], 'decision': p['decision']}
-                       for p in self.photos() if p['id'] in ids]
+                       for p in self.photos(include_hidden=True) if p['id'] in ids and not p['hidden']]
             self.db.execute(f'INSERT INTO {destination}(snapshot) VALUES (?)', (json.dumps(current),))
             for photo in snapshot:
                 self.db.execute('UPDATE photos SET recipe=?,decision=? WHERE id=?',
@@ -1005,7 +1065,7 @@ class Catalog:
         return True
 
 
-def export_photo(photo, folder, template='plain', size=2400, format='jpeg', cancellation=None):
+def export_photo(photo, folder, template='recipe', size=2400, format='jpeg', cancellation=None):
     """Full-source float processing, then one explicit codec boundary; never overwrite."""
     import pixels
     import numpy as np
@@ -1017,9 +1077,19 @@ def export_photo(photo, folder, template='plain', size=2400, format='jpeg', canc
     if cancellation: cancellation.check()
     if format!='original':
         with cancellation_scope(cancellation):
-            image=render_pixels(photo['path'],photo['recipe'],preserve_alpha=format in {'png','tiff','webp'})
+            scale = film_spectral.enlargement(photo['recipe'])
+            # Retain up to the requested output's native samples before the
+            # enlargement pass. The spectral working limit is applied in pixels.
+            target = (size*scale,size*scale) if scale > 1 and size else None
+            image=render_pixels(photo['path'],photo['recipe'],max_size=target,preserve_alpha=format in {'png','tiff','webp'})
         h,w=image.shape[:2]
-        if template=='plain':
+        if template=='recipe':
+            config=borders.validate(photo['recipe'].get('border',''))
+            if config['style']=='none':
+                if size and max(w,h)>size:
+                    scale=size/max(w,h);image=pixels.resize(image,(max(1,round(w*scale)),max(1,round(h*scale))))
+            else:image,_=borders.compose(image,config,borders.photo_info(photo),max_size=size)
+        elif template=='plain':
             if size and max(w,h)>size:
                 scale=size/max(w,h);image=pixels.resize(image,(max(1,round(w*scale)),max(1,round(h*scale))))
         else:
@@ -1050,12 +1120,24 @@ def export_photo(photo, folder, template='plain', size=2400, format='jpeg', canc
             else:pixels.write(stream,image,{'jpeg':'jpeg','png':'png16','tiff':'tiff16','webp':'webp_lossless'}[format])
         if cancellation: cancellation.check()
         os.replace(temporary,path)
+        simulation = None
+        if format != 'original':
+            if advanced := photo['recipe'].get('film_advanced'):
+                simulation = {'engine':'spektrafilm 0.3.4', 'revision':film.REVISION,
+                              'stock':json.loads(advanced)['stock'], 'mode':'spectral float32 bridge',
+                              'spatial_effects':'Spektrafilm'}
+            elif photo['recipe'].get('film_stock', 'none') != 'none':
+                simulation = {'engine':'spektrafilm 0.3.4', 'revision':film.REVISION,
+                              'stock':photo['recipe']['film_stock'], 'mode':'33^3 sRGB float LUT',
+                              'spatial_effects':'Photo All additions'}
         metadata={'schema':2,'source_name':photo['name'],'source_sha256':photo['digest'],'recipe':photo['recipe'],
             'template':template,'size':size,'format':format,'pipeline':'float32 sRGB SDR',
             'output_color':'original bytes' if format=='original' else 'sRGB SDR '+('16-bit' if format in {'png','tiff'} else '8-bit'),
             'recipe_applied':format!='original','lossless_encoding':format!='jpeg',
-            'film_simulation':{'engine':'spektrafilm 0.3.4','revision':film.REVISION,'stock':photo['recipe'].get('film_stock'),
-                'mode':'33^3 sRGB float LUT','spatial_effects':'Photo All additions'} if format!='original' and photo['recipe'].get('film_stock','none')!='none' else None}
+            'film_simulation':simulation}
+        if template=='recipe' and format!='original':
+            config=borders.validate(photo['recipe'].get('border',''))
+            metadata['border']={'settings':config,'printed':borders.labels(config,borders.photo_info(photo)) if config['style']!='none' else {}}
         identity=photo['recipe'].get('filter_id','none')
         metadata['open_filter']=({'id':identity,'strength':photo['recipe'].get('filter_strength',1),
             'revision':open_filters.REVISION,**{key:open_filters.manifest()['items'][identity][key]

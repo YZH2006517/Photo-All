@@ -1,0 +1,119 @@
+name: Build Photo All Studio for Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/signpath-build
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUSTUP_TOOLCHAIN: '1.99.1'
+      PYTHONUTF8: '1'
+      VITE_PHOTOALL_CREATIVE_DARKROOM: '0'
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.14.0'
+          package-manager-cache: false
+
+      - name: Set up Python x64
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12.10'
+          architecture: x64
+
+      - name: Verify release version metadata
+        run: |
+          $version = (Get-Content product/package.json -Raw | ConvertFrom-Json).version
+          $tauri = (Get-Content product/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargo = (Select-String -Path product/src-tauri/Cargo.toml -Pattern '^version = "([^"]+)"$' |
+            Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($version -ne $tauri -or $version -ne $cargo) {
+            throw 'package.json, tauri.conf.json and Cargo.toml must use the same release version'
+          }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Release tag $env:GITHUB_REF_NAME does not match v$version"
+          }
+
+      - name: Install build tools and locked frontend dependencies
+        run: |
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m pip install --disable-pip-version-check uv==0.11.17
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm --prefix product ci
+
+      - name: Prepare pinned engines and assets
+        run: python product/package_windows.py prepare
+
+      - name: Assemble third-party source packages
+        run: |
+          python product/package_windows.py sources
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python product/package_windows.py filter-sources
+
+      - name: Stage and verify the Windows runtime
+        run: |
+          python product/package_windows.py stage
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $ErrorActionPreference = 'Stop'
+          $sample = Get-Content validation/metadata/raw-samples.json -Raw |
+            ConvertFrom-Json | Where-Object model -EQ D7000
+          $raw = Join-Path $env:RUNNER_TEMP 'D7000.NEF'
+          Invoke-WebRequest -Uri ([uri]$sample.url).AbsoluteUri -OutFile $raw
+          if ((Get-FileHash -LiteralPath $raw -Algorithm SHA256).Hash -ne $sample.sha256) {
+            throw 'D7000 verification sample checksum mismatch'
+          }
+          $env:TEMP = $env:RUNNER_TEMP
+          $env:TMP = $env:RUNNER_TEMP
+          python validation/packaging_smoke.py product/build/runtime --raw $raw --require-spectral --output product/dist/ci/packaging-report.json
+
+      - name: Build NSIS installer and portable ZIP
+        run: |
+          python product/package_windows.py build --output product/dist/ci --archive-only
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git diff --exit-code HEAD -- product/package-lock.json product/src-tauri/Cargo.lock
+
+      - name: Archive the exact source revision
+        run: git archive --format=zip --prefix=Photo-All-source/ --output=product/dist/Photo-All-source.zip HEAD
+
+      - name: Store unsigned Windows release artifacts
+        id: windows-artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: photo-all-windows-x64-unsigned
+          path: product/dist/ci/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Store corresponding sources
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: photo-all-corresponding-sources
+          path: |
+            product/dist/Photo-All-source.zip
+            product/dist/Photo-All-third-party-corresponding-source.zip
+            product/dist/Photo-All-open-filter-sources.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

@@ -65,31 +65,38 @@ type PictureProps = {
 export function Albums({
   library,
   open,
+  openLibrary,
   create,
   Picture,
   busy,
   review,
+  darkroom,
   removeAlbum,
   restoreAlbum,
   purgeAlbum,
+  restorePhoto,
   trash = false,
   variantMode = "all",
   onVariantMode,
 }: {
   library: Library;
   open: (album: Album) => void;
+  openLibrary: () => void;
   create: (name: string) => Promise<void>;
   Picture: React.ComponentType<PictureProps>;
   busy: boolean;
   review: () => void;
+  darkroom?: () => void;
   removeAlbum: (album: Album) => void;
   restoreAlbum: (album: Album) => void;
   purgeAlbum: (album: Album) => Promise<void>;
+  restorePhoto: (photo: Photo) => void;
   trash?: boolean;
   variantMode?: VariantMode;
   onVariantMode?: (mode: VariantMode) => void;
 }) {
   const albums = trash ? library.trash_albums || [] : library.albums;
+  const trashedPhotos = trash ? library.trash_photos ?? [] : [];
   const visiblePhotoCount = applyVariantPreference(
     library.photos,
     variantMode,
@@ -182,6 +189,18 @@ export function Albums({
           {trash && <p>保留 30 天 · 只清除软件记录，保留本地原片</p>}
         </div>
         <div className="album-home-actions">
+          {!trash && darkroom && (
+            <button
+              className="album-darkroom-entry"
+              aria-label="首页胶片收藏室"
+              disabled={busy}
+              onClick={darkroom}
+            >
+              <Film size={18} />
+              <span>胶片收藏室</span>
+              <ArrowUpRight size={15} />
+            </button>
+          )}
           <button
             className="album-lighttable-entry"
             aria-label="首页电子观片台"
@@ -217,6 +236,13 @@ export function Albums({
         )}
       </div>
       <div className="album-grid">
+        {!trash && !albums.length && visiblePhotoCount > 0 && (
+          <button className="unfiled-photos" onClick={openLibrary}>
+            <Images size={18} />
+            <span>{visiblePhotoCount} 张未归档照片</span>
+            <ArrowUpRight size={15} />
+          </button>
+        )}
         {!trash && (
           <button
             className="new-album-tile"
@@ -234,11 +260,11 @@ export function Albums({
             <strong>新建图集</strong>
           </button>
         )}
-        {trash && !albums.length && (
+        {trash && !albums.length && !trashedPhotos.length && (
           <div className="trash-empty">
             <Trash2 size={32} />
             <strong>回收站是空的</strong>
-            <span>已删除的图集会在这里保留 30 天</span>
+            <span>从图库删除的照片可以在这里恢复，已删除的图集保留 30 天</span>
           </div>
         )}
         {albums.map((album, index) => {
@@ -357,13 +383,35 @@ export function Albums({
           );
         })}
       </div>
-      <div className="album-home-note">
-        <Palette size={18} />
-        <span>
-          用颜色寻找共鸣
-          <small>日期、主色、冷暖、亮度与内容，可以一起筛选。</small>
-        </span>
-      </div>
+      {!!trashedPhotos.length && (
+        <section className="trash-photos" aria-label="已删除照片">
+          <h2>已删除照片 <small>{trashedPhotos.length}</small></h2>
+          <div className="trash-photo-list">
+            {trashedPhotos.map((photo) => (
+              <article key={photo.id} className="trash-photo-card">
+                <Picture photo={photo} />
+                <div className="trash-photo-caption">
+                  <strong title={photo.name}>{photo.name}</strong>
+                  <button type="button" className="icon-button" disabled={busy}
+                    aria-label={`恢复照片 ${photo.name}`} title="恢复照片"
+                    onClick={() => restorePhoto(photo)}>
+                    <RotateCcw size={16} />
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
+      )}
+      {!trash && (
+        <div className="album-home-note">
+          <Palette size={18} />
+          <span>
+            用颜色寻找共鸣
+            <small>日期、主色、冷暖、亮度与内容，可以一起筛选。</small>
+          </span>
+        </div>
+      )}
       {menu &&
         createPortal(
           <div
@@ -488,11 +536,7 @@ export function Albums({
               />
             </label>
             {error && <p role="alert">{error}</p>}
-            <button
-              className="button primary"
-              type="submit"
-              disabled={saving}
-            >
+            <button className="button primary" type="submit" disabled={saving}>
               {saving ? "正在创建…" : "创建图集"}
               <ArrowUpRight size={16} />
             </button>

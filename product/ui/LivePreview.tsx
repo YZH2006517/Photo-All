@@ -11,6 +11,7 @@ import {
   liveRecipeKey,
   filterLayers,
   FilterLayer,
+  currentPreviewGraphics,
 } from "./model";
 
 type Table = { edge: number; data: number[] };
@@ -224,8 +225,15 @@ function renderer(canvas: HTMLCanvasElement) {
     previousCurves = "";
   return {
     base(image: HTMLImageElement) {
-      canvas.width = image.naturalWidth;
-      canvas.height = image.naturalHeight;
+      const width = image.naturalWidth, height = image.naturalHeight;
+      const maxTexture = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+      const [maxWidth, maxHeight] = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
+      if (width > Math.min(maxWidth, maxTexture) || height > Math.min(maxHeight, maxTexture))
+        throw Error("Image exceeds the native WebGL canvas limit");
+      canvas.width = width;
+      canvas.height = height;
+      if (gl.drawingBufferWidth !== width || gl.drawingBufferHeight !== height)
+        throw Error("Native WebGL canvas could not be allocated");
       gl.viewport(0, 0, canvas.width, canvas.height);
       bind(0, gl.TEXTURE_2D);
       settings(gl.TEXTURE_2D);
@@ -241,11 +249,13 @@ function renderer(canvas: HTMLCanvasElement) {
         image,
       );
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      if (gl.getError() !== gl.NO_ERROR) throw Error("Native preview texture upload failed");
       const probe = document.createElement("canvas");
-      probe.width = canvas.width;
-      probe.height = canvas.height;
+      const sampleScale = Math.min(1, 512 / Math.max(width, height));
+      probe.width = Math.max(1, Math.round(width * sampleScale));
+      probe.height = Math.max(1, Math.round(height * sampleScale));
       const context = probe.getContext("2d", { willReadFrequently: true })!;
-      context.drawImage(image, 0, 0);
+      context.drawImage(image, 0, 0, probe.width, probe.height);
       const bytes = context.getImageData(0, 0, probe.width, probe.height).data;
       histogram = new Float64Array(768);
       total = bytes.length / 4;
@@ -407,15 +417,23 @@ export function LivePreview({
   photo,
   exact,
   uncropped = false,
+  sourceSize = currentPreviewGraphics().liveSize,
+  onFrame,
 }: {
   photo: Photo;
   exact: string;
   uncropped?: boolean;
+  sourceSize?: number;
+  onFrame?: (canvas: HTMLCanvasElement) => void;
 }) {
+  const frameGate = useRef({ exact, live: liveRecipeKey(photo.recipe) });
+  frameGate.current = { exact, live: liveRecipeKey(photo.recipe) };
+  const frameCallback = useRef(onFrame);
+  frameCallback.current = onFrame;
   const canvas = useRef<HTMLCanvasElement>(null),
     gpu = useRef<ReturnType<typeof renderer> | null>(null);
   const source = useRef<{
-    image: HTMLImageElement;
+    key: string;
     recipe: Recipe;
     geometry: string;
   } | null>(null);
@@ -466,7 +484,7 @@ export function LivePreview({
     const controller = new AbortController();
     let url = "";
     if (gpu.current)
-      liveBaseBlob(committed, uncropped, controller.signal)
+      liveBaseBlob(committed, uncropped, controller.signal, sourceSize)
         .then(async (blob) => {
           if (controller.signal.aborted) return;
           url = URL.createObjectURL(blob);
@@ -476,7 +494,7 @@ export function LivePreview({
           if (controller.signal.aborted) return;
           gpu.current?.base(image);
           source.current = {
-            image,
+            key: baseKey,
             recipe: { ...committed.recipe },
             geometry: geometrySignature(
               uncropped
@@ -490,16 +508,17 @@ export function LivePreview({
                 : committed.recipe,
             ),
           };
-          gpu.current?.draw(latest.current, source.current.recipe);
           setReady(true);
           setBaseVersion((v) => v + 1);
         })
-        .catch(() => {});
+        .catch(() => {
+          if (!controller.signal.aborted) setReady(false);
+        });
     return () => {
       controller.abort();
       if (url) URL.revokeObjectURL(url);
     };
-  }, [baseKey]);
+  }, [baseKey, sourceSize]);
   useEffect(() => {
     const controller = new AbortController();
     setLooksReady(false);
@@ -536,15 +555,18 @@ export function LivePreview({
   const active =
     ready &&
     looksReady &&
+    source.current?.key === baseKey &&
     source.current?.geometry === geometry &&
     exact !== live;
   useEffect(() => {
-    if (!ready || !looksReady || !source.current) return;
+    if (!active || !source.current) return;
     const frame = requestAnimationFrame(() => {
       gpu.current?.draw(latest.current, source.current!.recipe);
+      if (canvas.current && frameGate.current.exact !== frameGate.current.live)
+        frameCallback.current?.(canvas.current);
     });
     return () => cancelAnimationFrame(frame);
-  }, [live, ready, looksReady, baseKey, baseVersion]);
+  }, [live, active, baseVersion]);
   return (
     <>
       <canvas

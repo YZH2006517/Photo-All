@@ -14,13 +14,14 @@ import secrets
 import os
 import threading
 import sqlite3
-from contextlib import closing
+from contextlib import closing, nullcontext
 from urllib.parse import parse_qs, urlsplit
 
 import engine
 import workflow
 import film
 import open_filters
+import borders
 
 ORIGINS = {'http://127.0.0.1:1420', 'http://localhost:1420', 'http://tauri.localhost', 'tauri://localhost', 'https://tauri.localhost'}
 
@@ -50,7 +51,10 @@ class StudioServer(ThreadingHTTPServer):
         self.lock = threading.Lock()
         self.worker = ThreadPoolExecutor(max_workers=1)
         self.preview_lock = threading.Lock()
-        self.preview_slots = threading.Semaphore(2)
+        self.preview_slots = threading.BoundedSemaphore(2)
+        self.preview_workers = threading.BoundedSemaphore(min(4, max(2, (os.cpu_count() or 2) // 2)))
+        self.thumbnail_workers = threading.BoundedSemaphore(min(4, max(2, (os.cpu_count() or 2) // 2)))
+        self.border_pending = OrderedDict()
         self.previews = OrderedDict()
         self.preview_bytes = 0
         self.preview_flights = {}
@@ -58,7 +62,9 @@ class StudioServer(ThreadingHTTPServer):
         self.preview_pruned = 0
         self.preview_dir = self.data_dir / 'previews'
         self.preview_dir.mkdir(parents=True, exist_ok=True)
-        self.preview_version = tuple(p.stat().st_mtime_ns for p in [Path(engine.__file__),Path(__file__),Path(film.__file__),Path(open_filters.__file__),Path(engine.__file__).with_name('pixels.py')])
+        self.preview_version = tuple(p.stat().st_mtime_ns for p in [
+            Path(engine.__file__), Path(__file__), Path(film.__file__), Path(open_filters.__file__),
+            Path(__file__).with_name('pixels.py'), Path(__file__).with_name('film_spectral.py')])
         engine.RAW_CACHE = self.data_dir / 'raw-cache'
         engine.Catalog(self.data_dir / 'library.sqlite').close()
         super().__init__(address, Handler)
@@ -107,12 +113,19 @@ class StudioServer(ThreadingHTTPServer):
 
     def preview(self, photo, size, original, quality='preview',uncropped=False):
         import time
-        stat = Path(photo['path']).stat()
+        source = Path(photo['path'])
+        stat = source.stat()
+        is_raw = source.suffix.lower() in engine.RAW
+        camera = quality == 'camera'
+        if camera and (not is_raw or not 0 < size <= 640):
+            raise ValueError('机内预览只支持 640 像素以内的 RAW 照片')
         geometry=('quarter_turns','flip_x','flip_y','straighten','crop_x','crop_y','crop_w','crop_h')
-        recipe=engine.validate_recipe({**{key:photo['recipe'].get(key,engine.DEFAULT_RECIPE[key]) for key in geometry}} if original else photo['recipe'])
+        recipe = engine.validate_recipe(
+            {key: photo['recipe'].get(key, engine.DEFAULT_RECIPE[key]) for key in geometry}
+            if original or camera else photo['recipe'])
         if uncropped:recipe.update(crop_x=0,crop_y=0,crop_w=1,crop_h=1)
         raw_identity = None
-        if Path(photo['path']).suffix.lower() in engine.RAW:
+        if is_raw and not camera:
             executable = engine.raw_executable()
             if executable:
                 executable_stat = executable.stat()
@@ -169,21 +182,39 @@ class StudioServer(ThreadingHTTPServer):
                 raise TimeoutError('Preview processing timed out')
         temporary = None
         try:
-            # Shared requests wait without using a decode slot. At most two full images live here.
-            with self.preview_slots:
+            suffix = source.suffix.lower()
+            proxy = camera or (not lossless and 0 < size <= 640 and recipe == engine.DEFAULT_RECIPE
+                               and (is_raw or suffix in {'.jpg', '.jpeg'}))
+            source_pixels = (photo.get('width') or 0) * (photo.get('height') or 0)
+            small_jpeg = (0 < size <= 1024 and suffix in {'.jpg', '.jpeg'}
+                          and 0 < source_pixels <= 24_000_000
+                          and recipe.get('crop_w', 1) == recipe.get('crop_h', 1) == 1
+                          and not recipe.get('straighten', 0))
+            # Keep expensive decodes at two and bound the shared total on every machine.
+            heavy = nullcontext() if proxy or small_jpeg else self.preview_slots
+            with heavy, (self.thumbnail_workers if proxy else self.preview_workers):
                 value = cached()
                 if value is not None:
                     return remember(value)
-                if (not lossless and 0 < size <= 640 and recipe == engine.DEFAULT_RECIPE
-                        and Path(photo['path']).suffix.lower() in engine.RAW):
-                    # Embedded JPEG is a browsing proxy only. Editing/source requests
-                    # always use the unchanged float32 professional RAW pipeline.
-                    image, _, _ = engine.analysis_image(photo['path'])
+                if proxy and is_raw:
+                    image, _, _ = engine.analysis_image(source, fallback_raw=not camera)
+                    if camera and recipe != engine.DEFAULT_RECIPE:
+                        import numpy as np
+                        import pixels
+                        image = pixels.to_image(pixels._geometry(np.asarray(image, dtype=np.float32) / 255, recipe))
                     image.thumbnail((size, size))
+                elif proxy:
+                    image = engine.open_image(photo['path'], preview_size=(size, size))
                 else:
-                    image = engine.render_image(photo['path'], recipe, (size, size) if size else None)
+                    render_recipe = recipe
+                    if lossless and size == 0 and engine.film_spectral.enlargement(recipe) > 1:
+                        # Native previews keep the source pixel grid. Print enlargement is applied on export.
+                        config = json.loads(recipe['film_advanced'])
+                        config['enlarge'] = '1'
+                        render_recipe = {**recipe, 'film_advanced': json.dumps(config)}
+                    image = engine.render_image(source, render_recipe, (size, size) if size else None, preview=True)
                 output = BytesIO()
-                if lossless:image.save(output,format='PNG',compress_level=3,icc_profile=engine.SRGB)
+                if lossless:image.save(output,format='PNG',compress_level=1 if is_raw else 3,icc_profile=engine.SRGB)
                 else:image.save(output, format='JPEG', quality=88, icc_profile=engine.SRGB)
                 value = output.getvalue()
                 import tempfile
@@ -219,7 +250,8 @@ class StudioServer(ThreadingHTTPServer):
         for path in self.preview_dir.iterdir():
             if path.suffix not in {'.jpg','.png'}:continue
             try:
-                files.append((path.stat().st_mtime_ns, path.stat().st_size, path))
+                stat = path.stat()
+                files.append((stat.st_mtime_ns, stat.st_size, path))
             except FileNotFoundError:
                 pass
         total = 0
@@ -282,12 +314,23 @@ class Handler(BaseHTTPRequestHandler):
     def library(self):
         catalog = engine.Catalog(self.server.data_dir / 'library.sqlite')
         try:
-            return {'photos': catalog.photos(), 'albums': catalog.albums(), 'trash_albums': catalog.trash_albums(), 'composites': catalog.composites(), 'history': catalog.history_state(), 'film': film.catalog(),
+            return {'photos': catalog.photos(), 'albums': catalog.albums(), 'trash_albums': catalog.trash_albums(),
+                    'trash_photos': catalog.trash_photos(), 'composites': catalog.composites(), 'history': catalog.history_state(), 'film': film.catalog(),
                     'filters': open_filters.catalog(),
                     'recognition': workflow.recognition_status(), 'capabilities': engine.capabilities(), 'styles': engine.STYLES,
                     'templates': engine.TEMPLATES, 'defaults': engine.DEFAULT_RECIPE}
         finally:
             catalog.close()
+
+    def preview_photo(self, identity, *, visible_only=False):
+        with closing(sqlite3.connect((self.server.data_dir / 'library.sqlite').as_uri() + '?mode=ro', uri=True)) as database:
+            database.row_factory = sqlite3.Row
+            query = 'SELECT id,path,recipe,width,height FROM photos WHERE id=?'
+            if visible_only:
+                query += ' AND hidden=0'
+            row = database.execute(query, (identity,)).fetchone()
+            if row:
+                return {**row, 'recipe': json.loads(row['recipe'])}
 
     def handle_api(self):
         if not self.allowed():
@@ -305,6 +348,43 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('请求必须为对象')
             if route.path == '/api/library' and self.command == 'GET':
                 return self.reply(self.library())
+            if route.path in {'/api/border-info','/api/border-preview','/api/draft-preview'} and self.command=='POST':
+                identity=body.get('id')
+                if type(identity) is not int or identity<1:raise ValueError('照片 ID 无效')
+                draft=route.path=='/api/draft-preview'
+                size=body.get('size',1200) if draft else 1200
+                if type(size) is not int or not 120 <= size <= 1920:raise ValueError('预览尺寸无效')
+                if draft:
+                    photo=self.preview_photo(identity,visible_only=True)
+                else:
+                    with closing(engine.Catalog(self.server.data_dir/'library.sqlite')) as catalog:
+                        photo=next(iter(catalog.photos(photo_id=identity)),None)
+                        if photo:
+                            albums={a['id']:a for a in catalog.albums()}
+                            photo['border_album']=next((albums[i]['name'] for i in sorted(photo['album_ids']) if i in albums),'')
+                if not photo:return self.reply({'error':'照片不存在'},404)
+                info={} if draft else borders.photo_info(photo)
+                if route.path=='/api/border-info':return self.reply(info)
+                recipe=engine.validate_recipe(body.get('recipe',photo['recipe']))
+                config=borders.validate(recipe.get('border',''))
+                session=body.get('preview_session','api')
+                if not isinstance(session,str) or len(session)>80:raise ValueError('片边预览会话无效')
+                family=(route.path,identity,session);ticket=secrets.token_hex(8)
+                with self.server.preview_lock:
+                    self.server.border_pending[family]=ticket
+                    self.server.border_pending.move_to_end(family)
+                    while len(self.server.border_pending)>256:self.server.border_pending.popitem(last=False)
+                with self.server.preview_slots, self.server.preview_workers:
+                    with self.server.preview_lock:
+                        current=self.server.border_pending.get(family)==ticket
+                    if not current:return self.reply({'error':'片边预览已被更新请求替代'},409)
+                    image=engine.render_pixels(photo['path'],recipe,max_size=(size,size),preserve_alpha=True)
+                    if not draft:image,_=borders.compose(image,config,info,max_size=1200)
+                    import pixels
+                    output=BytesIO();pixels.write(output,image,'png8')
+                with self.server.preview_lock:
+                    if self.server.border_pending.get(family)==ticket:self.server.border_pending.pop(family,None)
+                return self.reply(output.getvalue(),content_type='image/png')
             if route.path == '/api/live-look' and self.command == 'GET':
                 import numpy as np
                 import pixels
@@ -336,20 +416,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(job or {'error': '任务不存在'}, 200 if job else 404)
             if (route.path.startswith('/api/image/') or route.path.startswith('/api/filter-preview/') or route.path.startswith('/api/live-base/')) and self.command == 'GET':
                 identity = int(route.path.rsplit('/', 1)[1])
-                with closing(sqlite3.connect((self.server.data_dir / 'library.sqlite').as_uri() + '?mode=ro', uri=True)) as database:
-                    database.row_factory = sqlite3.Row
-                    row = database.execute('SELECT id,path,recipe FROM photos WHERE id=?', (identity,)).fetchone()
-                    photo = dict(row) if row else None
-                    if photo: photo['recipe'] = json.loads(photo['recipe'])
+                photo = self.preview_photo(identity)
                 if not photo:
                     return self.reply({'error': '照片不存在'}, 404)
-                query = parse_qs(route.query)
                 if route.path.startswith('/api/live-base/'):
                     recipe = engine.validate_recipe(photo['recipe'])
                     keep = (*engine.RAW_DEFAULTS, 'quarter_turns', 'flip_x', 'flip_y', 'straighten',
                             'crop_x', 'crop_y', 'crop_w', 'crop_h')
                     neutral = {**engine.DEFAULT_RECIPE, **{key: recipe[key] for key in keep}}
-                    return self.reply(self.server.preview({**photo, 'recipe': neutral}, 1024, False, 'source',
+                    requested = query.get('size', ['1024'])[0]
+                    size = int(requested) if requested in {'0', '768', '1280', '1536'} else 1024
+                    return self.reply(self.server.preview({**photo, 'recipe': neutral}, size, False, 'source',
                         query.get('uncropped') == ['1']), content_type='image/png')
                 if route.path.startswith('/api/filter-preview/'):
                     identity=query.get('filter_id',['none'])[0]
@@ -365,7 +442,7 @@ class Handler(BaseHTTPRequestHandler):
                     size=min(480,max(120,int(query.get('size',['240'])[0])))
                     return self.reply(self.server.preview(photo,size,False),content_type='image/jpeg')
                 quality=query.get('quality',['preview'])[0]
-                if quality not in {'source','preview'}:raise ValueError('显示质量无效')
+                if quality not in {'source','preview','camera'}:raise ValueError('显示质量无效')
                 requested=int(query.get('size',['1200'])[0])
                 size=0 if quality=='source' and requested==0 else min(16384 if quality=='source' else 2400,max(120,requested))
                 return self.reply(self.server.preview(photo,size,query.get('original')==['1'],quality,query.get('uncropped')==['1']),content_type='image/png' if quality=='source' else 'image/jpeg')
@@ -385,6 +462,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.reply({'changed': changed})
                 finally:
                     catalog.close()
+            if re.fullmatch(r'/api/photos/\d+/restore', route.path) and self.command == 'POST':
+                with closing(engine.Catalog(self.server.data_dir / 'library.sqlite')) as catalog:
+                    return self.reply({'changed': catalog.restore_photo(int(route.path.split('/')[-2]))})
             if route.path=='/api/remove' and self.command=='POST':
                 catalog=engine.Catalog(self.server.data_dir/'library.sqlite')
                 try:return self.reply({'changed':catalog.remove_photos(body.get('ids'),body.get('album_id'),body.get('album_ids')),'history':catalog.history_state()})
@@ -513,6 +593,7 @@ class Handler(BaseHTTPRequestHandler):
                 scope = scope if scope is not None else list(albums)
                 tasks = []
                 for photo in photos:
+                    photo['border_album']=next((albums[identity]['name'] for identity in sorted(photo['album_ids']) if identity in albums),'')
                     if folder_mode == 'single':
                         tasks.append((photo, folder))
                     else:
@@ -523,7 +604,7 @@ class Handler(BaseHTTPRequestHandler):
                             name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', albums[identity]['name']).replace('..', '_').strip(' .')[:70] or '图集'
                             # Prefix avoids Windows device names, suffix separates identical names.
                             tasks.append((photo, str(Path(folder) / f'album_{name}_{identity}')))
-                template, size = body.get('template', 'plain'), int(body.get('size', 2400))
+                template, size = body.get('template', 'recipe'), int(body.get('size', 2400))
                 format=body.get('format','jpeg')
                 if format not in {'jpeg','png','tiff','webp','original','tiff16'}:raise ValueError('未知导出格式')
                 raw16 = format == 'tiff16'

@@ -17,6 +17,36 @@ use tauri::Manager;
 struct Connection {
     port: u16,
     token: String,
+    dedicated_vram_mib: Option<usize>,
+}
+
+#[cfg(windows)]
+fn dedicated_vram_mib() -> Option<usize> {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
+    };
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let mut maximum: Option<usize> = None;
+        for index in 0.. {
+            let Ok(adapter) = factory.EnumAdapters1(index) else {
+                break;
+            };
+            let Ok(desc) = adapter.GetDesc1() else {
+                continue;
+            };
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                let mib = desc.DedicatedVideoMemory / (1024 * 1024);
+                maximum = Some(maximum.map_or(mib, |current| current.max(mib)));
+            }
+        }
+        maximum
+    }
+}
+
+#[cfg(not(windows))]
+fn dedicated_vram_mib() -> Option<usize> {
+    None
 }
 struct Backend {
     child: Mutex<Child>,
@@ -138,6 +168,7 @@ fn start_backend(app: &tauri::App) -> Result<Backend, Box<dyn std::error::Error>
             Ok(Connection {
                 port: port as u16,
                 token,
+                dedicated_vram_mib: dedicated_vram_mib(),
             })
         });
     match parsed {

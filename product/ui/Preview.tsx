@@ -16,9 +16,11 @@ import {
   photoPreviewFamily,
   decodedPreviews,
   DecodedPreview,
+  BROWSE_PREVIEW_SIZE,
   geometrySignature,
   Recipe,
   liveRecipeKey,
+  isRaw,
 } from "./model";
 import { LivePreview } from "./LivePreview";
 
@@ -30,13 +32,14 @@ export function sourceSize(pixels: number) {
 
 export const Picture = memo(function Picture({
   photo,
-  size = 480,
+  size = BROWSE_PREVIEW_SIZE,
   revision = 0,
   original = false,
   onLoaded,
   className = "",
   eager = false,
   quality = "preview",
+  reusePreview = false,
   sourceScale,
   uncropped = false,
 }: {
@@ -48,6 +51,7 @@ export const Picture = memo(function Picture({
   className?: string;
   eager?: boolean;
   quality?: "preview" | "source";
+  reusePreview?: boolean;
   sourceScale?: number;
   uncropped?: boolean;
 }) {
@@ -85,9 +89,7 @@ export const Picture = memo(function Picture({
     quality,
     uncropped,
   );
-  const [visible, setVisible] = useState(
-      eager || !!decodedPreviews.peek(family, size),
-    ),
+  const [visible, setVisible] = useState(eager),
     [display, setDisplay] = useState<{
       photoId: number;
       asset: DecodedPreview;
@@ -97,6 +99,7 @@ export const Picture = memo(function Picture({
     [loaded, setLoaded] = useState<{ url: string; geometry: string } | null>(
       null,
     ),
+    [browseVersion, refreshBrowse] = useState(0),
     [error, setError] = useState("");
   const held = useRef(new Set<DecodedPreview>());
   const [sourcePixels, setSourcePixels] = useState(0);
@@ -118,16 +121,31 @@ export const Picture = memo(function Picture({
     quality === "source" && sourceScale !== undefined
       ? sourceSize(sourcePixels)
       : size;
-  const cached = decodedPreviews.peek(family, requestedSize);
+  const cached = visible ? decodedPreviews.peek(family, requestedSize, requestedSize !== 0) : undefined;
+  const previous = display?.photoId === photo.id ? display : null;
+  const spectralEdit = !original && !!requestedPhoto.recipe.film_advanced;
+  const cameraFallback = quality === "source" && isRaw(requestedPhoto);
+  const browseQuality = cameraFallback ? "camera" : "preview";
+  const canUseBrowse = ((reusePreview || cameraFallback) && quality === "source")
+    || (spectralEdit && quality === "preview" && requestedSize <= 640);
+  const browseFamily = photoPreviewFamily(requestedPhoto, original || spectralEdit, revision, browseQuality, uncropped);
+  const previewFamily = photoPreviewFamily(requestedPhoto, original, revision, "preview", uncropped);
+  const editedBrowse = visible && canUseBrowse && !cached && !previous
+    ? decodedPreviews.peek(previewFamily, BROWSE_PREVIEW_SIZE)
+    : undefined;
+  const provisional = visible && canUseBrowse && !cached && !previous
+    ? editedBrowse || (browseFamily !== previewFamily
+        ? decodedPreviews.peek(browseFamily, BROWSE_PREVIEW_SIZE)
+        : undefined)
+    : undefined;
+  const showingOriginalProxy = !!provisional && spectralEdit && !editedBrowse;
+  const showingCamera = !!provisional && cameraFallback && !editedBrowse;
   const requestedGeometry = geometrySignature(
     uncropped
       ? { ...requestedPhoto.recipe, crop_x: 0, crop_y: 0, crop_w: 1, crop_h: 1 }
       : requestedPhoto.recipe,
   );
-  const shown =
-    visible || quality !== "source"
-      ? cached || (display?.photoId === photo.id ? display.asset : undefined)
-      : undefined;
+  const shown = visible ? cached || previous?.asset || provisional : undefined;
   const url = shown?.url || "";
   const shownGeometry = cached ? requestedGeometry : display?.geometry || "";
   const acknowledged = useRef<{ url: string; geometry: string } | null>(null);
@@ -136,7 +154,8 @@ export const Picture = memo(function Picture({
       frame.current?.querySelector("img") !== image ||
       (image.currentSrc || image.src) !== url ||
       !image.complete ||
-      !image.naturalWidth
+      !image.naturalWidth ||
+      provisional
     )
       return;
     if (
@@ -176,7 +195,7 @@ export const Picture = memo(function Picture({
         decodedPreviews.release(asset);
         held.current.delete(asset);
       }
-  }, [shown]);
+  }, [shown, display?.asset, browseVersion]);
   useEffect(
     () => () => {
       for (const asset of held.current) decodedPreviews.release(asset);
@@ -191,26 +210,37 @@ export const Picture = memo(function Picture({
     }
     if (!frame.current) return;
     const observer = new IntersectionObserver(
-      (entries) => {
-        const intersecting = entries.some((e) => e.isIntersecting);
-        if (quality === "source") setVisible(intersecting);
-        else if (intersecting) {
-          setVisible(true);
-          observer.disconnect();
-        }
-      },
+      (entries) => setVisible(entries[entries.length - 1].isIntersecting),
       { rootMargin: quality === "source" ? "80px" : "200px" },
     );
     observer.observe(frame.current);
     return () => observer.disconnect();
   }, [eager, quality]);
   useEffect(() => {
+    if (!visible || !canUseBrowse || cached || previous || editedBrowse) return;
+    const controller = new AbortController();
+    decodedPreviews.read(
+      browseFamily,
+      BROWSE_PREVIEW_SIZE,
+      (signal) => photoBlob(requestedPhoto, BROWSE_PREVIEW_SIZE, original || spectralEdit,
+        signal, revision, browseQuality, uncropped),
+      controller.signal,
+      nativeDimensions,
+    ).then((asset) => {
+      if (controller.signal.aborted) return;
+      if (!held.current.has(asset)) {
+        decodedPreviews.retain(asset);
+        held.current.add(asset);
+      }
+      refreshBrowse((value) => value + 1);
+    }).catch(() => { /* The main render reports any persistent image error. */ });
+    return () => controller.abort();
+  }, [visible, canUseBrowse, browseFamily, !!cached, !!previous, !!editedBrowse]);
+  useEffect(() => {
     if (quality === "source" && sourceScale !== undefined && !sourcePixels)
       return;
     if (!visible) {
-      if (quality === "source") {
-        setDisplay(null);
-      }
+      setDisplay(null);
       return;
     }
     const controller = new AbortController();
@@ -280,9 +310,10 @@ export const Picture = memo(function Picture({
       {!url && visible && loading && (
         <LoaderCircle className="spin" size={20} />
       )}
-      {url && loading && (
-        <span className="picture-refresh">
-          <LoaderCircle className="spin" size={12} />
+      {url && ((loading && !reusePreview) || showingOriginalProxy || showingCamera) && (
+        <span className={`picture-refresh${showingOriginalProxy || showingCamera ? " picture-refresh-labeled" : ""}`}>
+          {loading && <LoaderCircle className="spin" size={12} />}
+          {showingCamera ? <span>机内暂览</span> : showingOriginalProxy && <span>原图暂览</span>}
         </span>
       )}
       {error && (
@@ -301,33 +332,36 @@ export function Comparison({
   revision = 0,
   active,
   onLoaded,
-  scale = 1,
   uncropped = false,
 }: {
   photo: Photo;
   revision?: number;
   active: boolean;
   onLoaded: (image: HTMLImageElement) => void;
-  scale?: number;
   uncropped?: boolean;
 }) {
   const surface = useRef<HTMLDivElement>(null),
     frame = useRef<HTMLDivElement>(null);
   const [bounds, setBounds] = useState({ width: 0, height: 0 }),
     [position, setPosition] = useState(0.5),
-    [originalReady, setOriginalReady] = useState(false);
+    [readyOriginal, setReadyOriginal] = useState("");
   const [exact, setExact] = useState(() =>
     liveRecipeKey(photo.committed_recipe ?? photo.recipe),
   );
-  const markOriginalReady = useCallback(() => setOriginalReady(true), []);
   const acknowledgedPhoto = {
     ...photo,
     recipe: photo.committed_recipe ?? photo.recipe,
   };
   const geometry = geometrySignature(acknowledgedPhoto.recipe);
-  useLayoutEffect(
-    () => setOriginalReady(false),
-    [photo.id, geometry, uncropped],
+  // A cached image can acknowledge in the child's layout effect on the same
+  // commit as a geometry change. Match that acknowledgement to its geometry.
+  const originalKey = `${photo.id}/${geometry}/${!!uncropped}`;
+  const originalReady = readyOriginal === originalKey;
+  const markOriginalReady = useCallback(
+    (_image: HTMLImageElement, recipe?: Recipe) => {
+      if (recipe && geometrySignature(recipe) === geometry) setReadyOriginal(originalKey);
+    },
+    [geometry, originalKey],
   );
   useLayoutEffect(() => {
     const element = surface.current!;
@@ -380,7 +414,7 @@ export function Comparison({
         <Picture
           photo={photo}
           revision={revision}
-          size={1600}
+          size={0}
           eager
           onLoaded={(image, recipe) => {
             setExact(
@@ -391,9 +425,9 @@ export function Comparison({
           className="comparison-edited"
           quality="source"
           uncropped={uncropped}
-          sourceScale={scale}
         />
-        <LivePreview photo={photo} exact={exact} uncropped={uncropped} />
+        {!photo.recipe.film_advanced && !photo.committed_recipe?.film_advanced &&
+          <LivePreview photo={photo} exact={exact} uncropped={uncropped} sourceSize={0} />}
         {active && (
           <>
             <div
@@ -403,12 +437,11 @@ export function Comparison({
                 photo={photo}
                 original
                 revision={revision}
-                size={1600}
+                size={0}
                 eager
                 onLoaded={markOriginalReady}
                 quality="source"
                 uncropped={uncropped}
-                sourceScale={scale}
               />
             </div>
             <span className="comparison-label before">

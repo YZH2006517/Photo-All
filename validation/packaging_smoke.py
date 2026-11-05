@@ -15,10 +15,12 @@ def main():
     parser.add_argument('runtime', type=Path)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--raw', type=Path, help='Optional RAW fixture copied into the relocated test directory')
+    parser.add_argument('--require-spectral', action='store_true',
+                        help='Require the bundled Spektrafilm worker and render a float preview')
     args = parser.parse_args()
-    temp_parent = Path(__file__).resolve().parent / 'artifacts'
-    temp_parent.mkdir(exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='Photo All 独立验证 ', dir=temp_parent) as temporary:
+    # The bundled GTK icons include long relative names. Keep the relocated
+    # directory short while still testing both spaces and non-ASCII characters.
+    with tempfile.TemporaryDirectory(prefix='PA 验证 ') as temporary:
         temporary = Path(temporary)
         runtime = temporary / 'application' / 'runtime'
         shutil.copytree(args.runtime, runtime)
@@ -57,6 +59,15 @@ graded = film.apply_film(image, {'film_stock':'kodak_portra_400','film_strength'
 assert graded.tobytes() != image.tobytes()
 look = next(iter(looks['items']))
 base = engine.render_pixels(sys.argv[1], {})
+spectral_rendered = False
+if sys.argv[3] == '1':
+    assert film.catalog()['spectral']['ready'], 'Bundled Spektrafilm runtime is missing'
+    spectral = engine.render_pixels(sys.argv[1], {
+        'film_advanced': json.dumps({'stock': 'kodak_portra_400', 'process': 'negative'})
+    })
+    assert spectral.shape == base.shape and spectral.dtype == numpy.float32
+    assert numpy.isfinite(spectral).all() and numpy.max(numpy.abs(spectral-base)) > 1e-5
+    spectral_rendered = True
 filtered = engine.render_pixels(sys.argv[1], {'filter_id':look, 'filter_strength':1})
 assert filtered.dtype == numpy.float32 and numpy.isfinite(filtered).all()
 assert numpy.max(numpy.abs(filtered-base)) > 1e-5
@@ -70,10 +81,10 @@ if raw.is_file():
     assert decoded.width > 100 and decoded.height > 100
 classifier = workflow.LocalClassifier()
 features = classifier.classify(image)
-print(json.dumps({'python':sys.version,'prefix':sys.prefix,'raw':str(engine.raw_executable()),'raw_decoded':raw.is_file(),'precision_roundtrips':True,'lcms_loaded':True,'film_rendered':True,'open_filter_rendered':True,'open_filter_count':looks['count'],'tk_companion':True,'classification':features,'numpy':numpy.__version__,'Pillow':PIL.__version__}))
+print(json.dumps({'python':sys.version,'prefix':sys.prefix,'raw':str(engine.raw_executable()),'raw_decoded':raw.is_file(),'precision_roundtrips':True,'lcms_loaded':True,'film_rendered':True,'spectral_rendered':spectral_rendered,'open_filter_rendered':True,'open_filter_count':looks['count'],'tk_companion':True,'classification':features,'numpy':numpy.__version__,'Pillow':PIL.__version__}))
 """
         fixture = temporary / 'synthetic.png'
-        result = subprocess.run([str(python), '-c', check, str(fixture), str(raw)], env=env,
+        result = subprocess.run([str(python), '-c', check, str(fixture), str(raw), str(int(args.require_spectral))], env=env,
                                 cwd=runtime, capture_output=True, text=True, timeout=240,
                                 creationflags=subprocess.CREATE_NO_WINDOW)
         if result.returncode:

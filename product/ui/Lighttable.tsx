@@ -36,8 +36,11 @@ import {
   reviewStep,
   viewerFullscreen,
   decodedPreviews,
+  BROWSE_PREVIEW_SIZE,
   photoPreviewFamily,
   photoDimensions,
+  isRaw,
+  filmStock,
   VariantMode,
   applyVariantPreference,
   resolveVariantSelection,
@@ -283,7 +286,8 @@ export function Lighttable({
   useEffect(() => {
     if (layout === "sheet") return;
     const controller = new AbortController();
-    [photos[index - 1], photos[index + 1]].filter(Boolean).forEach(
+    // RAW neighbours would queue another development before the visible frame.
+    [photos[index - 1], photos[index + 1]].filter((photo) => photo && !isRaw(photo)).forEach(
       (photo) =>
         void decodedPreviews
           .read(
@@ -542,6 +546,7 @@ export function Lighttable({
             photo={photo}
             revision={revisions[photo.id]}
             quality="source"
+            reusePreview
             sourceScale={zoom}
             eager
           />
@@ -552,7 +557,7 @@ export function Lighttable({
           {pinnedFrame ? "参考帧 · " : ""}
           {photo.name}
         </span>
-        <span>{filmNames[String(photo.recipe.film_stock)] || "原生显影"}</span>
+        <span>{filmNames[filmStock(photo.recipe)] || "原生显影"}</span>
         <b className={decision(photo)}>
           {decision(photo) === "keep"
             ? "精选"
@@ -950,7 +955,7 @@ export function Lighttable({
                   <Picture
                     photo={photo}
                     revision={revisions[photo.id]}
-                    size={220}
+                    size={BROWSE_PREVIEW_SIZE}
                   />
                   <i className={decision(photo)} />
                 </button>

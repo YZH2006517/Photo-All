@@ -143,16 +143,48 @@ async function verifyReadiness(page, editor, current) {
     ready_canvas_accepts_crop: true,
   };
 }
+async function openAdjustment(editor, name) {
+  const button = editor.getByRole("button", { name, exact: true });
+  await button.waitFor({ timeout: 5000 });
+  if ((await button.getAttribute("aria-expanded")) !== "true")
+    await button.click();
+  return button;
+}
+
 async function verifyInspector(page, editor, current, output) {
+  const light = await openAdjustment(editor, "光线");
+  await light.click();
+  const exposure = editor.getByRole("slider", {
+    name: "亮度曝光",
+    exact: true,
+  });
+  if (await exposure.isVisible())
+    throw Error("Collapsed adjustment left its controls visible");
+  await openAdjustment(editor, "光线");
+  await openAdjustment(editor, "色阶与伽马");
+  if (!(await exposure.isVisible()))
+    throw Error("Opening levels closed the light panel");
+  await editor.getByLabel("编辑画布").focus();
+  await page.keyboard.press("s");
+  if (
+    (await editor
+      .getByRole("button", { name: "色彩", exact: true })
+      .getAttribute("aria-expanded")) !== "true"
+  )
+    throw Error("S did not reveal the color controls");
+  const histogram = editor.locator(".ew-histogram");
+  const scrollPanel = editor.locator(".ew-inspector-scroll");
+  const beforeScroll = await histogram.boundingBox();
+  await scrollPanel.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  const afterScroll = await histogram.boundingBox();
+  if (beforeScroll.y !== afterScroll.y)
+    throw Error("RGB histogram moved with the adjustment groups");
   for (const height of [720, 620, 1020]) {
     await page.setViewportSize({ width: 1540, height });
     for (const name of ["亮度曝光", "白场", "中间调伽马"]) {
-      await editor
-        .getByRole("tab", {
-          name: name === "亮度曝光" ? "基础光线" : "色阶 / 伽马",
-          exact: true,
-        })
-        .click();
+      await openAdjustment(editor, name === "亮度曝光" ? "光线" : "色阶与伽马");
       const input = editor.getByRole("slider", { name, exact: true });
       await input.scrollIntoViewIfNeeded();
       const bounds = await input.boundingBox();
@@ -202,9 +234,10 @@ async function verifyFilters(page, editor, current, call) {
   };
   page.on("request", record);
   await editor.getByRole("button", { name: "滤镜", exact: true }).click();
-  const cards = editor.locator(".ew-filter-grid>button");
-  if ((await cards.count()) > 24)
-    throw Error("Filter catalog rendered more than one bounded page");
+  const cards = editor.locator(".filter-browser [data-preset-key]");
+  const initialCards = await cards.count();
+  if (!initialCards || initialCards >= items.length)
+    throw Error("Filter groups did not limit their initial card lists");
   await editor
     .locator(".ew-inspector-scroll")
     .evaluate((element) => (element.scrollTop = 0));
@@ -216,46 +249,54 @@ async function verifyFilters(page, editor, current, call) {
     throw Error(
       "Filter catalog eagerly fetched full-resolution or unbounded previews",
     );
-  const firstPage = await cards.first().getAttribute("aria-label");
-  await editor.getByLabel("下一页滤镜", { exact: true }).click();
-  if ((await cards.first().getAttribute("aria-label")) === firstPage)
-    throw Error("Filter pagination did not advance");
+  await editor
+    .getByRole("button", { name: /^展开更多 / })
+    .first()
+    .click();
+  if ((await cards.count()) <= initialCards)
+    throw Error("Filter group did not reveal more choices");
+
   const [id, item] = items[items.length - 1];
-  await editor.getByLabel("搜索滤镜", { exact: true }).fill(item.label);
-  const candidate = editor.getByRole("button", {
-    name: `应用滤镜 ${item.label}`,
-    exact: true,
-  });
-  await candidate.click();
-  await until(async () => (await current()).recipe.filter_id === id);
+  await editor.getByRole("button", { name: "搜索滤镜", exact: true }).click();
+  const search = editor.getByLabel("搜索滤镜名称", { exact: true });
+  await search.fill(item.label);
+  await editor
+    .getByRole("button", { name: `选择滤镜 ${item.label}`, exact: true })
+    .click();
+  const layers = async () =>
+    JSON.parse((await current()).recipe.filter_stack || "[]");
+  await until(async () => (await layers())[0]?.id === id);
   if ((await current()).recipe.style !== "natural")
     throw Error("External LUT retained a hidden legacy style");
-  await editor
-    .getByRole("textbox", { name: "滤镜强度数值", exact: true })
-    .fill("0.35");
-  await editor
-    .getByRole("textbox", { name: "滤镜强度数值", exact: true })
-    .press("Enter");
-  await until(async () => (await current()).recipe.filter_strength === 0.35);
+  const initialStrength = (await layers())[0].strength;
+  const strength = editor.getByRole("textbox", {
+    name: "当前滤镜强度数值",
+    exact: true,
+  });
+  await strength.fill("35");
+  await strength.press("Enter");
+  await until(async () => (await layers())[0]?.strength === 0.35);
   await editor.getByLabel("撤销上次修改", { exact: true }).click();
-  await until(async () => (await current()).recipe.filter_strength === 1);
-  await editor
-    .getByLabel("搜索滤镜", { exact: true })
-    .fill("no-filter-matches-0987654321");
+  await until(async () => (await layers())[0]?.strength === initialStrength);
+  await search.fill("no-filter-matches-0987654321");
   if (await cards.count())
     throw Error("Filter search returned unrelated cards");
-  await editor.getByLabel("搜索滤镜", { exact: true }).fill("");
-  await editor.getByLabel("滤镜分组", { exact: true }).selectOption(item.group);
-  if ((await cards.count()) > 24)
-    throw Error("Filter group bypassed pagination");
+  await search.fill(item.group);
+  const group = editor.getByRole("region", {
+    name: `滤镜分组 ${item.group}`,
+    exact: true,
+  });
+  await group.getByRole("button", { name: item.group, exact: true }).click();
+  if (await group.locator("[data-preset-key]").count())
+    throw Error("Collapsed filter group left its choices open");
   await editor
-    .getByRole("button", { name: "关闭 LUT 滤镜", exact: true })
+    .getByRole("button", { name: "移除当前滤镜层", exact: true })
     .click();
-  await until(async () => (await current()).recipe.filter_id === "none");
+  await until(async () => !(await layers()).length);
   page.off("request", record);
   return {
     ready_filters: items.length,
-    bounded_page: true,
+    bounded_initial_previews: true,
     search_group_apply_strength_undo: true,
   };
 }
@@ -291,7 +332,7 @@ async function verifyFilters(page, editor, current, call) {
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
   await page.goto(
-    `http://127.0.0.1:1420/#port=${connection.port}&token=${connection.token}`,
+    `${process.env.PHOTOALL_VITE_URL || "http://127.0.0.1:1420"}/#port=${connection.port}&token=${connection.token}`,
   );
   await page.getByRole("button", { name: "打开图集 编辑器验证" }).click();
   await page.locator('article[aria-label="照片 precise.png"]').dblclick();
@@ -340,7 +381,7 @@ async function verifyFilters(page, editor, current, call) {
     current,
     output,
   );
-  await editor.getByRole("tab", { name: "基础光线", exact: true }).click();
+  await openAdjustment(editor, "光线");
   const numeric = editor.getByRole("textbox", {
     name: "亮度曝光数值",
     exact: true,
@@ -432,7 +473,14 @@ async function verifyFilters(page, editor, current, call) {
   await until(async () => (await current()).recipe.quarter_turns === 1);
 
   await editor.getByRole("button", { name: "调节", exact: true }).click();
-  await editor.getByRole("tab", { name: "曲线", exact: true }).click();
+  await editor.getByLabel("编辑画布").focus();
+  await page.keyboard.press("u");
+  if (
+    (await editor
+      .getByRole("button", { name: "曲线", exact: true })
+      .getAttribute("aria-expanded")) !== "true"
+  )
+    throw Error("U did not reveal the curve controls");
   const curve = await editor.getByLabel("分段线性曲线编辑器").boundingBox();
   await page.mouse.dblclick(
     curve.x + curve.width * 0.5,
@@ -441,7 +489,7 @@ async function verifyFilters(page, editor, current, call) {
   await until(
     async () => JSON.parse((await current()).recipe.curve_rgb).length === 3,
   );
-  await editor.getByRole("tab", { name: "色彩 / HSL", exact: true }).click();
+  await openAdjustment(editor, "混色器 HSL");
   await editor.getByLabel("HSL 蓝", { exact: true }).click();
   await editor
     .getByRole("slider", { name: "分色色相", exact: true })

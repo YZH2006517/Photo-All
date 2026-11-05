@@ -2513,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "photo-all"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "rfd",
  "serde",
@@ -2521,6 +2521,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "uuid",
+ "windows",
 ]
 
 [[package]]

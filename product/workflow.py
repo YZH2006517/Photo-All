@@ -45,7 +45,7 @@ _model_lock = threading.Lock()
 
 def visual_features(image):
     """Area-weighted HSV palette plus perceptual lightness; no filename heuristics."""
-    sample = image.convert('RGB').copy()
+    sample = image.convert('RGB')
     sample.thumbnail((128, 128))
     rgb = np.asarray(sample, dtype=np.float32) / 255
     hsv = np.asarray(sample.convert('HSV'), dtype=np.float32) / 255

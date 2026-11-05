@@ -5,7 +5,8 @@ product/build/
 product/dist/
 validation/inputs/
 product/data/
-product/engines/
+product/engines/*
+!product/engines/film-borders/
 product/node_modules/
 product/web-build/
 product/src-tauri/target/

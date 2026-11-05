@@ -7,6 +7,12 @@ WebView2 and includes Microsoft's bootstrapper; installing WebView2 for the firs
 time requires an internet connection. Existing WebView2 installations can run
 Photo All offline. A portable ZIP does not install WebView2.
 
+The darkroom uses Poly Haven's Mantel Clock 01 (CC0 1.0), bundled as a GLB
+with the original 1K material maps. See https://polyhaven.com/a/mantel_clock_01.
+The collection room also includes Camera 01 by Rajil Jose Macatangay / Poly Haven
+(CC0 1.0), packed as a self-contained GLB with its original 1K material maps.
+Source: https://polyhaven.com/a/Camera_01. License: https://polyhaven.com/license.
+
 Python, NumPy, Pillow, TIFF/PNG codecs, the CPU ONNX inference runtime/tokenizer,
 the local CLIP model, film LUTs, the open-filter library, and the complete
 official RawTherapee portable
@@ -25,6 +31,28 @@ application folder is movable; the library profile stays in AppData.
 
 ## Build and verify
 
+The **Build Photo All Studio for Windows** GitHub Actions workflow runs on a
+GitHub-hosted Windows x64 runner. It checks out the selected commit, prepares
+version-pinned build inputs, verifies the staged runtime with a checksum-verified
+RAW sample, and uploads unsigned binaries and their corresponding source as
+workflow artifacts. The workflow can be started manually or by pushing a version
+tag. Download the two artifact groups from the same successful run.
+
+To prepare a clean local Windows builder, install Git, Node.js, Rust, Visual
+Studio Build Tools with the x64 C++ redistributable, CPython 3.12 x64 with
+Tkinter, and uv. From the repository root, run:
+
+```powershell
+npm --prefix product ci
+python product/package_windows.py prepare
+python product/package_windows.py all
+```
+
+The `prepare` command installs pinned Python packages into project directories,
+verifies downloaded RawTherapee and model resources, and builds the film LUTs.
+It uses Visual Studio's installed x64 redistributable. Set `VCToolsRedistDir`
+to override automatic detection.
+
 On a Windows x64 builder install Rust/MSVC Build Tools, Node, project npm
 dependencies, and the Python packages listed in `requirements.txt`. Prepare
 the pinned CLIP assets with `setup_recognition.py` and the film LUTs with
@@ -41,13 +69,29 @@ no need to download or recompress those unchanged source packages.
 Run `python package_windows.py filter-sources` to package the original open-filter
 archive and its licenses separately as `dist/Photo-All-open-filter-sources.zip`.
 Then `python package_windows.py stage` creates `build/runtime`;
-`python package_windows.py build` builds NSIS plus portable ZIP in `dist`.
+`python package_windows.py build` builds NSIS, a portable ZIP, and a ready-to-run
+`Photo-All-Studio_<version>_windows-x64` folder in `dist`. Open
+**Photo All Studio.exe** in that folder and keep `runtime` beside it.
+Use `python package_windows.py build --output <directory>` to keep an existing
+release in place while verifying a new build.
 `python package_windows.py all` runs both source steps, staging and building.
 The stage is a deliberately selected runtime, not a copy of the
 builder environment. Package versions and per-file SHA-256 hashes are recorded
 in `runtime/runtime-manifest.json`. Both staging and building verify every
 open-filter LUT against the pinned catalog and require its attribution,
 license text and modification notice.
+
+If the local `engines/film-runtime` and managed CPython 3.13.13 are prepared,
+staging also includes the optional Spektrafilm 0.3.4 float-array worker under
+`runtime/engines/spectral-python/`. Staging checks the pinned upstream source
+files and writes the `spektrafilm-photo-all.patch` source adaptation beside that
+interpreter and the built artifacts. The patch defers upstream RAW and image
+file I/O imports and switches the Gaussian convolution's FFT calls to SciPy.
+The Gaussian kernel, padding and crop are preserved. Photo All handles decoding
+and encoding, and the isolated worker receives float arrays. The runtime
+manifest records the revision, original and staged file hashes, and patch hash.
+Apply the patch with `patch -p1` from the Spektrafilm source archive root to
+reproduce the staged source changes.
 
 From the repository root run `python validation/packaging_smoke.py product/build/runtime
 --raw validation/inputs/D7000.NEF --output validation/artifacts/packaging-report.json`.
@@ -113,6 +157,12 @@ Share adaptations under the same license and retain attribution. The upstream
 license files are copied to `runtime/licenses/spektrafilm/`. CC BY-SA 4.0 text:
 <https://creativecommons.org/licenses/by-sa/4.0/legalcode>.
 
+The editor's spectral film mode uses the same pinned Spektrafilm revision
+directly. The optional Windows engine lives in `runtime/engines/spectral-python`
+and retains its dependency licenses. Spektrafilm corresponding source is
+available at <https://github.com/andreavolpato/spektrafilm/tree/3bb2c2d2801ff68b92019cf1dbcbb133d60832bc>.
+The Photo All float32 bridge and its recipe schema are in `product/film_spectral.py`.
+
 The **RawTherapee Film Simulation Collection 2015-09-20** supplies the additional
 open looks, attributed upstream to Pat David, Pavlov Dmitry and Michael Ezra,
 under **CC BY-SA 4.0**. Source and background:
@@ -156,3 +206,88 @@ identify the frontend and wrapper dependency versions.
 Official implementation references:
 <https://www.python.org/downloads/release/python-31210/> and
 <https://v2.tauri.app/distribute/windows-installer/>.
+
+
+## Three.js darkroom renderer
+
+The independent darkroom uses Three.js 0.187.0 (MIT), https://threejs.org/.
+All room geometry, labels and procedural textures are Photo All code.
+
+The MIT License
+
+Copyright © 2010-2026 three.js authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+## Film border sources
+
+Photo All uses a pinned scan-border alpha silhouette from romnn/film-borders and adapts bitmap edge lettering plus the frame-number barcode pattern from lexluthor0304/NegativeConverter. Both are MIT. Full pinned sources, hashes and adaptation notes are in runtime/engines/film-borders/SOURCES.json. Kodak dimensions are a reference only, not bundled artwork; no Kodak/Fujifilm brand artwork or trademarks are added automatically. The barcode is a frame-number illustration, not recovered stock identification.
+
+### LICENSE-romnn-MIT.txt
+
+Copyright (c) 2020 romnn <contact@romnn.com>
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+### LICENSE-NegativeConverter-MIT.txt
+
+MIT License
+
+Copyright (c) 2025 lex
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

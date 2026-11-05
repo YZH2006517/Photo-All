@@ -168,6 +168,20 @@ class PrecisionTests(unittest.TestCase):
             tifffile.imwrite(path, samples, photometric='rgb', extratags=[(274, 'H', 1, orientation, False)])
             np.testing.assert_array_equal(np.rint(p.read(path)*65535).astype('uint16'), expected[orientation])
 
+    def test_reduced_jpeg_matches_float_resize_for_every_exif_orientation(self):
+        p = self.pixels()
+        samples = np.random.default_rng(42).integers(0, 256, (45, 67, 3), dtype=np.uint8)
+        size = (17, 12)
+        for orientation in range(1, 9):
+            with self.subTest(orientation=orientation):
+                path = self.folder / f'reduced-{orientation}.jpg'
+                exif = Image.Exif()
+                exif[274] = orientation
+                Image.fromarray(samples).save(path, exif=exif)
+                expected = p.resize(p.read(path, preserve_alpha=True), size)
+                actual = p.read(path, preserve_alpha=True, resize_target=lambda width, height: size)
+                np.testing.assert_array_equal(actual, expected)
+
     def test_native_raw_is_developed_as_sixteen_bit(self):
         p = self.pixels()
         import engine

@@ -1,0 +1,26 @@
+{
+  "sources": [
+    {
+      "project": "romnn/film-borders",
+      "url": "https://github.com/romnn/film-borders",
+      "revision": "ff428ce31dfc77701941d4cdbd45734dac5976a6",
+      "license": "MIT",
+      "asset": "scan-border.png",
+      "sha256": "aa629ce79633fcb08c6c8411f49e23df59ed3dc2589af0ad84d9d5be1975bb43",
+      "upstream_path": "borders/border.png",
+      "use": "Original alpha silhouette, sampled only outside the photo; central dust is not applied."
+    },
+    {
+      "project": "lexluthor0304/NegativeConverter",
+      "url": "https://github.com/lexluthor0304/NegativeConverter",
+      "revision": "ff3043976b7cb72266d89e659faa65142c21b635",
+      "license": "MIT",
+      "asset": "NegativeConverter-sprocketFrame.js",
+      "sha256": "a29d4f8cdf5e191e0d2774567fd57277ff7a51ac18e239db0977aea207e99205",
+      "upstream_path": "negative2positive/src/app/sprocketFrame.js",
+      "use": "Port of bitmap edge font and DX-style block pattern; float compositor is local. KS dimensions independently checked against Kodak guide; horizontal/vertical perforation axes corrected."
+    }
+  ],
+  "dimension_reference": "https://www.kodak.com/content/products-brochures/Film/kodak-essential-reference-guide-for-filmmakers.pdf#page=98",
+  "changes": "Photo All: float32 composition, no image-area overlay, custom text, portrait geometry; barcode is frame-number illustration with unknown stock fields, not original-film identification."
+}
