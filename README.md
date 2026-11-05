@@ -6,7 +6,7 @@
 
 ## 下载
 
-在 [0.10.6 发布页](https://github.com/YZH2006517/Photo-All/releases/tag/v0.10.6) 下载 `*-setup.exe` 安装器，或解压整个 portable ZIP 后打开 `Photo All Studio.exe`。发行包附带 Python、图像依赖、RawTherapee、离线识图模型及胶片 LUT，无需安装开发工具。Windows 需要 WebView2；安装器包含检测与引导安装，首次安装 WebView2 需要联网。
+在 [0.10.7 发布页](https://github.com/YZH2006517/Photo-All/releases/tag/v0.10.7) 下载 `*-setup.exe` 安装器，或解压整个 portable ZIP 后打开 `Photo All Studio.exe`。发行包附带 Python、图像依赖、RawTherapee、离线识图模型及胶片 LUT，无需安装开发工具。Windows 需要 WebView2；安装器包含检测与引导安装，首次安装 WebView2 需要联网。
 
 ## 电子观片台
 
@@ -32,13 +32,7 @@
 
 当前为持续开发中的桌面软件。屏幕预览为 8-bit SDR；JPEG 为有损，WebP 输出为 8-bit。尚不支持完整 Photoshop 功能、PSD 互通、HDR 工作流和手机端。
 
-## 更新
 
-**0.10.6**：即时调节预览、滤镜交互与多层叠加、整块准备区收纳、关灯底色、统一深浅界面与标题栏、新图标、可留空图集名称、回收站彻底移除、RAW 分析与缓存优化。完整对比见 [更新说明](docs/release-0.10.6.md)。
-
-![0.10.6 更新内容](docs/media/update-0.10.6.png)
-
-在 GitHub Releases 下载安装升级，安装 EXE 可覆盖升级。已有图库与配方保留；没有后台自动安装或账号服务。便携版需完整解压新 ZIP 并保留同目录 runtime，个人图库仍在 AppData。本版仅进行了针对性检查、浏览器与原生窗口冒烟，未运行完整测试或安装升级测试。
 
 ## 源码与构建
 
