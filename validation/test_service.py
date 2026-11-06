@@ -98,6 +98,12 @@ class ServiceTests(unittest.TestCase):
             identity = self.call('/api/import', {'paths': [str(path) for path in paths], 'album_id': album['id']})['id']
             try:
                 self.assertTrue(entered.wait(5))
+                # Analysis is parallel: the second decoder can start before
+                # the first result has been committed. Cancel after one commit.
+                for _ in range(250):
+                    if self.call('/api/jobs/'+identity)['done'] >= 1: break
+                    import time
+                    time.sleep(.02)
                 self.assertTrue(self.call('/api/jobs/' + identity + '/cancel', {})['cancel_requested'])
             finally: release.set()
             job = self.wait_job(identity)
@@ -362,7 +368,7 @@ class ServiceTests(unittest.TestCase):
         catalog.import_files([path]);identity=catalog.photos()[0]['id']
         def read():
             try:
-                with urlopen(Request(self.base+f'/api/image/{identity}?size=300',headers={'Authorization':'Bearer test-secret'})) as r:return r.status
+                with urlopen(Request(self.base+f'/api/image/{identity}?size=300&quality=source',headers={'Authorization':'Bearer test-secret'})) as r:return r.status
             except HTTPError as error:return error.code
         with patch.object(engine,'render_image',side_effect=RuntimeError('decoder failed')) as render:
             with ThreadPoolExecutor(3) as executor:self.assertEqual(list(executor.map(lambda _:read(),range(3))),[500]*3)

@@ -165,18 +165,27 @@ export function BorderPreview({
     [error, setError] = useState("");
   const onSizeRef = useRef(onSize);
   const previewSession = useRef(crypto.randomUUID());
+  const previousStyle = useRef("");
   onSizeRef.current = onSize;
   const key = JSON.stringify(photo.recipe);
   useEffect(() => {
     const controller = new AbortController();
     let objectURL = "";
+    let published = false;
+    const style=borderSettings(photo.recipe).style;
+    const delay=previousStyle.current===style ? 100 : 0;
+    previousStyle.current=style;
     setBusy(true);
     setError("");
     const timer = window.setTimeout(() => {
       void borderBlob(photo, controller.signal, previewSession.current)
-        .then((blob) => {
+        .then(async (blob) => {
           if (controller.signal.aborted) return;
           objectURL = URL.createObjectURL(blob);
+          const image=new Image();image.src=objectURL;
+          await image.decode();
+          if(controller.signal.aborted){URL.revokeObjectURL(objectURL);return;}
+          published = true;
           setAsset({ id: photo.id, url: objectURL });
         })
         .catch((e) => {
@@ -185,13 +194,14 @@ export function BorderPreview({
             setBusy(false);
           }
         });
-    }, 180);
+    }, delay);
     return () => {
       clearTimeout(timer);
       controller.abort();
-      if (objectURL) URL.revokeObjectURL(objectURL);
+      if (objectURL && !published) URL.revokeObjectURL(objectURL);
     };
   }, [photo.id, key]);
+  useEffect(()=>()=>{if(asset?.url)URL.revokeObjectURL(asset.url);},[asset?.url]);
   return (
     <div
       className={`border-preview ${className}`}

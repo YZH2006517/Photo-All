@@ -8,6 +8,7 @@ describe("precision editor workspace contracts", () => {
       ["adjust", "调节"],
       ["filters", "滤镜"],
       ["film", "胶片模拟"],
+      ["border", "片边"],
       ["raw", "RAW 显影"],
     ]);
   });
@@ -21,7 +22,7 @@ describe("precision editor workspace contracts", () => {
     expect(editorToolShortcut("k")).toBe("filters");
     expect(editorToolShortcut("g")).toBe("film");
     expect(editorToolShortcut("r")).toBe("raw");
-    expect(editorToolShortcut("b")).toBeNull();
+    expect(editorToolShortcut("b")).toBe("border");
   });
   it("provides the independent editing workspace", async () => {
     const { EditorWorkspace } = await import("../product/ui/Editor");

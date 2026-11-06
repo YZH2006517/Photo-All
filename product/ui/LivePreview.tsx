@@ -133,6 +133,13 @@ function curveTable(recipe: Recipe) {
   return table;
 }
 
+// Sample the native texture at the physical viewport resolution. Drawing 24 MP
+// for a 1 MP viewport only wastes fill rate; it adds no visible source detail.
+export function liveDrawDimensions(width:number,height:number,screenWidth:number,screenHeight:number,ratio:number) {
+  const scale=Math.min(1,Math.max(screenWidth*ratio/width,screenHeight*ratio/height));
+  return {width:Math.max(1,Math.round(width*scale)),height:Math.max(1,Math.round(height*scale))};
+}
+
 function renderer(canvas: HTMLCanvasElement) {
   const gl = canvas.getContext("webgl2", {
     alpha: false,
@@ -223,6 +230,13 @@ function renderer(canvas: HTMLCanvasElement) {
   let histogram = new Float64Array(768),
     total = 1,
     previousCurves = "";
+  let sourceWidth=1,sourceHeight=1;
+  const resizeOutput=()=>{
+    const rect=canvas.getBoundingClientRect();
+    const size=liveDrawDimensions(sourceWidth,sourceHeight,rect.width||sourceWidth,rect.height||sourceHeight,window.devicePixelRatio||1);
+    if(canvas.width!==size.width || canvas.height!==size.height){canvas.width=size.width;canvas.height=size.height;}
+    gl.viewport(0,0,canvas.width,canvas.height);
+  };
   return {
     base(image: HTMLImageElement) {
       const width = image.naturalWidth, height = image.naturalHeight;
@@ -230,9 +244,9 @@ function renderer(canvas: HTMLCanvasElement) {
       const [maxWidth, maxHeight] = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
       if (width > Math.min(maxWidth, maxTexture) || height > Math.min(maxHeight, maxTexture))
         throw Error("Image exceeds the native WebGL canvas limit");
-      canvas.width = width;
-      canvas.height = height;
-      if (gl.drawingBufferWidth !== width || gl.drawingBufferHeight !== height)
+      sourceWidth=width;sourceHeight=height;
+      resizeOutput();
+      if (gl.drawingBufferWidth !== canvas.width || gl.drawingBufferHeight !== canvas.height)
         throw Error("Native WebGL canvas could not be allocated");
       gl.viewport(0, 0, canvas.width, canvas.height);
       bind(0, gl.TEXTURE_2D);
@@ -294,6 +308,7 @@ function renderer(canvas: HTMLCanvasElement) {
       );
     },
     draw(recipe: Recipe, base: Recipe) {
+      resizeOutput();
       const layers = recipe.filter_stack ? filterLayers(recipe) : [];
       const config = new Float32Array(64);
       layers.forEach((layer, index) => {
@@ -365,7 +380,7 @@ function renderer(canvas: HTMLCanvasElement) {
         location("style"),
         style === "film" ? 1 : style === "mono" ? 2 : 0,
       );
-      gl.uniform2f(location("pixel"), 1 / canvas.width, 1 / canvas.height);
+      gl.uniform2f(location("pixel"), 1 / sourceWidth, 1 / sourceHeight);
       let operations: {
         band: number;
         hue: number;
@@ -419,12 +434,14 @@ export function LivePreview({
   uncropped = false,
   sourceSize = currentPreviewGraphics().liveSize,
   onFrame,
+  viewScale=1,
 }: {
   photo: Photo;
   exact: string;
   uncropped?: boolean;
   sourceSize?: number;
   onFrame?: (canvas: HTMLCanvasElement) => void;
+  viewScale?: number;
 }) {
   const frameGate = useRef({ exact, live: liveRecipeKey(photo.recipe) });
   frameGate.current = { exact, live: liveRecipeKey(photo.recipe) };
@@ -566,7 +583,7 @@ export function LivePreview({
         frameCallback.current?.(canvas.current);
     });
     return () => cancelAnimationFrame(frame);
-  }, [live, active, baseVersion]);
+  }, [live, active, baseVersion, viewScale]);
   return (
     <>
       <canvas

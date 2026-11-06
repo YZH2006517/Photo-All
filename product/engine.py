@@ -512,9 +512,9 @@ def render_image(path, recipe, max_size=None, preserve_alpha=False, *, preview=F
     return pixels.to_image(pixels.render(path, recipe, max_size, preserve_alpha, preview=preview))
 
 
-def render_pixels(path,recipe,max_size=None,preserve_alpha=False):
+def render_pixels(path,recipe,max_size=None,preserve_alpha=False,*,preview=False,preview_input_limit=0):
     import pixels
-    return pixels.render(path,recipe,max_size,preserve_alpha)
+    return pixels.render(path,recipe,max_size,preserve_alpha,preview=preview,preview_input_limit=preview_input_limit)
 
 
 

@@ -659,7 +659,7 @@ export function photoPreviewFamily(
   uncropped = false,
 ) {
   const recipe = photo.committed_recipe ?? photo.recipe;
-  return `${photo.id}/${photo.digest}/${quality}/${uncropped ? "uncropped" : "cropped"}/${original || quality === "camera" ? "original/" + geometrySignature(recipe) : JSON.stringify(recipe) + "/" + revision}`;
+  return `${photo.id}/${photo.digest}/${quality}/${uncropped ? "uncropped" : "cropped"}/${original || quality === "camera" ? "original/" + geometrySignature(recipe) : liveRecipeKey(recipe)}`;
 }
 let session: Promise<Connection> | undefined;
 export function connect(): Promise<Connection> {
@@ -732,7 +732,19 @@ export function photoBlob(
     signal,
   );
 }
-export const liveRecipeKey = (recipe: Recipe) => JSON.stringify(Object.keys(recipe).sort().map(key => [key, recipe[key]]));
+export const liveRecipeKey = (recipe: Recipe) => JSON.stringify(Object.keys(recipe).filter(key=>key!=="border").sort().map(key => [key, recipe[key]]));
+export type EditorPreviewSession = {id: string; generation: number};
+export async function editorPreviewBlob(photo: Photo, session: EditorPreviewSession, size: number,
+  signal: AbortSignal, uncropped = false) {
+  const {port,token}=await connect();
+  const response=await fetch(`http://127.0.0.1:${port}/api/editor-preview`,{
+    method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
+    body:JSON.stringify({id:photo.id,recipe:photo.recipe,size,uncropped,
+      preview_session:session.id,generation:session.generation}),signal,
+  });
+  if(!response.ok)throw Error((await response.json()).error||'编辑预览失败');
+  return response.blob();
+}
 export const liveBaseKey = (photo: Photo, uncropped = false) => JSON.stringify([
   photo.id, photo.digest, geometrySignature(uncropped ? {...photo.recipe,crop_x:0,crop_y:0,crop_w:1,crop_h:1} : photo.recipe),
   ...['raw_exposure','raw_wb','raw_temperature','raw_tint','raw_highlights','raw_denoise','raw_sharpen'].map(key => photo.recipe[key]),

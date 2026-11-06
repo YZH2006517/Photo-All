@@ -2322,6 +2322,7 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
                   photo={photo}
                   revision={revision}
                   active={compare && tool !== "composition"}
+                  viewScale={zoom}
                   uncropped={tool === "composition"}
                   onLoaded={(img) => {
                     setImage(img);

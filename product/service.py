@@ -55,6 +55,10 @@ class StudioServer(ThreadingHTTPServer):
         self.preview_workers = threading.BoundedSemaphore(min(4, max(2, (os.cpu_count() or 2) // 2)))
         self.thumbnail_workers = threading.BoundedSemaphore(min(4, max(2, (os.cpu_count() or 2) // 2)))
         self.border_pending = OrderedDict()
+        self.screen_pixels = OrderedDict()
+        self.screen_pixel_bytes = 0
+        self.screen_lock = threading.Lock()
+        self.editor_generations = OrderedDict()
         self.previews = OrderedDict()
         self.preview_bytes = 0
         self.preview_flights = {}
@@ -124,6 +128,8 @@ class StudioServer(ThreadingHTTPServer):
             {key: photo['recipe'].get(key, engine.DEFAULT_RECIPE[key]) for key in geometry}
             if original or camera else photo['recipe'])
         if uncropped:recipe.update(crop_x=0,crop_y=0,crop_w=1,crop_h=1)
+        # Borders are composed separately and cannot change a photo's pixels.
+        recipe['border'] = ''
         raw_identity = None
         if is_raw and not camera:
             executable = engine.raw_executable()
@@ -240,6 +246,53 @@ class StudioServer(ThreadingHTTPServer):
                     self.preview_flights.pop(key, None)
                     event.set()
 
+    def screen_render(self, photo, recipe, size, *, uncropped=False,input_limit=0):
+        """Reuse the float photo stage across frame choices; exports never use it."""
+        recipe = {**engine.validate_recipe(recipe), 'border': ''}
+        if uncropped:
+            recipe.update(crop_x=0, crop_y=0, crop_w=1, crop_h=1)
+        if recipe['film_advanced']:
+            config = json.loads(recipe['film_advanced'])
+            config['enlarge'] = '1'
+            recipe['film_advanced'] = json.dumps(config, sort_keys=True)
+        source = Path(photo['path'])
+        stat = source.stat()
+        key = json.dumps([str(source), stat.st_mtime_ns, stat.st_size, size, recipe,input_limit], sort_keys=True)
+        with self.screen_lock:
+            cached = self.screen_pixels.pop(key, None)
+            if cached is not None:
+                self.screen_pixels[key] = cached
+                return cached
+        engine.film_spectral.check_preview()
+        image = engine.render_pixels(source, recipe, max_size=(size, size) if size else None,
+                                     preserve_alpha=True, preview=True,preview_input_limit=input_limit)
+        engine.film_spectral.check_preview()
+        if size and image.nbytes <= 48 * 1024 * 1024:
+            image.setflags(write=False)
+            with self.screen_lock:
+                if key not in self.screen_pixels:
+                    self.screen_pixels[key] = image
+                    self.screen_pixel_bytes += image.nbytes
+                while self.screen_pixel_bytes > 96 * 1024 * 1024:
+                    _, old = self.screen_pixels.popitem(last=False)
+                    self.screen_pixel_bytes -= old.nbytes
+        return image
+
+    def editor_generation(self, session, generation):
+        if not isinstance(session, str) or not session or len(session) > 80:
+            raise ValueError('编辑预览会话无效')
+        if type(generation) is not int or generation < 0:
+            raise ValueError('编辑预览序号无效')
+        with self.preview_lock:
+            self.editor_generations[session] = max(generation, self.editor_generations.get(session, -1))
+            self.editor_generations.move_to_end(session)
+            while len(self.editor_generations) > 256:
+                self.editor_generations.popitem(last=False)
+        def current():
+            with self.preview_lock:
+                return self.editor_generations.get(session) == generation
+        return current
+
     def prune_previews(self):
         import time
         with self.preview_lock:
@@ -348,6 +401,29 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('请求必须为对象')
             if route.path == '/api/library' and self.command == 'GET':
                 return self.reply(self.library())
+            if route.path == '/api/editor-preview' and self.command == 'POST':
+                identity = body.get('id')
+                if type(identity) is not int or identity < 1: raise ValueError('照片 ID 无效')
+                current = self.server.editor_generation(body.get('preview_session'), body.get('generation'))
+                if body.get('cancel'):
+                    return self.reply({'cancelled':True})
+                photo = self.preview_photo(identity, visible_only=True)
+                if not photo: return self.reply({'error':'照片不存在'},404)
+                size = body.get('size',640)
+                if type(size) is not int or size not in {0, 640, 1024, 1200}: raise ValueError('编辑预览尺寸无效')
+                with engine.film_spectral.preview_task(current):
+                    # Preview encoding is deliberately separate from saved/export pixels.
+                    with (self.server.preview_slots if size == 0 else nullcontext()), self.server.preview_workers:
+                        image = self.server.screen_render(photo, body.get('recipe',photo['recipe']), size,
+                                                          uncropped=body.get('uncropped') is True,
+                                                          input_limit=640 if size==640 else 0)
+                        import pixels
+                        if image.shape[-1]==4:
+                            image=image[...,:3]*image[...,3:]+1-image[...,3:]
+                        output = BytesIO()
+                        pixels.to_image(image).save(output,format='PNG',compress_level=1,icc_profile=engine.SRGB)
+                        engine.film_spectral.check_preview()
+                return self.reply(output.getvalue(),content_type='image/png')
             if route.path in {'/api/border-info','/api/border-preview','/api/draft-preview'} and self.command=='POST':
                 identity=body.get('id')
                 if type(identity) is not int or identity<1:raise ValueError('照片 ID 无效')
@@ -378,10 +454,10 @@ class Handler(BaseHTTPRequestHandler):
                     with self.server.preview_lock:
                         current=self.server.border_pending.get(family)==ticket
                     if not current:return self.reply({'error':'片边预览已被更新请求替代'},409)
-                    image=engine.render_pixels(photo['path'],recipe,max_size=(size,size),preserve_alpha=True)
+                    image=self.server.screen_render(photo,recipe,size)
                     if not draft:image,_=borders.compose(image,config,info,max_size=1200)
                     import pixels
-                    output=BytesIO();pixels.write(output,image,'png8')
+                    output=BytesIO();pixels.to_image(image).save(output,format='PNG',compress_level=1,icc_profile=engine.SRGB)
                 with self.server.preview_lock:
                     if self.server.border_pending.get(family)==ticket:self.server.border_pending.pop(family,None)
                 return self.reply(output.getvalue(),content_type='image/png')
@@ -625,6 +701,8 @@ class Handler(BaseHTTPRequestHandler):
                     return {'outputs': outputs, 'errors': errors}
                 return self.reply(self.server.submit(action, cancellable=True))
             self.reply({'error': '接口不存在'}, 404)
+        except engine.film_spectral.PreviewSuperseded as exc:
+            self.reply({'error':str(exc)},409)
         except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
             self.reply({'error': str(exc)}, 400)
         except Exception as exc:

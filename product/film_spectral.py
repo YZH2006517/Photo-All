@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 import numpy as np
 
@@ -392,47 +393,103 @@ def simulate_array(rgb, config, paper):
         return np.asarray(pipeline.process(rgb), dtype=np.float32)
 
 
-_lock = threading.Lock()
-_process = None
-_responses = None
+_preview = threading.local()
+
+
+class PreviewSuperseded(RuntimeError):
+    pass
+
+
+@contextlib.contextmanager
+def preview_task(current):
+    previous = getattr(_preview, 'current', None)
+    _preview.current = current
+    try:
+        check_preview()
+        yield
+    finally:
+        _preview.current = previous
+
+
+def check_preview():
+    current = getattr(_preview, 'current', None)
+    if current is not None and not current():
+        raise PreviewSuperseded('预览已被新的调整替代')
+
+
+class SpectralWorker:
+    def __init__(self, interactive=False):
+        self.interactive = interactive
+        self.lock = threading.Lock()
+        self.process = None
+        self.responses = None
+
+    def stop(self):
+        if self.process is not None:
+            process, self.process = self.process, None
+            if process.poll() is None: process.kill()
+            process.wait()
+            process.stdin.close()
+            process.stdout.close()
+
+    def start(self, python):
+        cache = Path(os.environ.get('LOCALAPPDATA', tempfile.gettempdir()))/'PhotoAll'/'spectral-cache'
+        cache.mkdir(parents=True, exist_ok=True)
+        env = {**os.environ, 'MPLBACKEND':'Agg', 'NUMBA_CACHE_DIR':str(cache),
+               'MPLCONFIGDIR':str(cache), 'NUMBA_NUM_THREADS':str(min(4, os.cpu_count() or 1)),
+               'OPENBLAS_NUM_THREADS':'2'}
+        process = self.process = subprocess.Popen([str(python), '-B', str(Path(__file__)), '--worker'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            encoding='utf-8', env=env, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        responses = self.responses = queue.Queue()
+        def read():
+            try:
+                for line in process.stdout: responses.put(line)
+            finally: responses.put('')
+        threading.Thread(target=read, daemon=True).start()
+
+    def call(self, python, root, config, paper):
+        check_preview()
+        if self.process is None or self.process.poll() is not None:
+            self.stop()
+            self.start(python)
+        try:
+            self.process.stdin.write(json.dumps({'dir':str(root), 'config':config, 'paper':paper})+'\n')
+            self.process.stdin.flush()
+            deadline = time.monotonic() + 300
+            while True:
+                # Keep the small worker warm (its abandoned frame is bounded).
+                # Native work can take minutes, so stop it as soon as it is stale.
+                if not self.interactive:
+                    try: check_preview()
+                    except PreviewSuperseded:
+                        self.stop()
+                        raise
+                try:
+                    status = json.loads(self.responses.get(timeout=.05))
+                    break
+                except queue.Empty:
+                    if time.monotonic() >= deadline: raise
+        except (OSError, ValueError, queue.Empty) as exc:
+            self.stop()
+            raise RuntimeError('光谱引擎处理超时或意外退出') from exc
+        check_preview()
+        if not status.get('ok'): raise ValueError('光谱成像失败：' + status['error'])
+
+
+_native_worker = SpectralWorker()
+_interactive_worker = SpectralWorker(interactive=True)
 
 
 def stop_worker():
-    global _process
-    if _process is not None:
-        process, _process = _process, None
-        process.kill()
-        process.wait()
-        process.stdin.close()
-        process.stdout.close()
+    _native_worker.stop()
+    _interactive_worker.stop()
 
 
 atexit.register(stop_worker)
 
 
-def start_worker(python):
-    global _process, _responses
-    cache = Path(os.environ.get('LOCALAPPDATA', tempfile.gettempdir()))/'PhotoAll'/'spectral-cache'
-    cache.mkdir(parents=True, exist_ok=True)
-    env = {**os.environ, 'MPLBACKEND':'Agg', 'NUMBA_CACHE_DIR':str(cache),
-           'MPLCONFIGDIR':str(cache), 'NUMBA_NUM_THREADS':str(min(4, os.cpu_count() or 1)),
-           'OPENBLAS_NUM_THREADS':'2'}
-    process = _process = subprocess.Popen([str(python), '-B', str(Path(__file__)), '--worker'],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        encoding='utf-8', env=env, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-    responses = _responses = queue.Queue()
-
-    def read():
-        try:
-            for line in process.stdout:
-                responses.put(line)
-        finally:
-            responses.put('')
-
-    threading.Thread(target=read, daemon=True).start()
-
-
-def render(rgb, recipe, stocks):
+def render(rgb, recipe, stocks, *, preview=False):
     python = interpreter()
     if python is None:
         raise RuntimeError('光谱引擎未安装，请重新安装完整 Photo All Studio')
@@ -442,25 +499,22 @@ def render(rgb, recipe, stocks):
     if scale > 1 and height * width * scale * scale > MAX_ENLARGED_PIXELS:
         raise ValueError('印片放大超过 3200 万像素，请降低倍率或选择较小的导出尺寸')
     paper = stocks.get(config['stock'], ('', '', 'kodak_portra_endura'))[2]
-    with _lock, tempfile.TemporaryDirectory(prefix='photo-all-spectral-') as directory:
-        root = Path(directory)
-        np.save(root/'input.npy', np.ascontiguousarray(rgb, dtype=np.float32), allow_pickle=False)
-        if _process is None or _process.poll() is not None:
-            stop_worker()
-            start_worker(python)
-        try:
-            _process.stdin.write(json.dumps({'dir':str(root), 'config':config, 'paper':paper})+'\n')
-            _process.stdin.flush()
-            status = json.loads(_responses.get(timeout=300))
-        except (OSError, ValueError, queue.Empty) as exc:
-            stop_worker()
-            raise RuntimeError('光谱引擎处理超时或意外退出') from exc
-        if not status.get('ok'):
-            raise ValueError('光谱成像失败：' + status['error'])
-        result = np.load(root/'output.npy', allow_pickle=False)
-        if result.shape != (height*scale, width*scale, 3) or not np.isfinite(result).all():
-            raise ValueError('光谱引擎返回了无效像素')
-        return result
+    worker = _interactive_worker if preview and max(height, width) <= 768 else _native_worker
+    check_preview()
+    while not worker.lock.acquire(timeout=.05):
+        check_preview()
+    try:
+        check_preview()
+        with tempfile.TemporaryDirectory(prefix='photo-all-spectral-') as directory:
+            root = Path(directory)
+            np.save(root/'input.npy', np.ascontiguousarray(rgb, dtype=np.float32), allow_pickle=False)
+            worker.call(python, root, config, paper)
+            result = np.load(root/'output.npy', allow_pickle=False)
+            if result.shape != (height*scale, width*scale, 3) or not np.isfinite(result).all():
+                raise ValueError('光谱引擎返回了无效像素')
+            return result
+    finally:
+        worker.lock.release()
 
 
 if __name__ == '__main__' and '--worker' in sys.argv:

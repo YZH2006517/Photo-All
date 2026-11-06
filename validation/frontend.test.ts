@@ -1,6 +1,22 @@
 import { describe, expect, it } from 'vitest';
 import * as model from '../product/ui/model';
 
+it('draws native-source adjustments at physical screen resolution and restores 1:1 when zoomed',async()=>{
+  const {liveDrawDimensions}=await import('../product/ui/LivePreview');
+  expect(liveDrawDimensions(6000,4000,1200,800,1)).toEqual({width:1200,height:800});
+  expect(liveDrawDimensions(6000,4000,1200,800,2)).toEqual({width:2400,height:1600});
+  expect(liveDrawDimensions(6000,4000,6000,4000,1)).toEqual({width:6000,height:4000});
+  expect(liveDrawDimensions(6000,4000,12000,8000,2)).toEqual({width:6000,height:4000});
+});
+
+it('keeps photo pixel caches stable when only export borders or save revisions change', () => {
+  const photo = {id:17,digest:'same-source',recipe:{exposure:.2,border:''}} as model.Photo;
+  const framed = {...photo,recipe:{...photo.recipe,border:JSON.stringify({style:'film35'})}};
+  expect(model.photoPreviewFamily(framed,false,2,'source')).toBe(model.photoPreviewFamily(photo,false,1,'source'));
+  expect(model.liveRecipeKey(framed.recipe)).toBe(model.liveRecipeKey(photo.recipe));
+  expect(model.photoPreviewFamily({...photo,recipe:{exposure:.3}},false,2,'source')).not.toBe(model.photoPreviewFamily(photo,false,1,'source'));
+});
+
 it('uses JPEG, 80% LUT and 80/35/15 film defaults for new edits', () => {
   expect(model.DEFAULT_EXPORT_FORMAT).toBe('jpeg');
   expect(model.newFilterLayer('lut', 'example').strength).toBe(.8);

@@ -16,6 +16,8 @@ from io import BytesIO
 from pathlib import Path
 import os
 import sys
+import threading
+from collections import OrderedDict
 
 import numpy as np
 from PIL import Image, ImageCms
@@ -27,6 +29,35 @@ import tifffile
 
 SRGB = ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB')).tobytes()
 TILE = 65536
+_screen_sources = OrderedDict()
+_screen_source_bytes = 0
+_screen_source_lock = threading.Lock()
+
+
+def _screen_read(path, recipe, max_size, target, source_limit=0):
+    """Bounded float decode cache for interactive previews only, never export."""
+    global _screen_source_bytes
+    source = Path(path)
+    stat = source.stat()
+    geometry = tuple(recipe[key] for key in ('quarter_turns', 'crop_x', 'crop_y', 'crop_w', 'crop_h'))
+    key = (str(source.resolve()), stat.st_mtime_ns, stat.st_size, tuple(max_size), geometry, source_limit)
+    with _screen_source_lock:
+        cached = _screen_sources.pop(key, None)
+        if cached is not None:
+            _screen_sources[key] = cached
+            return cached.copy()  # Grading works in-place; cached source must stay neutral.
+    image = read(path, preserve_alpha=True, resize_target=target)
+    if image.nbytes <= 32 * 1024 * 1024:
+        cached = image.copy()
+        cached.setflags(write=False)
+        with _screen_source_lock:
+            if key not in _screen_sources:
+                _screen_sources[key] = cached
+                _screen_source_bytes += cached.nbytes
+            while _screen_source_bytes > 64 * 1024 * 1024:
+                _, old = _screen_sources.popitem(last=False)
+                _screen_source_bytes -= old.nbytes
+    return image
 
 
 def _orient(array, orientation):
@@ -546,7 +577,7 @@ def _geometry(array, recipe):
     return np.ascontiguousarray(array[top:bottom, left:right])
 
 
-def render(path, recipe, max_size=None, preserve_alpha=False, *, preview=False):
+def render(path, recipe, max_size=None, preserve_alpha=False, *, preview=False,preview_input_limit=0):
     """Decode/develop then grade in float32; never writes the original file."""
     import engine
     import film
@@ -562,6 +593,8 @@ def render(path, recipe, max_size=None, preserve_alpha=False, *, preview=False):
         # the decoder for the final display size before cropping would blur it.
         minimum_crop=min(recipe['crop_w'],recipe['crop_h'])
         decode_size=tuple(int(np.ceil(value/minimum_crop)) for value in max_size) if max_size else None
+        if preview and preview_input_limit and decode_size:
+            decode_size=tuple(min(value,preview_input_limit) for value in decode_size)
         if preview and decode_size and decode_size[0] == decode_size[1]:
             # Share the 16-bit RAW stage across screen sizes. Render/crop to
             # the actual requested dimensions after reading the shared TIFF.
@@ -572,14 +605,17 @@ def render(path, recipe, max_size=None, preserve_alpha=False, *, preview=False):
     def target(width, height):
         output_width,output_height=engine.render_dimensions({'width':width,'height':height,'recipe':recipe})
         factor = min(1, max_size[0]/output_width, max_size[1]/output_height)
+        if preview and preview_input_limit:
+            factor=min(factor,preview_input_limit/max(width,height))
         if scale > 1:
             factor = min(factor, math.sqrt(.99*film_spectral.MAX_ENLARGED_PIXELS/(width*height))/scale)
         return max(1, round(width*factor)), max(1, round(height*factor))
-    array = read(path, preserve_alpha=True, resize_target=target if max_size else None)
+    array = (_screen_read(path, recipe, max_size, target,preview_input_limit) if preview and max_size and max(max_size) <= 1920
+             else read(path, preserve_alpha=True, resize_target=target if max_size else None))
     alpha = array[..., 3:].copy() if array.shape[-1] == 4 else None
     rgb = np.ascontiguousarray(array[..., :3])
     if negative_input:
-        rgb = film_spectral.render(rgb, recipe, film.STOCKS)
+        rgb = film_spectral.render(rgb, recipe, film.STOCKS, preview=preview)
     style = recipe['style']
     exposure, contrast, saturation = recipe['exposure'], recipe['contrast'], recipe['saturation']
     temperature = recipe['temperature'] + {'warm': .18, 'cool': -.15, 'film': .08}.get(style, 0)
@@ -613,7 +649,7 @@ def render(path, recipe, max_size=None, preserve_alpha=False, *, preview=False):
         rgb = apply_lut(rgb, np.asarray(creative.table, np.float32).reshape(17, 17, 17, 3))
     stock, strength = recipe['film_stock'], recipe['film_strength']
     if advanced and not negative_input and strength:
-        graded = film_spectral.render(rgb, recipe, film.STOCKS)
+        graded = film_spectral.render(rgb, recipe, film.STOCKS, preview=preview)
         if strength != 1:
             if scale > 1:
                 rgb = resize(rgb, (graded.shape[1], graded.shape[0]))
