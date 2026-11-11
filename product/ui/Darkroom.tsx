@@ -40,6 +40,7 @@ import {
   viewerFullscreen,
 } from "./model";
 import { Picture } from "./Preview";
+import { makeAcrylicScene } from "./AcrylicScene";
 import "./darkroom.css";
 import { WetLab } from "./WetLab";
 import { CASSETTE_PRESETS, cassetteAppearance, mountFilmCassette, paintCassette, type CassetteFields } from "./FilmCassette";
@@ -217,6 +218,7 @@ export function darkroomPerforations(width: number) {
 
 type Stage = "shelf" | "table" | "inspect";
 type SceneState = {
+  environment: "archive" | "acrylic";
   roll?: DarkroomRoll;
   shelf: DarkroomRoll[];
   shelfId: string;
@@ -328,6 +330,11 @@ function makeRoom(
   const scene = new THREE.Scene();
   scene.background = new THREE.Color("#100d0a");
   scene.fog = new THREE.FogExp2("#100d0a", 0.025);
+  const archive = new THREE.Group();
+  scene.add(archive);
+  const acrylic = makeAcrylicScene(Math.min(16, renderer.capabilities.getMaxAnisotropy()));
+  scene.add(acrylic.root);
+  let environment: SceneState["environment"] = "archive", environmentPhase = 1;
   const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 70);
   camera.position.set(7.8, 5.4, 13.8);
   const aim = new THREE.Vector3(0, 1.1, -1.2),
@@ -410,7 +417,7 @@ function makeRoom(
   const rack = new THREE.Group();
   let rackPhase = 1, rackDirection = 1, rackChanged = false;
   let pendingShelf: SceneState | null = null;
-  scene.add(rack);
+  archive.add(rack);
   const bendable: {
     geometry: THREE.PlaneGeometry;
     x: number;
@@ -474,7 +481,7 @@ function makeRoom(
       mats = new Set<THREE.Material>(),
       maps = new Set<THREE.Texture>();
     object.traverse((node) => {
-      if (!(node instanceof THREE.Mesh)) return;
+      if (!(node instanceof THREE.Mesh) && !(node instanceof THREE.Line)) return;
       geometries.add(node.geometry);
       for (const mat of Array.isArray(node.material)
         ? node.material
@@ -525,18 +532,18 @@ function makeRoom(
     metalness: 0.06,
   });
   const leftWallX = -14.5;
-  box(scene, [27, 0.4, 17], [-1, -0.42, 0], woodMaterial);
+  box(archive, [27, 0.4, 17], [-1, -0.42, 0], woodMaterial);
   const wall = mesh(
     new THREE.PlaneGeometry(32, 15),
     new THREE.MeshStandardMaterial({ color: "#29291f", roughness: 1 }),
-    scene,
+    archive,
     0,
     5.5,
     -5,
   );
   wall.receiveShadow = true;
   const sideWall = mesh(new THREE.PlaneGeometry(15, 15), wall.material,
-    scene, leftWallX, 5.5, 2.5);
+    archive, leftWallX, 5.5, 2.5);
   sideWall.rotation.y = Math.PI / 2;
   // The back rack is real geometry; the cartridges cast shadows onto its ledges.
   for (const y of [0.18, 3.01]) {
@@ -565,9 +572,9 @@ function makeRoom(
   }
   // A quiet leather work surface frames the instruments without tinting photographs.
   const leather = new THREE.MeshStandardMaterial({ color: "#30221b", roughness: .98 });
-  box(scene, [9.1, .018, 4.9], [-.4, -.208, .7], leather);
+  box(archive, [9.1, .018, 4.9], [-.4, -.208, .7], leather);
   for (const z of [-1.67, 3.07])
-    for (let i = 0; i < 62; i++) box(scene, [.052, .003, .007], [-4.75 + i * .14, -.196, z], materials.brass);
+    for (let i = 0; i < 62; i++) box(archive, [.052, .003, .007], [-4.75 + i * .14, -.196, z], materials.brass);
   // Poly Haven's Mantel Clock 01 (CC0), bundled with its original material maps.
   const clockLight = new THREE.SpotLight("#ffdab0", 15, 5.5, .46, .85, 2);
   clockLight.position.set(6.3, 2.05, -.15);
@@ -591,7 +598,7 @@ function makeRoom(
       node.castShadow = !node.name.endsWith("_glass");
       node.receiveShadow = node.castShadow;
     });
-    scene.add(clock, clockLight, clockLight.target);
+    archive.add(clock, clockLight, clockLight.target);
     host.dataset.clock = "ready";
     wake();
   }, undefined, () => { host.dataset.clock = "unavailable"; });
@@ -608,12 +615,12 @@ function makeRoom(
         for (const value of Object.values(mat)) if (value instanceof THREE.Texture)
           value.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
     } });
-    scene.add(prop); host.dataset.cameraProp = "ready"; wake();
+    archive.add(prop); host.dataset.cameraProp = "ready"; wake();
   }, undefined, () => { host.dataset.cameraProp = "unavailable"; });
   const propLight = new THREE.SpotLight("#ffdab0", 28, 8, .55, .9, 2);
   propLight.position.set(-7, 4.5, 1); propLight.target.position.set(-9, .7, -2.1);
-  scene.add(propLight, propLight.target);
-  scene.add(strip, cartridge);
+  archive.add(propLight, propLight.target);
+  archive.add(strip, cartridge);
   rack.add(shelves);
 
   function fillShelf(next: SceneState) {
@@ -725,7 +732,7 @@ function makeRoom(
       fog: false,
       side: THREE.DoubleSide,
     }),
-    scene,
+    archive,
     0.35,
     -0.205,
     2.3,
@@ -762,7 +769,7 @@ function makeRoom(
   }
   const viewer = new THREE.Group();
   viewer.name = "desktop-slide-viewer";
-  scene.add(viewer);
+  archive.add(viewer);
   const housing = new THREE.MeshStandardMaterial({
     color: "#b8ad94",
     roughness: 0.66,
@@ -945,7 +952,7 @@ function makeRoom(
     Math.sin(opticalDistance * 0.42) *
       0.2 *
       (1 - Math.exp(-opticalDistance * 1.6));
-  scene.add(optical);
+  archive.add(optical);
   const enamel = new THREE.MeshStandardMaterial({
     color: "#243c33",
     roughness: 0.43,
@@ -1133,6 +1140,7 @@ function makeRoom(
     });
     sheetTexture.needsUpdate = true;
     paintViewer();
+    if (state) acrylic.update(state.frames.photos, state.frames.start, state.frames.index, sheetImages);
     wake();
   }
   function buildStrip() {
@@ -1140,9 +1148,9 @@ function makeRoom(
     controller = new AbortController();
     const signal = controller.signal;
     release(strip);
-    scene.remove(strip);
+    archive.remove(strip);
     strip = new THREE.Group();
-    scene.add(strip);
+    archive.add(strip);
     bendable.length = 0;
     sheetImages.clear();
     feed = desiredFeed = 0;
@@ -1317,6 +1325,22 @@ function makeRoom(
     // Keep the requested speed at lower frame rates; background resume resets last.
     const dt = Math.min(0.25, Math.max(0.001, (now - last) / 1000));
     last = now;
+    const environmentGoal = environment === state.environment ? 1 : 0;
+    environmentPhase = state.reduced ? environmentGoal : THREE.MathUtils.clamp(
+      environmentPhase + Math.sign(environmentGoal - environmentPhase) * dt / .8, 0, 1);
+    if (environmentPhase === 0 && environment !== state.environment) {
+      environment = state.environment;
+      zoom = 1; orbit.set(0, 0); events.zoom(1);
+    }
+    const archivePhase = environment === "archive" ? environmentPhase : 0;
+    archive.visible = archivePhase > 0;
+    archive.position.y = -12 * (1 - THREE.MathUtils.smoothstep(archivePhase, 0, 1));
+    acrylic.animate(environment === "acrylic" ? environmentPhase : 0);
+    for (const lamp of [hemi,key,rim,fill]) lamp.visible = environment === "archive";
+    (scene.background as THREE.Color).set(environment === "acrylic" ? "#babbb4" : state.neutral ? "#171c1b" : "#100d0a");
+    scene.fog!.color.copy(scene.background as THREE.Color);
+    host.dataset.environment = environment;
+    host.dataset.sceneTransition = environmentPhase < 1 || environment !== state.environment ? "moving" : "idle";
     if (rackPhase < 1 && pendingShelf) {
       rackPhase = state.reduced ? 1 : Math.min(1, rackPhase + dt / .72);
       if (rackPhase >= .5 && !rackChanged) { fillShelf(pendingShelf); rackChanged = true; }
@@ -1458,6 +1482,10 @@ function makeRoom(
     cameraBase.copy(desiredCamera).sub(desiredAim);
     if (state.stage === "shelf") cameraBase.multiplyScalar(Math.max(1, 1.65 / camera.aspect));
     cameraBase.lerp(viewerOffset, focus);
+    if (environment === "acrylic") {
+      cameraTarget.set(0,1.20,0);
+      cameraBase.set(2.3,2.7,14.5).multiplyScalar(Math.max(1,1.75/camera.aspect));
+    }
     cameraOrbit.setFromVector3(cameraBase);
     cameraOrbit.theta += orbit.x;
     cameraOrbit.phi = THREE.MathUtils.clamp(cameraOrbit.phi + orbit.y, .63, 1.63);
@@ -1520,6 +1548,7 @@ function makeRoom(
     cartridge.localToWorld(mouth);
     host.dataset.mouthGap = mouth.distanceTo(filmStart).toFixed(5);
     const moving =
+      environmentPhase < 1 || environment !== state.environment ||
       rackPhase < 1 ||
       progress !== target ||
       Math.abs(feed - desiredFeed) > 0.0001 ||
@@ -1560,7 +1589,8 @@ function makeRoom(
     scene.updateMatrixWorld(true);
     camera.updateMatrixWorld();
     ray.setFromCamera(pointer, camera);
-    const groups =
+    if (environmentPhase !== 1 || environment !== state?.environment) return undefined;
+    const groups = environment === "acrylic" ? [acrylic.root] :
       state?.stage === "shelf"
         ? [shelves]
         : [
@@ -1569,7 +1599,7 @@ function makeRoom(
             ...(viewer.visible ? [viewer] : []),
             ...(optical.visible ? [optical] : []),
           ];
-    if (state?.stage === "shelf" && (progress > 0.0001 || rackPhase < 1)) return undefined;
+    if (environment === "archive" && state?.stage === "shelf" && (progress > 0.0001 || rackPhase < 1)) return undefined;
     for (const hit of ray.intersectObjects(groups, true)) {
       if (
         hit.object.parent === strip &&
@@ -1596,6 +1626,7 @@ function makeRoom(
   }
   let down = { id: -1, x: 0, y: 0 };
   const freeFilm = () =>
+    environment === "archive" && environmentPhase === 1 &&
     state?.stage === "table" &&
     progress === 1 &&
     !state.parts.viewer &&
@@ -1799,7 +1830,7 @@ function makeRoom(
     },
     update(next) {
       if (disposed) return;
-      if (state && (state.parts.viewer !== next.parts.viewer || state.parts.optical !== next.parts.optical ||
+      if (state && (state.environment !== next.environment || state.parts.viewer !== next.parts.viewer || state.parts.optical !== next.parts.optical ||
         (state.stage === "shelf") !== (next.stage === "shelf"))) {
         zoom = 1;
         orbit.set(0, 0);
@@ -1846,11 +1877,18 @@ function makeRoom(
       if (activeRollKey !== activeSignature) {
         activeRollKey = activeSignature;
         release(cartridge);
-        scene.remove(cartridge);
+        archive.remove(cartridge);
         cartridge = new THREE.Group();
         if (next.roll) cartridge.add(makeCartridge(next.roll, true));
         cartridge.position.copy(tablePosition);
-        scene.add(cartridge);
+        archive.add(cartridge);
+        release(acrylic.cassette);
+        acrylic.cassette.clear();
+        if (next.roll) {
+          const miniature = makeCartridge(next.roll, true);
+          miniature.scale.setScalar(.55);
+          acrylic.cassette.add(miniature);
+        }
       }
       const signature =
         next.frames.photos
@@ -1865,6 +1903,7 @@ function makeRoom(
         buildStrip();
         setPositions();
       } else if (previousIndex !== next.frames.index) drawSheet();
+      acrylic.update(next.frames.photos, next.frames.start, next.frames.index, sheetImages);
       if (next.stage === "shelf") {
         desiredCamera.set(6.6, 5.1, 14.9);
         desiredAim.set(0, 2.15, -2.6);
@@ -2010,6 +2049,7 @@ function ArchiveDarkroom({
       if (fullscreenActive.current) setImmersive(immersiveRef.current);
     })().catch(() => {}).finally(() => { fullscreenWork.current = null; });
   };
+  const [environment, setEnvironment] = useState<SceneState["environment"]>("archive");
   const [pixelSize, setPixelSize] = useState(false);
   const [photoZoom, setPhotoZoom] = useState(1);
   const [zoom, setZoom] = useState(1);
@@ -2102,6 +2142,7 @@ function ArchiveDarkroom({
     item.title.toLocaleLowerCase().includes(query.toLocaleLowerCase().trim())), [visible, query]);
   const shelfThumbnails = useMemo(() => visible.map(cassetteThumbnail), [visible]);
   const currentState: SceneState = {
+    environment,
     roll,
     shelf: visible,
     shelfId: activeShelf.id,
@@ -2175,6 +2216,7 @@ function ArchiveDarkroom({
   };
   const stow = () => {
     clickSound();
+    if (environment === "acrylic") setEnvironment("archive");
     setReturning(!!room.current && !error);
     setStage("shelf");
   };
@@ -2184,6 +2226,9 @@ function ArchiveDarkroom({
     setStage("inspect");
   };
   const selectFrame = (index: number) => {
+    if (environment === "acrylic") {
+      clickSound(); setCursor(index); setStage("table"); return;
+    }
     if ((!parts.viewer && !parts.optical) || error || !room.current) {
       viewFrame(index);
       return;
@@ -2254,6 +2299,7 @@ function ArchiveDarkroom({
     activeShelf.id,
     library,
     parts,
+    environment,
   ]);
   useEffect(
     () => () => {
@@ -2301,10 +2347,10 @@ function ArchiveDarkroom({
     };
     window.addEventListener("keydown", key);
     return () => window.removeEventListener("keydown", key);
-  }, [stage, roll, onBack, activeViewer, viewerGuides]);
+  }, [stage, roll, onBack, activeViewer, viewerGuides, environment]);
   return (
     <section
-      className={`darkroom dr-stage-${stage} ${immersive ? "dr-immersive" : ""} ${neutral ? "dr-neutral" : ""} ${error ? "dr-failed" : ""}`}
+      className={`darkroom dr-environment-${environment} dr-stage-${stage} ${immersive ? "dr-immersive" : ""} ${neutral ? "dr-neutral" : ""} ${error ? "dr-failed" : ""}`}
       role="region"
       aria-label="独立胶片收藏室"
       data-stage={stage}
@@ -2323,6 +2369,16 @@ function ArchiveDarkroom({
           </span>
         </div>
         <div className="dr-utilities">
+          <select className="dr-environment-select" aria-label="收藏室场景" value={environment}
+            onChange={event => {
+              const next=event.target.value as SceneState["environment"];
+              setEnvironment(next);
+              if(next==="acrylic" && !roll && visible[0]) {setRollId(visible[0].key);setCursor(0);}
+              if(next==="acrylic") setStage("table");
+            }}>
+            <option value="archive">胡桃木收藏室</option>
+            <option value="acrylic">亚克力胶片展廊</option>
+          </select>
           <button aria-pressed={immersive}
             aria-label={immersive ? "退出暗房全屏沉浸" : "暗房全屏沉浸"}
             title={immersive ? "退出全屏沉浸 · F / Esc" : "全屏沉浸 · F"}
@@ -2370,7 +2426,7 @@ function ArchiveDarkroom({
               </form>
             </details>
           )}
-          <details className="dr-parts">
+          <details className="dr-parts" hidden={environment !== "archive"}>
             <summary aria-label="选择暗房桌面部件">
               <Boxes size={16} />
               <span>桌面部件</span>
@@ -2441,7 +2497,7 @@ function ArchiveDarkroom({
           </button>
         </div>
       </header>
-      {stage === "table" && activeViewer && current && !error && (
+      {environment === "archive" && stage === "table" && activeViewer && current && !error && (
         <div className="dr-viewer-controls" role="group" aria-label={activeViewer === "optical" ? "胶片观片器翻片" : "电子观片器翻片"}>
           <output className="dr-viewer-count">FRAME {String(frames.index + 1).padStart(2, "0")} / {frames.photos.length}</output>
           {!viewerGuides[activeViewer] && (
@@ -2476,7 +2532,7 @@ function ArchiveDarkroom({
           </button>
         </div>
       )}
-      {stage === "shelf" && (
+      {environment === "archive" && stage === "shelf" && (
         <div className="dr-intro">
           <span>THE PERSONAL ARCHIVE</span>
           <h1>{activeShelf.name}</h1>

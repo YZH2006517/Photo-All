@@ -1230,17 +1230,17 @@ export function EditorWorkspace(props: EditorWorkspaceProps) {
     setPan({ x: 0, y: 0 });
   };
   const canvasReady = () => {
-    const preview =
-      viewport.current?.querySelector<HTMLElement>(".comparison-edited");
-    return (
-      !!preview &&
+    const previews = viewport.current?.querySelectorAll<HTMLElement>(
+      ".comparison-edited, .spectral-interactive-preview",
+    );
+    return Array.from(previews ?? []).some((preview) =>
       geometryInteractionReady(
         recipe,
         photo.committed_recipe ?? recipe,
         preview.dataset.renderedGeometry,
         preview.dataset.geometryReady === "true",
         tool === "composition",
-      )
+      ),
     );
   };
   const requireReady = () => {

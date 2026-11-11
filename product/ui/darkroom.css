@@ -182,3 +182,16 @@
 .dr-shelf-toolbar button:disabled{opacity:.3;cursor:default;}
 .dr-stage-shelf .dr-intro{top:112px;}.dr-stage-shelf .dr-intro h1{font-size:22px;margin:8px 0;}
 @media(max-width:780px){.dr-shelf-select>span{display:none;}.dr-shelf-select select{max-width:150px;}.dr-shelf-toolbar{gap:3px;}.dr-shelf-toolbar button{padding:5px;}.dr-stage-shelf .dr-roll-list{grid-template-columns:repeat(2,minmax(0,1fr));}}
+.dr-environment-select {
+  color: #e0d0ac;
+  background: #211b13;
+  border: 1px solid #65533b;
+  border-radius: 8px;
+  padding: 9px 12px;
+  font: inherit;
+  max-width: 180px;
+}
+.dr-environment-acrylic .dr-vignette { opacity: .10; }
+.dr-environment-acrylic .dr-scene-caption { color: #383b35; }
+.dr-environment-acrylic .dr-header { background: linear-gradient(#131711e8,#131711a8,transparent); }
+.dr-environment-acrylic .dr-viewer-guide { display: none; }

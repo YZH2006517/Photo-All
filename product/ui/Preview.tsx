@@ -374,7 +374,8 @@ function SpectralPreview({photo, session, exact, uncropped}: {
   useEffect(()=>()=>{if(urlRef.current)URL.revokeObjectURL(urlRef.current);},[]);
   const active=asset?.geometry===geometry && key!==exact;
   return <>
-    {active && <img className="spectral-interactive-preview" src={asset.url} alt="光谱交互预览" draggable={false} data-preview-key={asset.key} />}
+    {active && <img className="spectral-interactive-preview" src={asset.url} alt="光谱交互预览" draggable={false}
+      data-preview-key={asset.key} data-rendered-geometry={asset.geometry} data-geometry-ready="true" />}
     {key!==exact && <span className="live-preview-note">{busy?'光谱预览更新中':'交互预览 · 原尺寸精算中'}</span>}
   </>;
 }
