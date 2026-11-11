@@ -37,7 +37,7 @@
 - [下载便携 ZIP](https://github.com/YZH2006517/Photo-All/releases/download/v0.10.7/Photo-All-Studio_0.10.7_windows-x64.zip)：完整解压，打开 `Photo All Studio.exe`，保留同目录的 `runtime`。
 - [SHA256SUMS.txt](https://github.com/YZH2006517/Photo-All/releases/download/v0.10.7/SHA256SUMS.txt)：下载校验值。
 
-已核对安装程序与便携 EXE 版本、ZIP 完整性及随附源码。浏览器测试覆盖胶片架切换、光谱参数与折叠交互、对比分割线，以及 PNG 和 NEF 的原尺寸预览。本次未执行完整安装升级测试。
+0.10.7 初次发布时曾核对安装程序与便携 EXE 版本、ZIP 完整性及随附源码，浏览器测试覆盖胶片架切换、光谱参数与折叠交互、对比分割线，以及 PNG 和 NEF 的原尺寸预览。这些历史检查不代表本次新场景已通过功能测试；本次只执行编译打包与产物校验，未运行软件、功能测试或安装升级测试。
 
 ## 对应源码
 
