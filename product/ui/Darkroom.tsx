@@ -332,9 +332,15 @@ function makeRoom(
   scene.fog = new THREE.FogExp2("#100d0a", 0.025);
   const archive = new THREE.Group();
   scene.add(archive);
-  const acrylic = makeAcrylicScene(Math.min(16, renderer.capabilities.getMaxAnisotropy()));
+  const acrylic = makeAcrylicScene(renderer, Math.min(16, renderer.capabilities.getMaxAnisotropy()));
   scene.add(acrylic.root);
   let environment: SceneState["environment"] = "archive", environmentPhase = 1;
+  let lightPhase: number | undefined;
+  const neutralWhite = new THREE.Color("#ffffff"), neutralRim = new THREE.Color("#dbe3df");
+  const neutralFill = new THREE.Color("#e9f1ef"), warmKey = new THREE.Color("#ffd49c");
+  const warmRim = new THREE.Color("#ff9d4f"), warmFill = new THREE.Color("#dcd6b8");
+  const warmProp = new THREE.Color("#ffdab0"), warmRoom = new THREE.Color("#100d0a");
+  const coolRoom = new THREE.Color("#171c1b");
   const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 70);
   camera.position.set(7.8, 5.4, 13.8);
   const aim = new THREE.Vector3(0, 1.1, -1.2),
@@ -1326,18 +1332,41 @@ function makeRoom(
     const dt = Math.min(0.25, Math.max(0.001, (now - last) / 1000));
     last = now;
     const environmentGoal = environment === state.environment ? 1 : 0;
+    const transitionDuration = environmentGoal === 0 ? .66 : .82;
+    const transitionStep = Math.min(dt, .05) / transitionDuration;
     environmentPhase = state.reduced ? environmentGoal : THREE.MathUtils.clamp(
-      environmentPhase + Math.sign(environmentGoal - environmentPhase) * dt / .8, 0, 1);
+      environmentPhase + Math.sign(environmentGoal - environmentPhase) * transitionStep, 0, 1);
+    const changingSet = environmentPhase === 0 && environment !== state.environment;
     if (environmentPhase === 0 && environment !== state.environment) {
       environment = state.environment;
+      if (state.reduced) environmentPhase = 1;
       zoom = 1; orbit.set(0, 0); events.zoom(1);
     }
     const archivePhase = environment === "archive" ? environmentPhase : 0;
     archive.visible = archivePhase > 0;
-    archive.position.y = -12 * (1 - THREE.MathUtils.smoothstep(archivePhase, 0, 1));
+    const withdraw = 1 - THREE.MathUtils.smootherstep(archivePhase, 0, 1);
+    archive.position.set(-.55 * withdraw, -.32 * withdraw, -.8 * withdraw);
+    const visibility = .5 - .5 * Math.cos(Math.PI * environmentPhase);
+    renderer.domElement.style.opacity = String(visibility);
+    // Both sets meet at the same warm grey and identical vignette at the handoff.
+    const galleryLight = environment === "acrylic" ? (1 + visibility) / 2 : (1 - visibility) / 2;
+    host.parentElement?.style.setProperty("--dr-gallery-light", String(galleryLight));
     acrylic.animate(environment === "acrylic" ? environmentPhase : 0);
     for (const lamp of [hemi,key,rim,fill]) lamp.visible = environment === "archive";
-    (scene.background as THREE.Color).set(environment === "acrylic" ? "#babbb4" : state.neutral ? "#171c1b" : "#100d0a");
+    const lightGoal = Number(state.neutral);
+    if (lightPhase === undefined || state.reduced) lightPhase = lightGoal;
+    else lightPhase += Math.sign(lightGoal - lightPhase) * Math.min(Math.abs(lightGoal - lightPhase), Math.min(dt,.05) / .8);
+    const blend = THREE.MathUtils.smootherstep(lightPhase, 0, 1);
+    key.color.lerpColors(warmKey, neutralWhite, blend);
+    rim.color.lerpColors(warmRim, neutralRim, blend);
+    hemi.color.lerpColors(warmFill, neutralFill, blend);
+    clockLight.color.lerpColors(warmProp, neutralFill, blend);
+    propLight.color.copy(clockLight.color);
+    acrylic.light(blend);
+    renderer.toneMappingExposure = 1.18 + .02 * blend;
+    const background = scene.background as THREE.Color;
+    if (environment === "acrylic") background.set("#babbb4");
+    else background.lerpColors(warmRoom, coolRoom, blend);
     scene.fog!.color.copy(scene.background as THREE.Color);
     host.dataset.environment = environment;
     host.dataset.sceneTransition = environmentPhase < 1 || environment !== state.environment ? "moving" : "idle";
@@ -1483,8 +1512,8 @@ function makeRoom(
     if (state.stage === "shelf") cameraBase.multiplyScalar(Math.max(1, 1.65 / camera.aspect));
     cameraBase.lerp(viewerOffset, focus);
     if (environment === "acrylic") {
-      cameraTarget.set(0,1.20,0);
-      cameraBase.set(2.3,2.7,14.5).multiplyScalar(Math.max(1,1.75/camera.aspect));
+      cameraTarget.set(.25,1.18,0);
+      cameraBase.set(3.15,2.15,12.8).multiplyScalar(Math.max(1,1.75/camera.aspect));
     }
     cameraOrbit.setFromVector3(cameraBase);
     cameraOrbit.theta += orbit.x;
@@ -1495,8 +1524,9 @@ function makeRoom(
       cameraBase.x += mouseLean.x * 0.13;
       cameraBase.y += mouseLean.y * 0.07;
     }
-    camera.position.lerp(cameraBase, orbitDrag ? 1 : step);
-    aim.lerp(cameraTarget, step);
+    const cameraStep = changingSet ? 1 : step;
+    camera.position.lerp(cameraBase, orbitDrag ? 1 : cameraStep);
+    aim.lerp(cameraTarget, cameraStep);
     camera.lookAt(aim);
     renderer.render(scene, camera);
     host.dataset.renderer = "ready";
@@ -1548,6 +1578,7 @@ function makeRoom(
     cartridge.localToWorld(mouth);
     host.dataset.mouthGap = mouth.distanceTo(filmStart).toFixed(5);
     const moving =
+      lightPhase !== lightGoal ||
       environmentPhase < 1 || environment !== state.environment ||
       rackPhase < 1 ||
       progress !== target ||
@@ -1911,23 +1942,6 @@ function makeRoom(
         desiredCamera.set(0.9, 6.2, 12.8);
         desiredAim.set(0.2, 0.5, 0.1);
       }
-      if (next.neutral) {
-        key.color.set("#ffffff");
-        rim.color.set("#dbe3df");
-        hemi.color.set("#e9f1ef");
-        clockLight.color.set("#e9f1ef");
-        propLight.color.set("#e9f1ef");
-        scene.background = new THREE.Color("#171c1b");
-        renderer.toneMappingExposure = 1.2;
-      } else {
-        key.color.set("#ffd49c");
-        rim.color.set("#ff9d4f");
-        hemi.color.set("#dcd6b8");
-        clockLight.color.set("#ffdab0");
-        propLight.color.set("#ffdab0");
-        scene.background = new THREE.Color("#100d0a");
-        renderer.toneMappingExposure = 1.18;
-      }
       host.dataset.frameCount = String(next.frames.photos.length);
       host.dataset.photoErrors = String(loadErrors);
       last = performance.now();
@@ -1948,6 +1962,7 @@ function makeRoom(
       renderer.domElement.removeEventListener("contextmenu", suppressContextMenu);
       renderer.domElement.removeEventListener("webglcontextlost", lost);
       renderer.domElement.removeEventListener("wheel", wheel);
+      acrylic.dispose();
       release(scene);
       Object.values(materials).forEach((material) => material.dispose());
       renderer.dispose();
@@ -2050,6 +2065,7 @@ function ArchiveDarkroom({
     })().catch(() => {}).finally(() => { fullscreenWork.current = null; });
   };
   const [environment, setEnvironment] = useState<SceneState["environment"]>("archive");
+  const archiveStage = useRef<Stage>("shelf");
   const [pixelSize, setPixelSize] = useState(false);
   const [photoZoom, setPhotoZoom] = useState(1);
   const [zoom, setZoom] = useState(1);
@@ -2374,7 +2390,12 @@ function ArchiveDarkroom({
               const next=event.target.value as SceneState["environment"];
               setEnvironment(next);
               if(next==="acrylic" && !roll && visible[0]) {setRollId(visible[0].key);setCursor(0);}
-              if(next==="acrylic") setStage("table");
+              if(next==="acrylic") {
+                archiveStage.current=stage;
+                setStage("table");
+              } else {
+                setStage(archiveStage.current);
+              }
             }}>
             <option value="archive">胡桃木收藏室</option>
             <option value="acrylic">亚克力胶片展廊</option>

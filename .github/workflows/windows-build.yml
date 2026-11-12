@@ -71,6 +71,24 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python product/package_windows.py filter-sources
 
+      - name: Install native Vulkan build tools
+        id: native-tools
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e
+        with:
+          msystem: UCRT64
+          update: false
+          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-glslang mingw-w64-ucrt-x86_64-vulkan-loader
+
+      - name: Build Photo All Vulkan backend
+        run: |
+          git init validation/vulkan-headers
+          git -C validation/vulkan-headers remote add origin https://github.com/KhronosGroup/Vulkan-Headers.git
+          git -C validation/vulkan-headers fetch --depth 1 origin 88487f687f3100ebe1d3559a8a34d971ee85b977
+          git -C validation/vulkan-headers checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $tools = Join-Path '${{ steps.native-tools.outputs.msys2-location }}' 'ucrt64/bin'
+          ./product/native/build.ps1 -VulkanHeaders validation/vulkan-headers/include -Compiler "$tools/g++.exe" -ShaderCompiler "$tools/glslangValidator.exe"
+
       - name: Stage and verify the Windows runtime
         run: |
           python product/package_windows.py stage

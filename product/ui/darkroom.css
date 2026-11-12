@@ -191,7 +191,9 @@
   font: inherit;
   max-width: 180px;
 }
-.dr-environment-acrylic .dr-vignette { opacity: .10; }
-.dr-environment-acrylic .dr-scene-caption { color: #383b35; }
-.dr-environment-acrylic .dr-header { background: linear-gradient(#131711e8,#131711a8,transparent); }
+.dr-scene { background: radial-gradient(ellipse at 52% 44%,#686662,#4d4c49); }
+.dr-vignette { opacity: calc(1 - .84 * var(--dr-gallery-light,0)); }
+.dr-scene-caption { transition: color .55s ease-in-out; }
+.darkroom:has(.dr-scene[data-environment="acrylic"]) .dr-scene-caption { color: #303932; }
+.dr-header { background: linear-gradient(rgb(21 27 27 / calc(.88 * var(--dr-gallery-light,0))),rgb(21 27 27 / calc(.53 * var(--dr-gallery-light,0))),transparent); }
 .dr-environment-acrylic .dr-viewer-guide { display: none; }

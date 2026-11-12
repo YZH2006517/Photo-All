@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import React, { useEffect, useId, useRef, useState } from "react";
 import { Check, ChevronDown, RotateCcw, Search } from "lucide-react";
-import { type FilmSpectralControl, Library, Photo, Recipe, filmSelectionPatch, spectralRecipe } from "./model";
+import { type FilmSpectralControl, Library, Photo, Recipe, api, filmSelectionPatch, spectralRecipe } from "./model";
 
 export function numericEntry(
   draft: string,
@@ -139,6 +139,12 @@ const quickFields: FilmSpectralControl[] = [
   { key: "film_halation", label: "附加光晕", min: 0, max: 1, step: .01, default: .15, unit: "%" },
 ];
 
+const processSections = {
+  "底片": ["胶片", "耦合剂", "光晕", "颗粒"],
+  "冲印": ["冲印", "放大机滤色", "预闪"],
+  "光源": ["光源"],
+};
+
 export function FilmControls({ photo, catalog, update, disabled }: {
   photo: Photo;
   catalog: Library["film"];
@@ -148,8 +154,12 @@ export function FilmControls({ photo, catalog, update, disabled }: {
   const radioName = useId();
   const [query, setQuery] = useState("");
   const [stockOpen, setStockOpen] = useState(false);
+  const [stage, setStage] = useState<keyof typeof processSections>("底片");
   const advanced = spectralRecipe(photo.recipe);
   const spectral = catalog.spectral;
+  useEffect(() => {
+    if (spectral?.ready) void api("/prepare-film-preview", {}).catch(() => {});
+  }, [spectral?.ready]);
   const current = String(advanced?.stock ?? photo.recipe.film_stock ?? "none");
   const stocks = advanced ? spectral?.stocks ?? {} : catalog.stocks;
   const active = stocks[current];
@@ -255,22 +265,30 @@ export function FilmControls({ photo, catalog, update, disabled }: {
         <div className="film-spectral-heading">
           <strong>光谱工艺</strong>
           <button type="button" aria-pressed={!!advanced} disabled={disabled || (!advanced && !spectral?.ready)}
-            onClick={() => selectMode(advanced ? "quick" : "advanced")}>启用光谱工艺</button>
+            onClick={() => selectMode(advanced ? "quick" : "advanced")}>{advanced ? "关闭光谱工艺" : "启用光谱工艺"}</button>
         </div>
-        <p className="film-engine-note">{!spectral?.ready ? "需要完整的 Spektrafilm 运行时。"
-          : advanced ? "Spektrafilm 光谱渲染 · 停止调节后刷新预览" : "启用后可调节下方的工艺参数。"}</p>
+        {!spectral?.ready && <p className="film-engine-note">需要完整的 Spektrafilm 运行时。</p>}
+        {advanced && <div className="film-stage-nav" role="group" aria-label="光谱工序">
+          {(Object.keys(processSections) as (keyof typeof processSections)[]).map((item) =>
+            <button key={item} type="button" aria-pressed={stage === item}
+              onClick={() => setStage(item)}>{item}</button>)}
+        </div>}
         {isNegative && <p className="film-engine-note">使用未反相的负片扫描。片基参考为 0 时自动估计，也可输入未曝光片基的 RGB 读数。</p>}
-        {Object.entries(spectral?.groups ?? {}).map(([group, fields]) => (
-          <details className="film-group" key={group}>
-            <summary className="film-group-toggle"><ChevronDown size={14} />{group}<span>{fields.length}</span></summary>
-            <section className="film-properties" aria-label={group}>
-              {fields.map((field) => <FilmValue key={field.key} field={field}
-                scale={"unit" in field && field.unit === "%" ? 100 : 1}
-                value={advanced?.[field.key] ?? field.default} disabled={fieldLocked(group, field.key)}
-                change={(value) => setAdvanced({ [field.key]: value })} />)}
-            </section>
-          </details>
-        ))}
+        {advanced && processSections[stage].map((group) => {
+          const fields = spectral?.groups[group];
+          if (!fields) return null;
+          return (
+            <details className="film-group" key={group}>
+              <summary className="film-group-toggle"><ChevronDown size={14} />{group}<span>{fields.length}</span></summary>
+              <section className="film-properties" aria-label={group}>
+                {fields.map((field) => <FilmValue key={field.key} field={field}
+                  scale={"unit" in field && field.unit === "%" ? 100 : 1}
+                  value={advanced?.[field.key] ?? field.default} disabled={fieldLocked(group, field.key)}
+                  change={(value) => setAdvanced({ [field.key]: value })} />)}
+              </section>
+            </details>
+          );
+        })}
       </section>
       <details className="film-provenance">
         <summary>引擎与授权</summary>

@@ -14,6 +14,35 @@ package_windows = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package_windows)
 
 
+class SpectralCompactionTests(unittest.TestCase):
+    def test_compaction_preserves_math_assets_and_metadata(self):
+        self.assertTrue(hasattr(package_windows,'compact_spectral_runtime'), 'Missing curated runtime compaction')
+        with tempfile.TemporaryDirectory(dir=ROOT/'validation') as folder:
+            root = Path(folder)
+            files = {
+                'Lib/json/__init__.py': b'VALUE=3',
+                'Lib/site-packages/numba/core.py': b'keep',
+                'Lib/site-packages/numba/support.c': b'build-only',
+                'Lib/site-packages/numpy/types.pyi': b'typing-only',
+                'Lib/site-packages/matplotlib/mpl-data/matplotlibrc': b'keep',
+                'Lib/site-packages/matplotlib/mpl-data/fonts/ttf/example.ttf': b'plot-only'*100,
+                'Lib/site-packages/fontTools/ttLib/__init__.py': b'plot-only',
+                'Lib/site-packages/fonttools-1.dist-info/licenses/LICENSE': b'keep license',
+                'Lib/site-packages/spektrafilm/data/profile.npy': b'keep science',
+            }
+            for name, data in files.items():
+                target=root/name; target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(data)
+            result = package_windows.compact_spectral_runtime(root)
+            with zipfile.ZipFile(root/'python313.zip') as archive:
+                self.assertEqual(archive.read('json/__init__.py'),b'VALUE=3')
+            for name in files:
+                if 'keep' in files[name].decode() and 'Lib/json/' not in name:
+                    self.assertTrue((root/name).is_file(),name)
+            self.assertFalse((root/'Lib/site-packages/fontTools').exists())
+            self.assertFalse((root/'Lib/site-packages/numba/support.c').exists())
+            self.assertGreater(result['removed_bytes'],0)
+
+
 class OpenFilterPackagingTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(dir=ROOT / 'validation')

@@ -15,6 +15,33 @@ sys.path.insert(0, str(ROOT.parent / 'product'))
 
 
 class ServiceTests(unittest.TestCase):
+    def test_export_exact_mode_reaches_render_and_does_not_leak(self):
+        import engine
+        from unittest.mock import patch
+        path=self.root/'mode.png';Image.new('RGB',(32,24),(90,120,50)).save(path)
+        value=self.call('/api/import',{'paths':[str(path)]});self.wait_job(value['id'])
+        photo=self.call('/api/library')['photos'][0]
+        seen=[];original=engine.export_photo
+        def traced(*args,**kwargs):
+            seen.append(engine.film_spectral.calculation_quality())
+            return original(*args,**kwargs)
+        with patch.object(engine,'export_photo',side_effect=traced):
+            for mode in ['exact','accelerated']:
+                value=self.call('/api/export',{'ids':[photo['id']],'folder':str(self.root/mode),'size':0,'spectral_mode':mode})
+                completed=self.wait_job(value['id'])
+                self.assertEqual(completed['status'],'done');self.assertEqual(completed['result']['errors'],[])
+                with Image.open(completed['result']['outputs'][0]) as result:self.assertEqual(result.size,(32,24))
+        self.assertEqual(seen,['exact','accelerated'])
+        self.assertEqual(engine.film_spectral.calculation_quality(),'accelerated')
+
+    def test_export_rejects_unknown_spectral_mode(self):
+        path=self.root/'mode.png';Image.new('RGB',(32,24),(90,120,50)).save(path)
+        value=self.call('/api/import',{'paths':[str(path)]});self.wait_job(value['id'])
+        photo=self.call('/api/library')['photos'][0]
+        with self.assertRaises(HTTPError) as caught:
+            self.call('/api/export',{'ids':[photo['id']],'folder':str(self.root/'exports'),'spectral_mode':'unknown'})
+        self.assertEqual(caught.exception.code,400)
+
     def setUp(self):
         self.assertIsNotNone(importlib.util.find_spec('service'), 'Unified UI service is missing')
         import service

@@ -401,6 +401,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('请求必须为对象')
             if route.path == '/api/library' and self.command == 'GET':
                 return self.reply(self.library())
+            if route.path == '/api/prepare-film-preview' and self.command == 'POST':
+                engine.film_spectral.prepare_preview()
+                return self.reply({'ok':True})
             if route.path == '/api/editor-preview' and self.command == 'POST':
                 identity = body.get('id')
                 if type(identity) is not int or identity < 1: raise ValueError('照片 ID 无效')
@@ -682,6 +685,8 @@ class Handler(BaseHTTPRequestHandler):
                             tasks.append((photo, str(Path(folder) / f'album_{name}_{identity}')))
                 template, size = body.get('template', 'recipe'), int(body.get('size', 2400))
                 format=body.get('format','jpeg')
+                spectral_mode = body.get('spectral_mode', 'accelerated')
+                if spectral_mode not in {'accelerated', 'exact'}:raise ValueError('光谱计算模式无效')
                 if format not in {'jpeg','png','tiff','webp','original','tiff16'}:raise ValueError('未知导出格式')
                 raw16 = format == 'tiff16'
                 if template not in engine.TEMPLATES or (size != 0 and not 300 <= size <= 12000): raise ValueError('导出规格无效')
@@ -691,7 +696,8 @@ class Handler(BaseHTTPRequestHandler):
                     for i, (photo, destination) in enumerate(tasks):
                         try:
                             cancellation.check()
-                            output = engine.export_raw_tiff(photo, destination, cancellation=cancellation) if raw16 else engine.export_photo(photo, destination, template, size, format, cancellation=cancellation)
+                            with engine.film_spectral.calculation_mode(spectral_mode):
+                                output = engine.export_raw_tiff(photo, destination, cancellation=cancellation) if raw16 else engine.export_photo(photo, destination, template, size, format, cancellation=cancellation)
                             outputs.append(str(output))
                         except engine.ExportCancelled:
                             break

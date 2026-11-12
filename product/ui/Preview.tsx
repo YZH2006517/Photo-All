@@ -46,6 +46,7 @@ export const Picture = memo(function Picture({
   sourceScale,
   uncropped = false,
   editorSession,
+  deferNative = false,
 }: {
   photo: Photo;
   size?: number;
@@ -59,6 +60,7 @@ export const Picture = memo(function Picture({
   sourceScale?: number;
   uncropped?: boolean;
   editorSession?: EditorPreviewSession;
+  deferNative?: boolean;
 }) {
   const frame = useRef<HTMLDivElement>(null);
   // The GET renderer reads the catalog. Optimistic slider/crop values must not
@@ -69,7 +71,10 @@ export const Picture = memo(function Picture({
     committed.current.revision !== revision
   )
     committed.current = { id: photo.id, revision, recipe: photo.recipe };
-  const requestedPhoto = {
+  // The editor POST carries the full live recipe. Its request, cache entry
+  // and decoded-frame acknowledgement must all identify that same recipe.
+  // Catalog-backed GET requests below still need the saved recipe.
+  const requestedPhoto = editorSession ? { ...photo, committed_recipe: undefined } : {
     ...photo,
     recipe: photo.committed_recipe ?? committed.current.recipe,
   };
@@ -248,6 +253,7 @@ export const Picture = memo(function Picture({
       setDisplay(null);
       return;
     }
+    if (deferNative) return;
     const controller = new AbortController();
     setError("");
     const load = () => { decodedPreviews
@@ -293,7 +299,7 @@ export const Picture = memo(function Picture({
       clearTimeout(delay);
       controller.abort();
     };
-  }, [visible, family, requestedSize, quality, sourcePixels > 0, editorSession?.generation]);
+  }, [visible, family, requestedSize, quality, sourcePixels > 0, editorSession?.generation, deferNative]);
   return (
     <div
       ref={frame}
@@ -337,8 +343,9 @@ export const Picture = memo(function Picture({
   );
 });
 
-function SpectralPreview({photo, session, exact, uncropped}: {
+function SpectralPreview({photo, session, exact, uncropped, onDraftSettled}: {
   photo: Photo; session: EditorPreviewSession; exact: string; uncropped: boolean;
+  onDraftSettled: (generation: number) => void;
 }) {
   const [asset,setAsset]=useState<{url:string;geometry:string;key:string}|null>(null);
   const [busy,setBusy]=useState(true);
@@ -362,21 +369,22 @@ function SpectralPreview({photo, session, exact, uncropped}: {
     const timer=window.setTimeout(()=>{
       void editorPreviewBlob(photo,session,640,controller.signal,uncropped).then(async blob=>{
         await show(blob);
+        if (!controller.signal.aborted) onDraftSettled(session.generation);
         if(!controller.signal.aborted && Math.min(Number(photo.recipe.crop_w??1),Number(photo.recipe.crop_h??1))>=.5)refineTimer=setTimeout(()=>{
           // Fill a normal desktop viewport while the native pixel grid is being
           // refined. This job yields to any new gesture; the fast worker stays warm.
           void editorPreviewBlob(photo,session,1200,controller.signal,uncropped).then(show).catch(()=>{});
         },300);
-      }).catch(()=>{if(!controller.signal.aborted)setBusy(false);});
+      }).catch(()=>{if(!controller.signal.aborted){setBusy(false);onDraftSettled(session.generation);}});
     },100);
     return ()=>{clearTimeout(timer);clearTimeout(refineTimer);controller.abort();};
-  },[key,session.id,session.generation,uncropped,exact]);
+  },[key,session.id,session.generation,uncropped,exact,onDraftSettled]);
   useEffect(()=>()=>{if(urlRef.current)URL.revokeObjectURL(urlRef.current);},[]);
   const active=asset?.geometry===geometry && key!==exact;
   return <>
     {active && <img className="spectral-interactive-preview" src={asset.url} alt="光谱交互预览" draggable={false}
       data-preview-key={asset.key} data-rendered-geometry={asset.geometry} data-geometry-ready="true" />}
-    {key!==exact && <span className="live-preview-note">{busy?'光谱预览更新中':'交互预览 · 原尺寸精算中'}</span>}
+    {key!==exact && <span className="live-preview-note">{busy?'光谱预览更新中':'交互预览 · 原尺寸细化中'}</span>}
   </>;
 }
 
@@ -401,6 +409,7 @@ export function Comparison({
     [position, setPosition] = useState(0.5),
     [readyOriginal, setReadyOriginal] = useState("");
   const [exact, setExact] = useState("");
+  const [settledDraft, setSettledDraft] = useState(-1);
   const previewSession=useRef(crypto.randomUUID());
   const liveKey=liveRecipeKey(photo.recipe);
   const renderKey=JSON.stringify([liveKey,uncropped]);
@@ -488,6 +497,7 @@ export function Comparison({
           eager
           reusePreview
           editorSession={photo.recipe.film_advanced ? session : undefined}
+            deferNative={!!photo.recipe.film_advanced && exact !== liveKey && settledDraft !== session.generation}
           onLoaded={(image, recipe) => {
             setExact(
               liveRecipeKey(recipe ?? photo.committed_recipe ?? photo.recipe),
@@ -500,7 +510,7 @@ export function Comparison({
         />
         {!photo.recipe.film_advanced && !photo.committed_recipe?.film_advanced &&
           <LivePreview photo={photo} exact={exact} uncropped={uncropped} sourceSize={0} viewScale={viewScale} />}
-        {photo.recipe.film_advanced && <SpectralPreview photo={photo} session={session} exact={exact} uncropped={uncropped} />}
+        {photo.recipe.film_advanced && <SpectralPreview photo={photo} session={session} exact={exact} uncropped={uncropped} onDraftSettled={setSettledDraft} />}
         {active && (
           <>
             <div

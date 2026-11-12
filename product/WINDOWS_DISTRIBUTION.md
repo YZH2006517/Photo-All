@@ -85,13 +85,21 @@ If the local `engines/film-runtime` and managed CPython 3.13.13 are prepared,
 staging also includes the optional Spektrafilm 0.3.4 float-array worker under
 `runtime/engines/spectral-python/`. Staging checks the pinned upstream source
 files and writes the `spektrafilm-photo-all.patch` source adaptation beside that
-interpreter and the built artifacts. The patch defers upstream RAW and image
-file I/O imports and switches the Gaussian convolution's FFT calls to SciPy.
+interpreter and the built artifacts. The patch defers upstream RAW, image
+file I/O and diagnostic plotting imports and switches the Gaussian convolution's FFT calls to SciPy.
 The Gaussian kernel, padding and crop are preserved. Photo All handles decoding
 and encoding, and the isolated worker receives float arrays. The runtime
 manifest records the revision, original and staged file hashes, and patch hash.
-Apply the patch with `patch -p1` from the Spektrafilm source archive root to
-reproduce the staged source changes.
+The patch also records the pinned colour-science headless adaptation. Apply
+it with `patch -p2` from a clean site-packages tree containing the pinned
+Spektrafilm and colour-science packages to reproduce all staged source changes.
+
+The worker's CPython standard library is compressed into `python313.zip`.
+Scientific Python source stays on disk for Numba's source inspection and JIT
+cache. Chart-only fonts/fontTools, static development inputs and typing stubs
+are excluded. Matplotlib polygon geometry, all film profiles, image codecs and
+dependency license metadata remain. Compaction byte counts are recorded in
+`runtime-manifest.json`. This changes only the isolated worker distribution.
 
 From the repository root run `python validation/packaging_smoke.py product/build/runtime
 --raw validation/inputs/D7000.NEF --output validation/artifacts/packaging-report.json`.

@@ -1,0 +1,197 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly buffer InputPixels { float inputPixels[]; };
+layout(std430, binding = 1) writeonly buffer OutputPixels { float outputPixels[]; };
+layout(std430, binding = 2) readonly buffer Tables { float tables[]; };
+layout(push_constant) uniform Parameters {
+    uint count;
+    uint mode;
+    uint size;
+    uint bands;
+    uint offsets[6];
+    float low[3];
+    float scale[3];
+}
+p;
+
+float hermite(float a, float b, float ma, float mb, float t) {
+    float t2 = t * t, t3 = t2 * t;
+    return (2 * t3 - 3 * t2 + 1) * a + (t3 - 2 * t2 + t) * ma + (-2 * t3 + 3 * t2) * b +
+           (t3 - t2) * mb;
+}
+float sampleTable(uint table, uvec3 at, uint channel) {
+    uint size = table < 4 ? p.size : p.size - 1;
+    return tables[p.offsets[table] + ((at.x * size + at.y) * size + at.z) * 3 + channel];
+}
+float xCurve(uvec3 at, uint channel, float t) {
+    return hermite(sampleTable(0, at, channel), sampleTable(0, at + uvec3(1, 0, 0), channel),
+                   sampleTable(1, at, channel), sampleTable(1, at + uvec3(1, 0, 0), channel), t);
+}
+float xMix(uint table, uvec3 at, uint channel, float t) {
+    return mix(sampleTable(table, at, channel), sampleTable(table, at + uvec3(1, 0, 0), channel),
+               t);
+}
+float xyMix(uint table, uvec3 at, uint channel, vec2 t) {
+    return mix(xMix(table, at, channel, t.x), xMix(table, at + uvec3(0, 1, 0), channel, t.x), t.y);
+}
+uint randomBits(inout uint state) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
+uint pixelSeed(uint pixel, uint channel, uint seed) {
+    uint state = pixel ^ (channel + 1) * 0x9e3779b9u ^ seed;
+    state ^= state >> 16;
+    state *= 0x7feb352du;
+    state ^= state >> 15;
+    state *= 0x846ca68bu;
+    state ^= state >> 16;
+    return state == 0u ? 1u : state;
+}
+float uniformRandom(inout uint state) {
+    return (float(randomBits(state) >> 9) + .5) / 8388608.;
+}
+float normalRandom(inout uint state) {
+    return sqrt(-2. * log(uniformRandom(state))) * cos(6.28318530718 * uniformRandom(state));
+}
+float particleSample(float density, float maximum, float particles, float uniformity, inout uint state) {
+    float probability = clamp(density / maximum, 1e-6, 1. - 1e-6);
+    float saturation = 1. - probability * uniformity * (1. - 1e-6);
+    float lambda = particles / saturation, trials;
+    if (lambda < 30.) {
+        float product = 1., limit = exp(-lambda);
+        uint count = 0;
+        while (product > limit) {
+            product *= uniformRandom(state);
+            count++;
+        }
+        trials = float(count) - 1.;
+    } else {
+        trials = max(0., roundEven(lambda + sqrt(lambda) * normalRandom(state)));
+    }
+    float drawn = 0.;
+    if (trials < 25.) {
+        for (uint i = 0; i < uint(trials); i++)
+            drawn += uniformRandom(state) < probability ? 1. : 0.;
+    } else if (trials * probability * (1. - probability) > 10.) {
+        drawn = clamp(roundEven(trials * probability +
+                      sqrt(trials * probability * (1. - probability)) * normalRandom(state)), 0., trials);
+    } else {
+        // Reflect high probabilities so the inversion starts at the short tail.
+        float q = min(probability, 1. - probability);
+        float mass = pow(1. - q, trials), cumulative = mass, u = uniformRandom(state);
+        for (uint k = 0; cumulative < u && float(k) < trials && k < 512u; k++) {
+            mass *= (trials - float(k)) / float(k + 1) * q / (1. - q);
+            cumulative += mass;
+            drawn += 1.;
+        }
+        if (probability > .5) drawn = trials - drawn;
+    }
+    return drawn * (maximum / particles) * saturation;
+}
+void main() {
+    uint pixel = gl_GlobalInvocationID.x;
+    if (pixel >= p.count)
+        return;
+    vec3 rgb = vec3(inputPixels[pixel * 3], inputPixels[pixel * 3 + 1], inputPixels[pixel * 3 + 2]);
+    vec3 result;
+    if (p.mode == 6 || p.mode == 7 || p.mode == 8) {
+        for (uint c = 0; c < 3; c++) {
+            uint offset = p.offsets[c], count = p.offsets[c + 3];
+            float value = p.mode == 7 ? -rgb[c] : rgb[c], density;
+            if (p.mode == 8) density = rgb[c];
+            else if (value <= tables[offset]) density = tables[offset + 1];
+            else if (value >= tables[offset + (count - 1) * 2]) density = tables[offset + (count - 1) * 2 + 1];
+            else {
+                uint left = 0, right = count;
+                while (left < right) {
+                    uint middle = (left + right) / 2;
+                    if (tables[offset + middle * 2] <= value) left = middle + 1;
+                    else right = middle;
+                }
+                uint a = offset + (left - 1) * 2, b = a + 2;
+                float delta = tables[b] - tables[a];
+                float t = delta == 0. ? 0. : (value - tables[a]) / delta;
+                density = mix(tables[a + 1], tables[b + 1], t);
+            }
+            uint state = pixelSeed(pixel + p.size, c, p.bands);
+            result[c] = particleSample(density + tables[c * 4], tables[c * 4 + 1],
+                                       tables[c * 4 + 2], tables[c * 4 + 3], state);
+        }
+    } else if (p.mode == 9) {
+        vec3 linear;
+        for (uint c = 0; c < 3; c++)
+            linear[c] = rgb[c] <= .04045 ? rgb[c] / 12.92 : pow((rgb[c] + .055) / 1.055, 2.4);
+        for (uint c = 0; c < 3; c++) {
+            float value = linear.r * tables[c] + linear.g * tables[3 + c] + linear.b * tables[6 + c];
+            result[c] = max(0., value <= .0031308 ? value * 12.92 : 1.055 * pow(value, 1. / 2.4) - .055);
+        }
+    } else if (p.mode == 1 || p.mode == 3) {
+        vec3 total = vec3(0);
+        for (uint band = 0; band < p.bands; band++) {
+            uint at = band * 7;
+            vec3 dye = vec3(tables[at], tables[at + 1], tables[at + 2]);
+            float light = pow(10., -(dot(rgb, dye) + tables[at + 3]));
+            vec3 contribution = light * vec3(tables[at + 4], tables[at + 5], tables[at + 6]);
+            total += mix(contribution, vec3(0), isnan(contribution));
+        }
+        uint end = p.bands * 7;
+        result =
+            log(max(total + vec3(tables[end], tables[end + 1], tables[end + 2]), vec3(0)) + 1e-10) /
+            log(10.);
+        rgb = result;
+    }
+    if (p.mode == 2 || p.mode == 3) {
+        for (uint c = 0; c < 3; c++) {
+            uint offset = p.offsets[c], count = p.offsets[c + 3];
+            uint left = 0, right = count - 1;
+            while (right - left > 1) {
+                uint middle = (left + right) / 2;
+                if (tables[offset + middle * 2] <= rgb[c])
+                    left = middle;
+                else
+                    right = middle;
+            }
+            float a = tables[offset + left * 2], b = tables[offset + right * 2];
+            float t = clamp((rgb[c] - a) / (b - a), 0., 1.);
+            result[c] = mix(tables[offset + left * 2 + 1], tables[offset + right * 2 + 1], t);
+        }
+    } else if (p.mode == 4 || p.mode == 5) {
+        vec3 normalized =
+            (rgb - vec3(p.low[0], p.low[1], p.low[2])) * vec3(p.scale[0], p.scale[1], p.scale[2]);
+        vec3 position = clamp(normalized, 0., 1.) * float(p.size - 1);
+        uvec3 at = min(uvec3(floor(position)), uvec3(p.size - 2));
+        vec3 t = position - vec3(at);
+        result = vec3(0);
+        for (uint b = 0; b < 2; b++)
+            for (uint g = 0; g < 2; g++)
+                for (uint r = 0; r < 2; r++) {
+                    float weight = (r == 1 ? t.r : 1. - t.r) * (g == 1 ? t.g : 1. - t.g) *
+                                   (b == 1 ? t.b : 1. - t.b);
+                    uint index = p.mode == 4
+                                     ? (((at.b + b) * p.size + at.g + g) * p.size + at.r + r) * 3
+                                     : (((at.r + r) * p.size + at.g + g) * p.size + at.b + b) * 3;
+                    result += vec3(tables[index], tables[index + 1], tables[index + 2]) * weight;
+                }
+    } else if (p.mode == 0) {
+        vec3 normalized =
+            (rgb - vec3(p.low[0], p.low[1], p.low[2])) * vec3(p.scale[0], p.scale[1], p.scale[2]);
+        vec3 position = clamp(normalized, 0., 1.) * float(p.size - 1);
+        uvec3 at = min(uvec3(floor(position)), uvec3(p.size - 2));
+        vec3 t = position - vec3(at);
+        for (uint c = 0; c < 3; c++) {
+            float z0 = hermite(xCurve(at, c, t.x), xCurve(at + uvec3(0, 1, 0), c, t.x),
+                               xMix(2, at, c, t.x), xMix(2, at + uvec3(0, 1, 0), c, t.x), t.y);
+            uvec3 back = at + uvec3(0, 0, 1);
+            float z1 = hermite(xCurve(back, c, t.x), xCurve(back + uvec3(0, 1, 0), c, t.x),
+                               xMix(2, back, c, t.x), xMix(2, back + uvec3(0, 1, 0), c, t.x), t.y);
+            result[c] = clamp(hermite(z0, z1, xyMix(3, at, c, t.xy), xyMix(3, back, c, t.xy), t.z),
+                              sampleTable(4, at, c), sampleTable(5, at, c));
+        }
+    }
+    outputPixels[pixel * 3] = result.r;
+    outputPixels[pixel * 3 + 1] = result.g;
+    outputPixels[pixel * 3 + 2] = result.b;
+}

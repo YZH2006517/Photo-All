@@ -17,12 +17,53 @@ import tifffile
 
 
 class PrecisionTests(unittest.TestCase):
+    def test_native_png_encoder_preserves_rgb_rgba_16bit_and_srgb_tag(self):
+        p = self.pixels()
+        import imagecodecs
+        rng = np.random.default_rng(63)
+        for channels in (3, 4):
+            samples = rng.integers(0, 65536, (48,73,channels),dtype=np.uint16)
+            output = BytesIO()
+            with patch.object(imagecodecs,'png_encode',wraps=imagecodecs.png_encode) as encode:
+                p.write(output,samples.astype(np.float32)/65535,'png16')
+                self.assertEqual(encode.call_count,1,'16-bit PNG still uses the slow Python encoder')
+            data=output.getvalue()
+            np.testing.assert_array_equal(imagecodecs.png_decode(data),samples)
+            with Image.open(BytesIO(data)) as preview:
+                self.assertEqual(preview.info.get('srgb'),1)
+
+    def test_native_preview_and_export_share_only_full_precision_source(self):
+        p=self.pixels();source=self.png_source(self.samples)
+        with patch.object(p,'read',wraps=p.read) as reading:
+            first=p.render(source,{'exposure':-.2},preview=True)
+            second=p.render(source,{'exposure':-.5},preview=True)
+            self.assertEqual(reading.call_count,1,'Native display should reuse the neutral float decode')
+            self.assertGreater(float(first.mean()),float(second.mean()))
+            output=p.render(source,{},preview=False)
+            self.assertEqual(reading.call_count,1,'Export should reuse the unchanged full-precision neutral decode')
+        np.testing.assert_array_equal(np.rint(output*65535).astype('uint16'),self.samples)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT / 'validation')
         self.addCleanup(self.temp.cleanup)
         self.folder = Path(self.temp.name)
         ramp = np.arange(4096, dtype=np.uint16) * 16
         self.samples = np.stack([ramp, np.roll(ramp, 113), 65535-ramp], axis=-1)[None]
+
+    def test_cached_raw_keeps_pixel_identity_and_reuses_native_for_preview(self):
+        import engine, subprocess
+        src = self.folder/'capture.nef'
+        src.write_bytes(b'fixture')
+        def develop(command, **kwargs):
+            Image.new('RGB', (24,16)).save(command[command.index('-o')+1], 'TIFF')
+            return subprocess.CompletedProcess(command,0,b'',b'')
+        with patch.object(engine,'RAW_CACHE',self.folder/'raw-cache'), patch.object(engine,'raw_executable',return_value=src), patch.object(engine.subprocess,'run',side_effect=develop) as run:
+            first = engine.develop_raw(src,output_16bit=True)
+            stamp = first.stat().st_mtime_ns
+            self.assertEqual(engine.develop_raw(src,preview_size=(12,12),output_16bit=True,reuse_native=True),first)
+            self.assertEqual(first.stat().st_mtime_ns,stamp)
+            self.assertNotEqual(engine.develop_raw(src,{'raw_exposure':1},preview_size=(12,12),output_16bit=True,reuse_native=True),first)
+            self.assertEqual(run.call_count,2)
 
     def pixels(self):
         import pixels

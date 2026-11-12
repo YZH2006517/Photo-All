@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Independent separable FIR / recursive Gaussian, with reference edge rules.
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : require
+layout(local_size_x=128) in;
+layout(std430,binding=0) buffer First { float a[]; };
+layout(std430,binding=1) buffer Second { float b[]; };
+layout(std430,binding=2) readonly buffer Coefficients { uint coefficient[]; };
+layout(push_constant) uniform Settings { uint width; uint height; uint recursive; uint pass; uint radius; } p;
+double coeff(uint i) { return packDouble2x32(uvec2(coefficient[i*2],coefficient[i*2+1])); }
+int reflectIndex(int i,int n) {
+    // GLSL modulo with negative operands is not portable across drivers.
+    if(i<0)i=-i-1;
+    i=i%(2*n);
+    return i<n?i:2*n-1-i;
+}
+float readPixel(uint i) { return p.pass==0?a[i]:b[i]; }
+float readOutput(uint i) { return p.pass==0?b[i]:a[i]; }
+void writePixel(uint i,float value) { if(p.pass==0)b[i]=value;else a[i]=value; }
+void main() {
+    uint job=(gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*128+gl_LocalInvocationID.x;
+    if(p.recursive==0) {
+        if(job>=p.width*p.height)return;
+        int x=int(job%p.width),y=int(job/p.width),r=int(p.radius);
+        double total=0.;
+        for(int k=-r;k<=r;k++) {
+            uint at=p.pass==0?uint(reflectIndex(y+k,int(p.height)))*p.width+uint(x)
+                             :uint(y)*p.width+uint(reflectIndex(x+k,int(p.width)));
+            total+=double(readPixel(at))*coeff(uint(k+r));
+        }
+        writePixel(job,float(total));
+        return;
+    }
+    // Horizontal first; each invocation owns an entire scanline. States stay
+    // double precision even though the frame storage is float32.
+    uint length=p.pass==0?p.width:p.height,lines=p.pass==0?p.height:p.width;
+    if(job>=lines)return;
+    uint base=p.pass==0?job*p.width:job,stride=p.pass==0?1:p.width;
+    double B=coeff(0),B1=coeff(1),B2=coeff(2),B3=coeff(3);
+    double s1=double(readPixel(base)),s2=s1,s3=s1;
+    for(uint i=0;i<length;i++) {
+        uint at=base+i*stride;
+        double v=B*double(readPixel(at))+B1*s1+B2*s2+B3*s3;
+        writePixel(at,float(v));s3=s2;s2=s1;s1=v;
+    }
+    s1=double(readOutput(base+(length-1)*stride));s2=s1;s3=s1;
+    for(int i=int(length)-1;i>=0;i--) {
+        uint at=base+uint(i)*stride;
+        double v=B*double(readOutput(at))+B1*s1+B2*s2+B3*s3;
+        writePixel(at,float(v));s3=s2;s2=s1;s1=v;
+    }
+}

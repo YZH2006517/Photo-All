@@ -44,11 +44,11 @@ RAW_SOURCE_SHA256 = '09c7a1e1ad39cf1fe178a3a8e392fb0426e81c540106937801e54549e35
 BASE_WHEELS = {'numpy': '2.3.5', 'pillow': '12.3.0', 'packaging': '26.3'}
 PRECISION_WHEELS = {'imagecodecs': '2026.10.10', 'pypng': '0.20220715.0', 'tifffile': '2026.10.15'}
 RECOGNITION_WHEELS = {'onnxruntime': '1.23.2', 'tokenizers': '0.22.1'}
-RUNTIME_FILES = ['service.py', 'engine.py', 'pixels.py', 'workflow.py', 'film.py', 'film_spectral.py', 'film_negative.py', 'borders.py',
+RUNTIME_FILES = ['service.py', 'engine.py', 'pixels.py', 'workflow.py', 'film.py', 'film_spectral.py', 'film_gpu.py', 'film_negative.py', 'borders.py',
                  'open_filters.py', 'open-filters-manifest.json',
                  'app.py', 'companion.cmd', 'LICENSE', 'README.md']
 SPECTRAL_PYTHON_VERSION = '3.13.13'
-SPECTRAL_PYTHON_PATHS = '.\nLib\nDLLs\nLib/site-packages\n..\\..\n'
+SPECTRAL_PYTHON_PATHS = '.\npython313.zip\nLib\nDLLs\nLib/site-packages\n..\\..\n'
 SPECTRAL_REVISION = '3bb2c2d2801ff68b92019cf1dbcbb133d60832bc'
 SPECTRAL_SOURCE_URL = f'https://codeload.github.com/andreavolpato/spektrafilm/legacy.tar.gz/{SPECTRAL_REVISION}'
 SPECTRAL_SOURCE_SHA256 = '0cc38b1c497047da14b153d4d5ba0cdf0a83da04cb1c1b1d113a971f624a04f9'
@@ -92,6 +92,21 @@ SPECTRAL_PATCHES = {
         ('    Uses pyFFTW for FFT operations.', '    Uses SciPy for FFT operations.'),
         (", planner_effort='FFTW_MEASURE'", ''),
         ('(pyFFTW)', '(SciPy FFT)'),
+    ]),
+    'model/color_filters.py': ('175aa801e228484880805e84af66bf1005fe916860fa4c36b955b4f5967579a7', [
+        ('import matplotlib.pyplot as plt', '# Plotting is optional in the headless worker.'),
+        ('    def plot(self):', '    def plot(self):\n        import matplotlib.pyplot as plt'),
+        ('if __name__=="__main__":', 'if __name__=="__main__":\n    import matplotlib.pyplot as plt'),
+    ]),
+    'utils/timings.py': ('e4f0e638333148a458068128232979ac02f58b650518fab06c45b8b19c26365a', [
+        ('import matplotlib.pyplot as plt', '# Import plotting only for an explicit diagnostic plot.'),
+        ('def plot_timings(timings):', 'def plot_timings(timings):\n    import matplotlib.pyplot as plt'),
+    ]),
+}
+HEADLESS_PATCHES = {
+    'colour/__init__.py': ('396cbaf3eb6d4ac32539eac8068c1df5020db642cb75184edb886e1dc3897c74', [
+        ('from colour import plotting  # noqa: F401',
+         '# Photo All headless worker: colour math does not require diagnostic charts.'),
     ]),
 }
 
@@ -548,8 +563,9 @@ def patch_spectral_sources(destination, packages):
     """Apply and record the headless adaptations against pinned upstream bytes."""
     patch = []
     files = {}
-    for relative, (expected, replacements) in SPECTRAL_PATCHES.items():
-        source_name = 'spektrafilm/' + relative
+    patches = {'spektrafilm/' + relative: patch for relative, patch in SPECTRAL_PATCHES.items()}
+    patches.update(HEADLESS_PATCHES)
+    for source_name, (expected, replacements) in patches.items():
         path = packages / source_name
         original = path.read_bytes()
         if hashlib.sha256(original).hexdigest() != expected:
@@ -569,6 +585,38 @@ def patch_spectral_sources(destination, packages):
     patch_path.write_bytes(''.join(patch).encode('utf-8'))
     return {'upstream_revision': SPECTRAL_REVISION, 'file': patch_path.name,
             'sha256': sha256(patch_path), 'files': files}
+
+
+def compact_spectral_runtime(destination):
+    """Headless distribution only: preserve geometry/math, codecs and licenses."""
+    destination = Path(destination).resolve()
+    def remove(path):
+        path = Path(path)
+        if not path.resolve().is_relative_to(destination) or path.resolve() == destination:
+            raise ValueError('Runtime compaction escaped its staging directory')
+        if path.is_dir(): shutil.rmtree(path)
+        elif path.is_file(): path.unlink()
+    before = sum(path.stat().st_size for path in destination.rglob('*') if path.is_file())
+    packages = destination/'Lib/site-packages'
+    # No text/chart rasterization runs inside the spectral worker. Matplotlib's
+    # actual polygon geometry extension remains for gamut compression.
+    for relative in ('fontTools', 'matplotlib/mpl-data/fonts', 'matplotlib/mpl-data/sample_data'):
+        remove(packages/relative)
+    for name in ('numpy', 'scipy', 'numba', 'llvmlite'):
+        for path in (packages/name).rglob('*'):
+            if path.is_file() and path.suffix.lower() in {'.pyi', '.c', '.cpp', '.h', '.lib', '.a'}:
+                remove(path)
+    # Only CPython's standard library is zipped. Numba/scientific source files
+    # stay on disk so source inspection and persistent JIT caching still work.
+    standard = [item for item in (destination/'Lib').iterdir() if item.name != 'site-packages']
+    with zipfile.ZipFile(destination/'python313.zip', 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        for item in standard:
+            for path in ([item] if item.is_file() else sorted(item.rglob('*'))):
+                if path.is_file() and '__pycache__' not in path.parts and path.suffix != '.pyc':
+                    archive.write(path, path.relative_to(destination/'Lib').as_posix())
+    for item in standard: remove(item)
+    after = sum(path.stat().st_size for path in destination.rglob('*') if path.is_file())
+    return {'before_bytes': before, 'after_bytes': after, 'removed_bytes': before-after}
 
 
 def stage_spectral_runtime(destination, crt):
@@ -622,7 +670,9 @@ def stage_spectral_runtime(destination, crt):
                     or relative.name in {'direct_url.json', 'uv_cache.json', 'uv_build.json'}):
                 continue
             copy(source / relative, packages / relative)
-    return {'python': SPECTRAL_PYTHON_VERSION, 'source_patch': patch_spectral_sources(destination, packages),
+    source_patch = patch_spectral_sources(destination, packages)
+    compaction = compact_spectral_runtime(destination)
+    return {'python': SPECTRAL_PYTHON_VERSION, 'source_patch': source_patch, 'compaction': compaction,
             'packages': {name: distributions[name].version for name in sorted(SPECTRAL_PACKAGES)}}
 
 
@@ -673,7 +723,10 @@ def stage():
         raise RuntimeError('Microsoft.VC143.CRT redistributable DLL directory is required (VCToolsRedistDir)')
     for name in RUNTIME_FILES:
         copy(ROOT / name, STAGE / name)
-    for name in ['RawTherapee-5.13', 'clip-vit-base-patch32', 'film-luts', 'open-filters', 'film-borders']:
+    gpu = ROOT / 'engines/photo-all-gpu'
+    if not all((gpu/name).is_file() for name in ('photo_all_gpu.dll', 'film.spv', 'spatial.spv')):
+        raise RuntimeError('Build Photo All Vulkan first with product/native/build.ps1 -VulkanHeaders <Khronos include directory>')
+    for name in ['RawTherapee-5.13', 'clip-vit-base-patch32', 'film-luts', 'open-filters', 'film-borders', 'photo-all-gpu']:
         copy(ROOT / 'engines' / name, STAGE / 'engines' / name)
     spectral = stage_spectral_runtime(STAGE / 'engines/spectral-python', crt)
     verify_open_filters(STAGE)

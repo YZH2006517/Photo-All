@@ -8,6 +8,7 @@ Lossless export refers to the encoded output samples, not a reversible edit.
 from __future__ import annotations
 
 import ctypes
+import contextlib
 from functools import lru_cache
 import hashlib
 import json
@@ -26,6 +27,27 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / 'engines' / 'precision-packages'))
 import png
 import tifffile
+
+_native_sources = OrderedDict()
+_native_source_lock = threading.Lock()
+
+
+def _native_read(path):
+    """One bounded, full-precision neutral decode shared by native display jobs."""
+    source = Path(path)
+    stat = source.stat()
+    key = (str(source.resolve()), stat.st_mtime_ns, stat.st_size)
+    with _native_source_lock:
+        cached = _native_sources.get(key)
+        if cached is not None:
+            return cached.copy()
+        _native_sources.clear()
+        image = read(path, preserve_alpha=True)
+        if image.nbytes <= 384*1024**2:
+            cached = image.copy()
+            cached.setflags(write=False)
+            _native_sources[key] = cached
+        return image
 
 SRGB = ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB')).tobytes()
 TILE = 65536
@@ -46,7 +68,14 @@ def _screen_read(path, recipe, max_size, target, source_limit=0):
         if cached is not None:
             _screen_sources[key] = cached
             return cached.copy()  # Grading works in-place; cached source must stay neutral.
-    image = read(path, preserve_alpha=True, resize_target=target)
+    native_key = (str(source.resolve()), stat.st_mtime_ns, stat.st_size)
+    with _native_source_lock:
+        native = _native_sources.get(native_key)
+    if native is None:
+        image = read(path, preserve_alpha=True, resize_target=target)
+    else:
+        size = target(native.shape[1], native.shape[0])
+        image = native.copy() if size == (native.shape[1], native.shape[0]) else resize(native, size)
     if image.nbytes <= 32 * 1024 * 1024:
         cached = image.copy()
         cached.setflags(write=False)
@@ -271,6 +300,14 @@ def apply_lut(array, table):
     table = np.asarray(table, dtype=np.float32)
     if table.ndim != 4 or table.shape[-1] != 3 or len(set(table.shape[:3])) != 1:
         raise ValueError('无效的 RGB LUT')
+    if array.size >= 12288:
+        from film_gpu import device, disable
+        gpu = device()
+        if gpu is not None:
+            try:
+                return gpu.trilinear(array, table)
+            except (OSError, RuntimeError):
+                disable()
     result = np.empty_like(array, dtype=np.float32)
     source, target = array.reshape(-1, 3), result.reshape(-1, 3)
     edge = table.shape[0]-1
@@ -600,7 +637,8 @@ def render(path, recipe, max_size=None, preserve_alpha=False, *, preview=False,p
             # the actual requested dimensions after reading the shared TIFF.
             edge = next((tier for tier in (1024, 2048, 4096) if tier >= decode_size[0]), decode_size[0])
             decode_size = (edge, edge)
-        path = engine.develop_raw(path, recipe, preview_size=decode_size, output_16bit=True)
+        path = engine.develop_raw(path, recipe, preview_size=decode_size, output_16bit=True,
+                                  reuse_native=bool(preview and decode_size))
     # Geometry must filter the original transparency before the final flatten.
     def target(width, height):
         output_width,output_height=engine.render_dimensions({'width':width,'height':height,'recipe':recipe})
@@ -611,6 +649,7 @@ def render(path, recipe, max_size=None, preserve_alpha=False, *, preview=False,p
             factor = min(factor, math.sqrt(.99*film_spectral.MAX_ENLARGED_PIXELS/(width*height))/scale)
         return max(1, round(width*factor)), max(1, round(height*factor))
     array = (_screen_read(path, recipe, max_size, target,preview_input_limit) if preview and max_size and max(max_size) <= 1920
+             else _native_read(path) if not max_size
              else read(path, preserve_alpha=True, resize_target=target if max_size else None))
     alpha = array[..., 3:].copy() if array.shape[-1] == 4 else None
     rgb = np.ascontiguousarray(array[..., :3])
@@ -718,6 +757,23 @@ def write(target, array, format):
     if array.ndim != 3 or array.shape[-1] not in {3, 4} or not np.isfinite(array).all():
         raise ValueError('导出需要有限 RGB/RGBA 像素')
     if format == 'png16':
+        try:
+            import imagecodecs
+        except ImportError:
+            imagecodecs = None
+        if imagecodecs is not None and imagecodecs.PNG.available:
+            # Libpng applies lossless row filters in native code. Preserve all
+            # 16-bit samples and the same explicit sRGB rendering intent.
+            samples = np.empty(array.shape, np.uint16)
+            for start in range(0, len(array), 64):
+                samples[start:start+64] = np.rint(np.clip(array[start:start+64], 0, 1)*65535).astype(np.uint16)
+            encoded = imagecodecs.png_encode(samples, level=6)
+            with contextlib.ExitStack() as stack:
+                stream = target if hasattr(target, 'write') else stack.enter_context(Path(target).open('wb'))
+                stream.write(encoded[:33])  # Signature and IHDR precede colour metadata.
+                png.write_chunk(stream, b'sRGB', b'\x01')
+                stream.write(memoryview(encoded)[33:])
+            return
         writer = _SRGBWriter(array.shape[1], array.shape[0], greyscale=False,
                             alpha=array.shape[-1] == 4, bitdepth=16, compression=6)
         rows = (np.rint(np.clip(row, 0, 1)*65535).astype(np.uint16).reshape(-1) for row in array)

@@ -4363,6 +4363,9 @@ a {
 .film-spectral-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px 4px; }
 .film-spectral-heading button { min-height: 26px; padding: 0 8px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); }
 .film-spectral-heading button[aria-pressed=true] { border-color: var(--editor-accent); background: var(--surface-soft); color: var(--ink); }
+.film-stage-nav { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; margin: 6px 12px 10px; padding: 3px; background: var(--surface-soft); border-radius: 5px; }
+.film-stage-nav button { min-height: 28px; padding: 3px 6px; color: var(--muted); font-size: 12px; }
+.film-stage-nav button[aria-pressed=true] { background: var(--input-surface); color: var(--ink); box-shadow: inset 0 0 0 1px var(--line); border-radius: 3px; }
 .film-workspace .film-current { display: grid; gap: 3px; margin: 0; padding: 9px 13px 11px; background: none; border: 0; border-radius: 0; }
 .film-workspace .film-current strong { font-size: 13px; }
 .film-workspace .film-current small, .film-engine-note { color: var(--muted); font-size: 10px; }

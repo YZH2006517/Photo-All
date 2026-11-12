@@ -229,7 +229,7 @@ OutputBPC=true
     return text
 
 
-def develop_raw(path, recipe=None, preview_size=None, output_16bit=False):
+def develop_raw(path, recipe=None, preview_size=None, output_16bit=False, *, reuse_native=False):
     """Cached native-engine output; TIFF bytes never pass through Pillow when exporting."""
     executable = raw_executable()
     if not executable:
@@ -237,22 +237,28 @@ def develop_raw(path, recipe=None, preview_size=None, output_16bit=False):
     path = Path(path).resolve()
     profile = raw_profile(recipe or {}, preview_size)
     stat = path.stat()
-    key = hashlib.sha256(json.dumps([str(path), stat.st_size, stat.st_mtime_ns,
-                                    str(executable), executable.stat().st_mtime_ns,
-                                    profile, output_16bit]).encode()).hexdigest()
+    source_key = [str(path), stat.st_size, stat.st_mtime_ns, str(executable), executable.stat().st_mtime_ns]
+    def cache_path(settings):
+        digest = hashlib.sha256(json.dumps([*source_key, settings, output_16bit]).encode()).hexdigest()
+        return RAW_CACHE / (digest + ('.tif' if output_16bit else '.png'))
     RAW_CACHE.mkdir(parents=True, exist_ok=True)
-    target = RAW_CACHE / (key + ('.tif' if output_16bit else '.png'))
+    target = cache_path(profile)
     cancellation = getattr(EXPORT_CONTEXT, 'cancellation', None)
     if cancellation: cancellation.check()
-    try:
-        os.utime(target, None)
-        return target
-    except FileNotFoundError:
-        pass
+    candidates = [target]
+    if reuse_native and preview_size:
+        candidates.append(cache_path(raw_profile(recipe or {})))
+    for candidate in candidates:
+        try:
+            # Pixel caches use mtime to identify content. Record use in atime only.
+            cached_stat = candidate.stat()
+            os.utime(candidate, ns=(time.time_ns(), cached_stat.st_mtime_ns))
+            return candidate
+        except FileNotFoundError:
+            continue
     with raw_lock(cancellation):
         if cancellation: cancellation.check()
         if target.is_file():
-            target.touch()
             return target
         with tempfile.TemporaryDirectory(dir=RAW_CACHE, prefix='job-') as folder:
             folder = Path(folder)
@@ -277,7 +283,7 @@ def develop_raw(path, recipe=None, preview_size=None, output_16bit=False):
                 check.verify()
             os.replace(output, target)
         # Keep at most 1 GiB; only generated cache images are eligible for eviction.
-        cached = sorted([*RAW_CACHE.glob('*.png'), *RAW_CACHE.glob('*.tif')], key=lambda p: p.stat().st_mtime)
+        cached = sorted([*RAW_CACHE.glob('*.png'), *RAW_CACHE.glob('*.tif')], key=lambda p: p.stat().st_atime_ns)
         total = sum(p.stat().st_size for p in cached)
         for old in cached:
             if total <= 1024 ** 3:

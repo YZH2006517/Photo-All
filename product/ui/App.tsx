@@ -269,6 +269,7 @@ function Studio() {
   }, [clearDrawerTimers]);
   useEffect(() => clearDrawerTimers, [clearDrawerTimers]);
   const [folderMode, setFolderMode] = useState("single");
+  const [spectralMode, setSpectralMode] = useState("accelerated");
   const [variantMode, setVariantMode] = useState<VariantMode>(() => {
     try {
       const saved = localStorage.getItem("photoall-variant-mode");
@@ -938,6 +939,7 @@ function Studio() {
         size: exportSize,
         format,
         folder_mode: folderMode,
+        spectral_mode: spectralMode,
         ...(albumId !== null ? { album_ids: [albumId] } : {}),
       });
       setExportOpen(false);
@@ -1372,7 +1374,7 @@ function Studio() {
           <div className="sidebar-bottom">
             <span className="online-dot" />
             <span>本地引擎{connected ? "已连接" : "连接中"}</span>
-            <span className="version">0.10.7</span>
+            <span className="version">0.10.8</span>
           </div>
         </aside>
 
@@ -2140,6 +2142,17 @@ function Studio() {
                   </label>
                   {format !== "tiff16" && format !== "original" ? (
                     <>
+                      {exportScope.some((photo) => !!photo.recipe.film_advanced) && (
+                        <label className="field-label">
+                          光谱计算方式
+                          <select aria-label="光谱计算方式" value={spectralMode}
+                            onChange={(event) => setSpectralMode(event.target.value)}>
+                            <option value="accelerated">加速计算 · 推荐</option>
+                            <option value="exact">逐像素精算 · 耗时较长</option>
+                          </select>
+                          <small>加速模式使用颜色插值；两种方式均保持所选输出尺寸与位深。</small>
+                        </label>
+                      )}
                       <label className="field-label">
                         画面模板
                         <select

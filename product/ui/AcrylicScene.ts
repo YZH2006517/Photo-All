@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Procedural reconstruction from the user's reference; no third-party model.
 import * as THREE from "three";
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 
-export function makeAcrylicScene(anisotropy: number) {
+export function makeAcrylicScene(renderer: THREE.WebGLRenderer, anisotropy: number) {
   const root = new THREE.Group();
   root.name = "acrylic-gallery";
   const acrylic = new THREE.MeshPhysicalMaterial({
-    color: "#e3e9e5", metalness: 0, roughness: .16, transmission: .88,
-    thickness: .12, ior: 1.49, transparent: true, opacity: .92,
-    clearcoat: .5, clearcoatRoughness: .15, depthWrite: false,
+    color: "#ffffff", roughness: .055, transmission: 1, thickness: .19, ior: 1.49,
+    attenuationColor: "#96c8bc", attenuationDistance: 2.4,
+    clearcoat: .35, clearcoatRoughness: .08, envMapIntensity: 1.2,
   });
-  const edge = new THREE.MeshPhysicalMaterial({ color: "#e2e9e5", roughness: .24,
-    metalness: .06, transparent: true, opacity: .48, depthWrite: false });
-  const plinthMat = new THREE.MeshStandardMaterial({ color: "#ded9ce", roughness: .94 });
+  let reflections: THREE.WebGLRenderTarget | undefined;
+  const plinthMat = new THREE.MeshStandardMaterial({ color: "#aea89d", roughness: .8 });
   const filmMat = new THREE.MeshStandardMaterial({ color: "#252a25", roughness: .72,
     side: THREE.DoubleSide });
   const pieces: { object: THREE.Group; position: THREE.Vector3; delay: number }[] = [];
@@ -50,12 +50,12 @@ export function makeAcrylicScene(anisotropy: number) {
   const shell=new THREE.Mesh(new THREE.ExtrudeGeometry(outer,{depth:.15,bevelEnabled:true,
     bevelSize:.045,bevelThickness:.035,bevelSegments:3,steps:1}),acrylic);
   shell.position.set(0,1.53,-.08);frame.add(shell);
-  for(const z of [-.09,.10]) {
-    const outline=new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(
-      outer.getPoints(120).map(p=>new THREE.Vector3(p.x,p.y+1.53,z))),
-      new THREE.LineBasicMaterial({color:"#eff3ef",transparent:true,opacity:.56}));frame.add(outline);
-  }
-  box(frame,9.98,.075,.13,0,2.67,.01,edge);
+  // A second polished leaf in front of the strip catches the softbox at grazing angles.
+  const cover = new THREE.Mesh(new THREE.ExtrudeGeometry(rounded(9.86,2.13,.095), {
+    depth:.045, bevelEnabled:true, bevelSize:.025, bevelThickness:.018, bevelSegments:4,
+  }), acrylic);
+  cover.position.set(0,1.53,.255);
+  frame.add(cover);
   box(frame,.12,.20,.16,-4.82,2.60,.02,new THREE.MeshStandardMaterial({color:"#343733",roughness:.8}));
   const strip=part("six-frame-film",.43);
   // One perforated substrate, with continuous 135-film pitch across all frames.
@@ -84,13 +84,20 @@ export function makeAcrylicScene(anisotropy: number) {
     cells.push({mesh,map,canvas});
   }
   const backdrop=part("gallery-wall",0);
-  box(backdrop,70,26,.2,0,7,-4,new THREE.MeshStandardMaterial({color:"#c7c6bd",roughness:1}));
+  box(backdrop,70,26,.2,0,7,-4,new THREE.MeshStandardMaterial({color:"#888e8c",roughness:1}));
   const ground=box(backdrop,70,.10,60,0,-.60,0,plinthMat);ground.castShadow=false;
   // Gallery lighting belongs to this scene and is never mixed into the archive.
-  const softbox=new THREE.DirectionalLight(0xfff8eb,3);
+  const softbox=new THREE.DirectionalLight(0xfff4df,2.4);
   softbox.position.set(-2,7,5);softbox.lookAt(0,1,0);root.add(softbox);
-  const fill=new THREE.DirectionalLight(0xe8f4ff,2);fill.position.set(-6,5,8);root.add(fill);
-  const ambient=new THREE.HemisphereLight(0xffffff,0x8c8678,2);root.add(ambient);
+  const fill=new THREE.DirectionalLight(0xe2f2ff,.85);fill.position.set(6,3,-2);root.add(fill);
+  const ambient=new THREE.HemisphereLight(0xf5f8ff,0x766b60,.85);root.add(ambient);
+  const warmKey = new THREE.Color("#ffd7b1"), neutralKey = new THREE.Color("#fffaf3");
+  const warmFill = new THREE.Color("#c7b8a9"), neutralFill = new THREE.Color("#e2f2ff");
+  function light(blend: number) {
+    softbox.color.lerpColors(warmKey, neutralKey, blend);
+    fill.color.lerpColors(warmFill, neutralFill, blend);
+    ambient.intensity = .62 + .23 * blend;
+  }
   let lastKey="";
   function update(photos: {id:number}[],start: number,index: number,images: Map<number,HTMLCanvasElement>) {
     const offset=Math.min(Math.max(0,Math.floor((index-start)/6)*6),Math.max(0,Math.floor((photos.length-1)/6)*6));
@@ -109,14 +116,26 @@ export function makeAcrylicScene(anisotropy: number) {
   }
   function animate(progress: number) {
     root.visible=progress>0;
+    if (!root.visible) return;
+    if (!reflections) {
+      const studio = new RoomEnvironment();
+      const pmrem = new THREE.PMREMGenerator(renderer);
+      reflections = pmrem.fromScene(studio, .035);
+      acrylic.envMap = reflections.texture;
+      acrylic.needsUpdate = true;
+      studio.dispose();
+      pmrem.dispose();
+    }
     for(const item of pieces) {
-      const t=THREE.MathUtils.smoothstep(progress,item.delay,Math.min(1,item.delay+.52));
+      const t=THREE.MathUtils.smootherstep(progress,item.delay*.68,1);
       item.object.visible=t>0;item.object.position.copy(item.position);
       if(item.object===backdrop)continue;
-      item.object.position.y-=(1-t)*1.1;item.object.rotation.x=(1-t)*-.07;
-      item.object.scale.setScalar(.96+.04*t);
+      if(item.object===strip) item.object.position.x-=(1-t)*1.05;
+      else item.object.position.y -= (1-t) * (item.object === frame ? .46 : .23);
+      item.object.rotation.x=(1-t)*-.045;
     }
   }
   animate(0);
-  return {root,cassette,update,animate};
+  function dispose() { acrylic.envMap=null; reflections?.dispose(); }
+  return {root,cassette,update,animate,light,dispose};
 }
